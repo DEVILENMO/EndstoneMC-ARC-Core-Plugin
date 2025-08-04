@@ -3,19 +3,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "endstone-example"
-version = "0.4.0"
+name = "endstone_arc_core"
+version = "0.0.1"
 dependencies = []
 authors = [
-    { name = "Endstone Developers", email = "hello@endstone.dev" },
+    { name = "DEVILENMO", email = "DEVILENMO@gmail.com" },
 ]
-description = "Python example plugin for Endstone servers"
-readme = "README.md"
-license = { file = "LICENSE" }
-keywords = ["endstone", "plugin"]
-
-[project.urls]
-Homepage = "https://github.com/EndstoneMC/python-example-plugin"
+description = "Core of ARC plugin series."
 
 [project.entry-points."endstone"]
-example = "endstone_example:ExamplePlugin"
+arc_core = "endstone_arc_core:ARCCorePlugin"
