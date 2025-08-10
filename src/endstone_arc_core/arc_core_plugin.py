@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
@@ -139,6 +140,19 @@ class ARCCorePlugin(Plugin):
             self.max_player_home_num = 3
         self.teleport_requests = {}  # 存储传送请求 {player_name: {'type': 'tpa'/'tphere', 'target': target_name, 'expire_time': time}}
 
+        # 公告系统
+        self.broadcast_messages = []  # 存储公告消息列表
+        self.current_broadcast_index = 0  # 当前公告索引
+        self.broadcast_interval = self.setting_manager.GetSetting('BROADCAST_INTERVAL')
+        try:
+            self.broadcast_interval = int(self.broadcast_interval)
+        except (ValueError, TypeError):
+            self.broadcast_interval = 300  # 默认5分钟（300秒）
+
+        # 清道夫系统变量初始化
+        self.enable_cleaner = False
+        self.cleaner_interval = 600
+
     def on_load(self) -> None:
         self.logger.info(f"{ColorFormat.YELLOW}[ARC Core]Plugin loaded!")
 
@@ -146,9 +160,25 @@ class ARCCorePlugin(Plugin):
         self.register_events(self)
         self.logger.info(f"{ColorFormat.YELLOW}[ARC Core]Plugin enabled!")
 
+        # 初始化公告系统和清道夫系统
+        self._load_broadcast_messages()
+        self._init_cleaner_system()
+
         # Scheduler tasks
         self.server.scheduler.run_task(self, self.player_position_listener, delay=0, period=25)
         self.server.scheduler.run_task(self, self.cleanup_expired_teleport_requests, delay=0, period=100)  # 每5秒清理一次过期请求
+        
+        # 公告系统定时任务
+        if self.broadcast_messages:
+            broadcast_period = self.broadcast_interval * 20  # 转换为ticks (1秒 = 20 ticks)
+            self.server.scheduler.run_task(self, self.send_broadcast_message, delay=broadcast_period, period=broadcast_period)
+            self.logger.info(f"[ARC Core]Broadcast system started, interval: {self.broadcast_interval} seconds")
+
+        # 清道夫系统定时任务
+        if self.enable_cleaner:
+            cleaner_period = self.cleaner_interval * 20  # 转换为ticks
+            self.server.scheduler.run_task(self, self.start_cleaner_warning, delay=cleaner_period, period=cleaner_period)
+            self.logger.info(f"[ARC Core]Cleaner system started, interval: {self.cleaner_interval} seconds")
 
     def on_disable(self) -> None:
         self.logger.info(f"{ColorFormat.YELLOW}[ARC Core]Plugin disabled!")
@@ -329,7 +359,6 @@ class ARCCorePlugin(Plugin):
                 player.send_message(self.language_manager.GetText('SPAWN_PROTECT_HINT').format(self.spawn_protect_range))
                 return False
         land_id = self.get_land_at_pos(dimension, pos[0], pos[2])
-        print(f'land_id: {land_id}')
         if land_id is not None:
             owner_uuid = self.get_land_owner(land_id)
             if owner_uuid != str(player.unique_id):
@@ -2284,6 +2313,9 @@ class ARCCorePlugin(Plugin):
         land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_RESET_LAND_TP_POS_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.set_player_pos_as_land_tp_pos(p, l_id)
                                      )
+        land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_TRANSFER_LAND_BUTTON_TEXT'),
+                                     on_click=lambda p=player, l_id=land_id: self.show_transfer_land_panel(p, l_id)
+                                     )
         land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_DELETE_LAND_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.confirm_delete_land(p, l_id)
                                      )
@@ -2359,6 +2391,109 @@ class ARCCorePlugin(Plugin):
             player.send_message(self.language_manager.GetText('DELETE_LAND_SUCCESS').format(land_id, return_money, self.get_player_money(player)))
         else:
             player.send_message(self.language_manager.GetText('DELETE_LAND_FAILED').format(land_id))
+        self.show_own_land_menu(player)
+
+    def show_transfer_land_panel(self, player: Player, land_id: int):
+        """显示移交领地面板，让玩家选择要移交给谁"""
+        online_players = [p for p in self.server.online_players if p.name != player.name]
+        if not online_players:
+            no_players_panel = ActionForm(
+                title=self.language_manager.GetText('TRANSFER_LAND_PANEL_TITLE'),
+                content=self.language_manager.GetText('NO_OTHER_PLAYERS_ONLINE'),
+                on_close=lambda p=player, l_id=land_id, l_info=self.get_land_info(land_id): self.show_own_land_detail_panel(p, l_id, l_info)
+            )
+            player.send_form(no_players_panel)
+            return
+
+        transfer_menu = ActionForm(
+            title=self.language_manager.GetText('TRANSFER_LAND_PANEL_TITLE'),
+            content=self.language_manager.GetText('TRANSFER_LAND_PANEL_CONTENT'),
+            on_close=lambda p=player, l_id=land_id, l_info=self.get_land_info(land_id): self.show_own_land_detail_panel(p, l_id, l_info)
+        )
+        
+        for target_player in online_players:
+            transfer_menu.add_button(
+                self.language_manager.GetText('TRANSFER_LAND_TARGET_BUTTON').format(target_player.name),
+                on_click=lambda p=player, l_id=land_id, t=target_player: self.confirm_transfer_land(p, l_id, t)
+            )
+        
+        player.send_form(transfer_menu)
+
+    def confirm_transfer_land(self, player: Player, land_id: int, target_player: Player):
+        """显示确认移交领地的面板"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        confirm_panel = ActionForm(
+            title=self.language_manager.GetText('CONFIRM_TRANSFER_LAND_TITLE').format(land_id),
+            content=self.language_manager.GetText('CONFIRM_TRANSFER_LAND_CONTENT').replace('\\n', '\n').format(
+                land_id, 
+                land_info['land_name'], 
+                target_player.name
+            ),
+            on_close=lambda p=player, l_id=land_id, l_info=land_info: self.show_own_land_detail_panel(p, l_id, l_info)
+        )
+        confirm_panel.add_button(
+            self.language_manager.GetText('CONFIRM_TRANSFER_LAND_BUTTON'),
+            on_click=lambda p=player, l_id=land_id, t=target_player: self.try_transfer_land(p, l_id, t)
+        )
+        player.send_form(confirm_panel)
+
+    def transfer_land(self, land_id: int, new_owner_uuid: str) -> bool:
+        """
+        移交领地给新的拥有者
+        :param land_id: 领地ID
+        :param new_owner_uuid: 新拥有者的UUID
+        :return: 是否成功
+        """
+        try:
+            # 检查领地是否存在
+            if not self.get_land_info(land_id):
+                return False
+
+            # 更新领地拥有者
+            self.database_manager.execute(
+                "UPDATE lands SET owner_uuid = ? WHERE land_id = ?",
+                (new_owner_uuid, land_id)
+            )
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Transfer land error: {str(e)}")
+            return False
+
+    def try_transfer_land(self, player: Player, land_id: int, target_player: Player):
+        """尝试移交领地"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        # 检查目标玩家是否还在线
+        target_online = any(p.name == target_player.name for p in self.server.online_players)
+        if not target_online:
+            player.send_message(self.language_manager.GetText('REQUEST_SENDER_OFFLINE'))
+            self.show_own_land_menu(player)
+            return
+
+        # 执行移交
+        success = self.transfer_land(land_id, str(target_player.unique_id))
+        if success:
+            # 通知当前玩家
+            player.send_message(self.language_manager.GetText('TRANSFER_LAND_SUCCESS').format(land_id, target_player.name))
+            
+            # 通知目标玩家
+            target_player.send_message(self.language_manager.GetText('TRANSFER_LAND_NOTIFICATION').format(
+                player.name, 
+                land_id, 
+                land_info['land_name']
+            ))
+        else:
+            player.send_message(self.language_manager.GetText('TRANSFER_LAND_FAILED').format(land_id))
+        
         self.show_own_land_menu(player)
 
     def show_create_new_land_guide(self, player: Player):
@@ -2639,3 +2774,137 @@ class ARCCorePlugin(Plugin):
                                                 f'{ColorFormat.WHITE}{new_money}')
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Change player money error: {str(e)}")
+
+    # 公告系统
+    def _load_broadcast_messages(self):
+        """从broadcast.txt文件加载公告消息"""
+        try:
+            broadcast_file = Path(MAIN_PATH) / "broadcast.txt"
+            if not broadcast_file.exists():
+                self.logger.warning(f"[ARC Core]broadcast.txt not found, creating empty file")
+                broadcast_file.parent.mkdir(exist_ok=True)
+                broadcast_file.touch()
+                return
+
+            with broadcast_file.open("r", encoding="utf-8") as f:
+                lines = f.readlines()
+                self.broadcast_messages = [line.strip() for line in lines if line.strip()]
+
+            if not self.broadcast_messages:
+                self.logger.warning(f"[ARC Core]broadcast.txt is empty")
+            else:
+                self.logger.info(f"[ARC Core]Loaded {len(self.broadcast_messages)} broadcast messages")
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Load broadcast messages error: {str(e)}")
+
+    def send_broadcast_message(self):
+        """发送公告消息"""
+        try:
+            if not self.broadcast_messages:
+                return
+
+            # 获取当前公告消息
+            message = self.broadcast_messages[self.current_broadcast_index]
+            
+            # 替换特殊符号
+            message = self._process_broadcast_placeholders(message)
+            
+            # 发送给所有在线玩家
+            for player in self.server.online_players:
+                player.send_message(f"{self.language_manager.GetText('BROADCAST_MESSAGE_PREFIX')}: {message}")
+            
+            # 更新索引
+            self.current_broadcast_index = (self.current_broadcast_index + 1) % len(self.broadcast_messages)
+            
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Send broadcast message error: {str(e)}")
+
+    def _process_broadcast_placeholders(self, message: str) -> str:
+        """处理公告消息中的占位符"""
+        try:
+            current_time = datetime.now()
+            
+            # 替换{date}为当前日期 (年-月-日)
+            date_str = current_time.strftime("%Y-%m-%d")
+            message = message.replace("{date}", date_str)
+            
+            # 替换{time}为当前时间 (小时:分钟)
+            time_str = current_time.strftime("%H:%M")
+            message = message.replace("{time}", time_str)
+            
+            # 替换{online_player_number}为当前在线玩家数量
+            online_player_count = len(self.server.online_players)
+            message = message.replace("{online_player_number}", str(online_player_count))
+            
+            return message
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Process broadcast placeholders error: {str(e)}")
+            return message  # 如果处理失败，返回原消息
+
+    # 清道夫系统
+    def _init_cleaner_system(self):
+        """初始化清道夫系统"""
+        try:
+            # 获取清道夫设置
+            self.enable_cleaner = self.setting_manager.GetSetting('ENABLE_CLEANER')
+            if self.enable_cleaner is None or self.enable_cleaner.lower() not in ['true', 'false']:
+                self.enable_cleaner = False
+            else:
+                self.enable_cleaner = self.enable_cleaner.lower() == 'true'
+
+            self.cleaner_interval = self.setting_manager.GetSetting('CLEANER_INTERVAL')
+            try:
+                self.cleaner_interval = int(self.cleaner_interval)
+            except (ValueError, TypeError):
+                self.cleaner_interval = 600  # 默认10分钟
+
+            if self.enable_cleaner:
+                self.logger.info(f"[ARC Core]Cleaner system enabled, interval: {self.cleaner_interval} seconds")
+            else:
+                self.logger.info(f"[ARC Core]Cleaner system disabled")
+
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Init cleaner system error: {str(e)}")
+
+    def start_cleaner_warning(self):
+        """开始清道夫警告倒计时"""
+        try:
+            if not self.enable_cleaner:
+                return
+
+            # 发送10秒后清理警告
+            for player in self.server.online_players:
+                player.send_message(self.language_manager.GetText('READY_TO_CLEAR_DROP_ITEM_BROADCAST'))
+
+            # 10秒后执行清理
+            self.server.scheduler.run_task(self, self.execute_cleaner, delay=200)  # 10秒 = 200 ticks
+
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Start cleaner warning error: {str(e)}")
+
+    def execute_cleaner(self):
+        """执行清理掉落物"""
+        try:
+            if not self.enable_cleaner:
+                return
+
+            # 发送正在清理消息
+            for player in self.server.online_players:
+                player.send_message(self.language_manager.GetText('CLEAR_DROP_ITEM_BROADCAST'))
+
+            # 执行清理命令
+            self.server.dispatch_command(self.server.command_sender, "kill @e[type=item]")
+
+            # 发送清理完成消息
+            self.server.scheduler.run_task(self, self.cleaner_complete_message, delay=20)  # 1秒后发送完成消息
+
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Execute cleaner error: {str(e)}")
+
+    def cleaner_complete_message(self):
+        """发送清理完成消息"""
+        try:
+            for player in self.server.online_players:
+                player.send_message(self.language_manager.GetText('CLEAR_DROP_ITEM_COMPLETE'))
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Cleaner complete message error: {str(e)}")
