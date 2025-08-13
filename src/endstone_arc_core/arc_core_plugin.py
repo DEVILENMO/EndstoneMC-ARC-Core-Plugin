@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional, Set
 from endstone import ColorFormat, Player, GameMode
 from endstone._internal.endstone_python import ActionForm, TextInput, ModalForm
 from endstone.command import Command, CommandSender
-from endstone.event import event_handler, PlayerJoinEvent, PlayerQuitEvent, BlockBreakEvent, BlockPlaceEvent, PlayerDeathEvent 
+from endstone.event import event_handler, PlayerJoinEvent, PlayerQuitEvent, BlockBreakEvent, BlockPlaceEvent, PlayerDeathEvent, PlayerInteractEvent, ActorExplodeEvent 
 from endstone.plugin import Plugin
 
 from endstone_arc_core.DatabaseManager import DatabaseManager
@@ -328,7 +328,10 @@ class ARCCorePlugin(Plugin):
     def on_block_break(self, event: BlockBreakEvent):
         if event.player.is_op:
             return
-        if not self.operation_check(event.player, event.block.location.dimension.name,
+        if not self.land_operation_check(event.player, event.block.location.dimension.name,
+                                    (event.block.location.x, event.block.location.y, event.block.location.z)):
+            event.is_cancelled = True
+        if not self.spawn_protect_check(event.player, event.block.location.dimension.name,
                                     (event.block.location.x, event.block.location.y, event.block.location.z)):
             event.is_cancelled = True
         return
@@ -337,7 +340,10 @@ class ARCCorePlugin(Plugin):
     def on_block_place(self, event: BlockPlaceEvent):
         if event.player.is_op:
             return
-        if not self.operation_check(event.player, event.block.location.dimension.name,
+        if not self.land_operation_check(event.player, event.block.location.dimension.name,
+                                    (event.block.location.x, event.block.location.y, event.block.location.z)):
+            event.is_cancelled = True
+        if not self.spawn_protect_check(event.player, event.block.location.dimension.name,
                                     (event.block.location.x, event.block.location.y, event.block.location.z)):
             event.is_cancelled = True
         return
@@ -353,16 +359,103 @@ class ARCCorePlugin(Plugin):
         }
         event.player.send_message(self.language_manager.GetText('DEATH_LOCATION_RECORDED'))
 
-    def operation_check(self, player: Player, dimension: str, pos: tuple):
+    @event_handler
+    def on_player_interact(self, event: PlayerInteractEvent):
+        """处理玩家交互事件，保护领地免受非法交互"""
+        # OP玩家跳过检查
+        if event.player.is_op:
+            return
+        
+        # 只检查有方块的交互事件
+        if not event.has_block:
+            return
+            
+        # 获取交互位置
+        block_location = event.block.location
+        dimension = event.player.location.dimension.name
+        pos = (block_location.x, block_location.y, block_location.z)
+        
+        # 检查是否在领地内且不是领地主人
+        if not self.land_interact_check(event.player, dimension, pos):
+            event.cancelled = True
+
+    @event_handler
+    def on_actor_explode(self, event: ActorExplodeEvent):
+        """处理爆炸事件，保护领地免受爆炸伤害"""
+        try:
+            explosion_location = event.location
+            dimension = explosion_location.dimension.name
+            
+            # 检查爆炸位置是否在任何领地内
+            land_id = self.get_land_at_pos(dimension, int(explosion_location.x), int(explosion_location.z))
+            if land_id is not None:
+                land_info = self.get_land_info(land_id)
+                if land_info and not land_info.get('allow_explosion', False):
+                    # 如果领地不允许爆炸，则取消爆炸事件
+                    event.cancelled = True
+                    return
+                    
+            # 检查爆炸影响的方块是否在领地内
+            filtered_blocks = []
+            for block in event.block_list:
+                block_land_id = self.get_land_at_pos(dimension, int(block.location.x), int(block.location.z))
+                if block_land_id is not None:
+                    block_land_info = self.get_land_info(block_land_id)
+                    if block_land_info and block_land_info.get('allow_explosion', False):
+                        # 如果该领地允许爆炸，保留这个方块在爆炸列表中
+                        filtered_blocks.append(block)
+                    # 如果不允许爆炸，则不添加到列表中（移除）
+                else:
+                    # 不在领地内的方块保持原样
+                    filtered_blocks.append(block)
+            
+            # 更新爆炸影响的方块列表
+            event.block_list = filtered_blocks
+            
+        except Exception as e:
+            self.logger.error(f"Handle actor explode event error: {str(e)}")
+
+    def land_operation_check(self, player: Player, dimension: str, pos: tuple):
+        land_id = self.get_land_at_pos(dimension, pos[0], pos[2])
+        if land_id is not None:
+            land_info = self.get_land_info(land_id)
+            if not land_info:
+                return True
+                
+            owner_uuid = land_info['owner_uuid']
+            shared_users = land_info['shared_users']
+            
+            # 检查是否是领地主人或授权用户
+            if owner_uuid != str(player.unique_id) and str(player.unique_id) not in shared_users:
+                player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.get_player_name_by_uuid(owner_uuid)))
+                return False
+        return True
+
+    def land_interact_check(self, player: Player, dimension: str, pos: tuple):
+        """检查玩家是否有权限在领地内进行方块互动"""
+        land_id = self.get_land_at_pos(dimension, pos[0], pos[2])
+        if land_id is not None:
+            land_info = self.get_land_info(land_id)
+            if not land_info:
+                return True
+            
+            # 如果领地设置为对所有人开放方块互动，直接允许
+            if land_info.get('allow_public_interact', False):
+                return True
+                
+            owner_uuid = land_info['owner_uuid']
+            shared_users = land_info['shared_users']
+            
+            # 检查是否是领地主人或授权用户
+            if owner_uuid != str(player.unique_id) and str(player.unique_id) not in shared_users:
+                player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.get_player_name_by_uuid(owner_uuid)))
+                return False
+        return True
+    
+    def spawn_protect_check(self, player: Player, dimension: str, pos: tuple):
         if self.if_protect_spawn and len(self.spawn_pos_dict):
             if not self.spawn_protect_check(dimension, pos[0], pos[2]):
                 player.send_message(self.language_manager.GetText('SPAWN_PROTECT_HINT').format(self.spawn_protect_range))
-                return False
-        land_id = self.get_land_at_pos(dimension, pos[0], pos[2])
-        if land_id is not None:
-            owner_uuid = self.get_land_owner(land_id)
-            if owner_uuid != str(player.unique_id):
-                player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.get_player_name_by_uuid(owner_uuid)))
                 return False
         return True
 
@@ -648,7 +741,8 @@ class ARCCorePlugin(Plugin):
             arc_menu.add_button(self.language_manager.GetText('BANK_MENU_NAME'), on_click=self.show_bank_main_menu)
             arc_menu.add_button(self.language_manager.GetText('TELEPORT_MENU_NAME'), on_click=self.show_teleport_menu)
             arc_menu.add_button(self.language_manager.GetText('LAND_MENU_NAME'), on_click=self.show_land_main_menu)
-            arc_menu.add_button(self.language_manager.GetText('SHOP_MENU_NAME'), on_click=self.show_shop_menu)
+            if self.server.plugin_manager.get_plugin('ushop'):
+                arc_menu.add_button(self.language_manager.GetText('SHOP_MENU_NAME'), on_click=self.show_shop_menu)
             if player.is_op:
                 arc_menu.add_button(self.language_manager.GetText('OP_PANEL_NAME'), on_click=self.show_op_main_panel)
             arc_menu.on_close = None
@@ -657,6 +751,7 @@ class ARCCorePlugin(Plugin):
     # Register and login
     def login_successfully(self, player: Player):
         self.player_authentication_state[player.name] = True
+        self.show_main_menu(player) # 登录成功后自动弹出主菜单
 
     def show_register_panel(self, player: Player, hint_message=None):
         password_input = TextInput(
@@ -1296,7 +1391,7 @@ class ARCCorePlugin(Plugin):
             player.send_message(self.language_manager.GetText('TELEPORT_DIMENSION_ERROR').format(warp_name, warp_info['dimension']))
             return
         
-        self.start_teleport_countdown(player, warp_name, (warp_info['x'], warp_info['y'], warp_info['z']), 'PUBLIC_WARP')
+        self.start_teleport_to_position_countdown(player, warp_name, (warp_info['x'], warp_info['y'], warp_info['z']), 'PUBLIC_WARP')
 
     def teleport_to_home(self, player: Player, home_name: str, home_info: Dict[str, Any]):
         """传送到玩家传送点"""
@@ -1304,26 +1399,38 @@ class ARCCorePlugin(Plugin):
             player.send_message(self.language_manager.GetText('TELEPORT_DIMENSION_ERROR').format(home_name, home_info['dimension']))
             return
         
-        self.start_teleport_countdown(player, home_name, (home_info['x'], home_info['y'], home_info['z']), 'HOME')
+        self.start_teleport_to_position_countdown(player, home_name, (home_info['x'], home_info['y'], home_info['z']), 'HOME')
 
-    def start_teleport_countdown(self, player: Player, destination_name: str, position: tuple, teleport_type: str):
-        """开始传送倒计时"""
+    def start_teleport_to_position_countdown(self, player: Player, destination_name: str, position: tuple, teleport_type: str):
+        """开始传送到位置倒计时"""
         self.server.scheduler.run_task(
             self, 
-            lambda: self.execute_teleport(player, destination_name, position, teleport_type), 
+            lambda: self.execute_teleport_to_position(player, destination_name, position, teleport_type), 
             delay=45
         )
         
+        # 发送提示
         if teleport_type == 'PUBLIC_WARP':
             message = self.language_manager.GetText('TELEPORT_TO_WARP_COUNTDOWN').format(destination_name)
         elif teleport_type == 'HOME':
             message = self.language_manager.GetText('TELEPORT_TO_HOME_COUNTDOWN').format(destination_name)
         else:
             message = self.language_manager.GetText('TELEPORT_COUNTDOWN').format(destination_name)
-        
+        player.send_message(message)
+    
+    def start_teleport_to_player_countdown(self, player: Player, target_player: Player):
+        """开始传送到玩家倒计时"""
+        self.server.scheduler.run_task(
+            self, 
+            lambda: self.execute_teleport_to_player(player, target_player), 
+            delay=45
+        )
+
+        # 发送提示
+        message = self.language_manager.GetText('TELEPORT_COUNTDOWN').format(target_player.name)
         player.send_message(message)
 
-    def execute_teleport(self, player: Player, destination_name: str, position: tuple, teleport_type: str):
+    def execute_teleport_to_position(self, player: Player, destination_name: str, position: tuple, teleport_type: str):
         """执行传送"""
         if teleport_type == 'PUBLIC_WARP':
             message = self.language_manager.GetText('TELEPORT_TO_WARP_SUCCESS').format(destination_name)
@@ -1331,9 +1438,25 @@ class ARCCorePlugin(Plugin):
             message = self.language_manager.GetText('TELEPORT_TO_HOME_SUCCESS').format(destination_name)
         else:
             message = self.language_manager.GetText('TELEPORT_SUCCESS').format(destination_name)
-        
         player.send_message(message)
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command(player.name, position))
+        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position))
+    
+    def execute_teleport_to_player(self, player: Player, target_player: Player):
+        """执行传送"""
+        message = self.language_manager.GetText('TELEPORT_SUCCESS').format(target_player.name)
+        player.send_message(message)
+        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_player(player.name, target_player.name))
+    
+    @staticmethod
+    def generate_tp_command_to_position(player_name: str, position: tuple):
+        formatted_name = f'"{player_name}"' if ' ' in player_name else player_name
+        return f'tp {formatted_name} {' '.join([str(int(_)) for _ in position])}'
+
+    @staticmethod
+    def generate_tp_command_to_player(player_name: str, target_player_name: str):
+        formatted_player = f'"{player_name}"' if ' ' in player_name else player_name
+        formatted_target = f'"{target_player_name}"' if ' ' in target_player_name else target_player_name
+        return f'tp {formatted_player} {formatted_target}'
 
     # Death Location Teleport
     def teleport_to_death_location(self, player: Player):
@@ -1372,7 +1495,7 @@ class ARCCorePlugin(Plugin):
         
         # 执行传送
         player.send_message(self.language_manager.GetText('TELEPORT_TO_DEATH_LOCATION_SUCCESS'))
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command(player.name, position))
+        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position))
         
         # 清理死亡位置记录
         del self.player_death_locations[player.name]
@@ -1568,12 +1691,12 @@ class ARCCorePlugin(Plugin):
         # 执行传送
         if request['type'] == 'tpa':
             # TPA: 发送者传送到接受者处
-            self.start_teleport_countdown(sender, player.name, self.get_player_position_vector(player), 'PLAYER_REQUEST')
+            self.start_teleport_to_player_countdown(sender, player)
             player.send_message(self.language_manager.GetText('TPA_REQUEST_ACCEPTED').format(sender.name))
             sender.send_message(self.language_manager.GetText('TPA_REQUEST_ACCEPTED_BY_TARGET').format(player.name))
         else:
             # TPHERE: 接受者传送到发送者处
-            self.start_teleport_countdown(player, sender.name, self.get_player_position_vector(sender), 'PLAYER_REQUEST')
+            self.start_teleport_to_player_countdown(player, sender)
             player.send_message(self.language_manager.GetText('TPHERE_REQUEST_ACCEPTED').format(sender.name))
             sender.send_message(self.language_manager.GetText('TPHERE_REQUEST_ACCEPTED_BY_TARGET').format(player.name))
         
@@ -1747,13 +1870,57 @@ class ARCCorePlugin(Plugin):
                 'tp_x': 'REAL NOT NULL',  # 传送点X坐标
                 'tp_y': 'REAL NOT NULL',  # 传送点Y坐标
                 'tp_z': 'REAL NOT NULL',  # 传送点Z坐标
-                'shared_users': 'TEXT'  # 共有人UUID列表(JSON字符串)
+                'shared_users': 'TEXT',  # 共有人UUID列表(JSON字符串)
+                'allow_explosion': 'INTEGER DEFAULT 0',  # 是否允许爆炸 (0=不允许, 1=允许)
+                'allow_public_interact': 'INTEGER DEFAULT 0'  # 是否对所有人开放方块互动 (0=不开放, 1=开放)
             }
 
-            return self.database_manager.create_table('lands', land_fields)
+            # 检查表是否已经存在
+            table_exists = self.database_manager.table_exists('lands')
+            
+            if table_exists:
+                # 表已存在，执行升级检查
+                self._upgrade_land_table()
+                return True
+            else:
+                # 表不存在，创建新表
+                success = self.database_manager.create_table('lands', land_fields)
+                if success:
+                    print("[ARC Core]Created new land table with all fields")
+                return success
         except Exception as e:
-            self.logger.error(f"Init land tables error: {str(e)}")
+            print(f"[ARC Core]Init land tables error: {str(e)}")
             return False
+
+    def _upgrade_land_table(self) -> bool:
+        """升级领地数据表结构，为老用户添加新字段"""
+        try:
+            # 尝试添加allow_explosion字段，如果字段已存在会失败但不影响功能
+            try:
+                self.database_manager.execute("ALTER TABLE lands ADD COLUMN allow_explosion INTEGER DEFAULT 0")
+                print("[ARC Core]Upgraded land table: added allow_explosion column")
+            except Exception as alter_error:
+                # 字段可能已经存在，这是正常的
+                if "duplicate column name" in str(alter_error).lower() or "already exists" in str(alter_error).lower():
+                    print("[ARC Core]Land table already has allow_explosion column")
+                else:
+                    print(f"[ARC Core]Could not add allow_explosion column: {str(alter_error)}")
+            
+            # 尝试添加allow_public_interact字段，如果字段已存在会失败但不影响功能
+            try:
+                self.database_manager.execute("ALTER TABLE lands ADD COLUMN allow_public_interact INTEGER DEFAULT 0")
+                print("[ARC Core]Upgraded land table: added allow_public_interact column")
+            except Exception as alter_error:
+                # 字段可能已经存在，这是正常的
+                if "duplicate column name" in str(alter_error).lower() or "already exists" in str(alter_error).lower():
+                    print("[ARC Core]Land table already has allow_public_interact column")
+                else:
+                    print(f"[ARC Core]Could not add allow_public_interact column: {str(alter_error)}")
+            
+            return True
+        except Exception as e:
+            print(f"[ARC Core]Upgrade land table error: {str(e)}")
+            return True  # 即使升级失败也不影响插件启动
 
     def _ensure_dimension_table(self, dimension: str) -> bool:
         """
@@ -1830,9 +1997,9 @@ class ARCCorePlugin(Plugin):
 
             # 插入领地基本信息
             self.database_manager.execute(
-                "INSERT INTO lands (owner_uuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, shared_users) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (owner_uuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, '[]')
+                "INSERT INTO lands (owner_uuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, shared_users, allow_explosion, allow_public_interact) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (owner_uuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, '[]', 0, 0)
             )
             result = self.database_manager.query_one("SELECT last_insert_rowid() as land_id")
             land_id = result['land_id']
@@ -2061,7 +2228,9 @@ class ARCCorePlugin(Plugin):
                     'tp_x': land['tp_x'],
                     'tp_y': land['tp_y'],
                     'tp_z': land['tp_z'],
-                    'shared_users': json.loads(land['shared_users'])
+                    'shared_users': json.loads(land['shared_users']),
+                    'allow_explosion': bool(land.get('allow_explosion', 0)),
+                    'allow_public_interact': bool(land.get('allow_public_interact', 0))
                 }
 
             return lands_info
@@ -2106,7 +2275,9 @@ class ARCCorePlugin(Plugin):
                     'tp_y': result['tp_y'],
                     'tp_z': result['tp_z'],
                     'shared_users': json.loads(result['shared_users']),
-                    'owner_uuid': result['owner_uuid']
+                    'owner_uuid': result['owner_uuid'],
+                    'allow_explosion': bool(result.get('allow_explosion', 0)),
+                    'allow_public_interact': bool(result.get('allow_public_interact', 0))
                 }
             return {}
 
@@ -2313,6 +2484,15 @@ class ARCCorePlugin(Plugin):
         land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_RESET_LAND_TP_POS_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.set_player_pos_as_land_tp_pos(p, l_id)
                                      )
+        land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_MANAGE_AUTH_BUTTON_TEXT'),
+                                     on_click=lambda p=player, l_id=land_id: self.show_land_auth_manage_panel(p, l_id)
+                                     )
+        land_detail_panel.add_button(self.language_manager.GetText('LAND_EXPLOSION_SETTING_BUTTON_TEXT'),
+                                     on_click=lambda p=player, l_id=land_id: self.show_land_explosion_setting_panel(p, l_id)
+                                     )
+        land_detail_panel.add_button(self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_BUTTON_TEXT'),
+                                     on_click=lambda p=player, l_id=land_id: self.show_land_public_interact_setting_panel(p, l_id)
+                                     )
         land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_TRANSFER_LAND_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.show_transfer_land_panel(p, l_id)
                                      )
@@ -2368,7 +2548,7 @@ class ARCCorePlugin(Plugin):
 
     def delay_teleport_to_land(self, player: Player, land_id: int, position: tuple):
         player.send_message(self.language_manager.GetText('TELEPORT_TO_LAND_START_HINT').format(land_id))
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command(player.name, position))
+        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position))
 
     def confirm_delete_land(self, player: Player, land_id: int):
         deleta_land_info = self.get_land_info(land_id)
@@ -2495,6 +2675,275 @@ class ARCCorePlugin(Plugin):
             player.send_message(self.language_manager.GetText('TRANSFER_LAND_FAILED').format(land_id))
         
         self.show_own_land_menu(player)
+
+    def show_land_auth_manage_panel(self, player: Player, land_id: int):
+        """显示领地授权管理面板"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        auth_panel = ActionForm(
+            title=self.language_manager.GetText('LAND_AUTH_MANAGE_TITLE'),
+            on_close=lambda p=player, l_id=land_id, l_info=land_info: self.show_own_land_detail_panel(p, l_id, l_info)
+        )
+        
+        auth_panel.add_button(
+            self.language_manager.GetText('LAND_AUTH_ADD_BUTTON'),
+            on_click=lambda p=player, l_id=land_id: self.show_add_land_auth_panel(p, l_id)
+        )
+        
+        if land_info['shared_users']:
+            auth_panel.add_button(
+                self.language_manager.GetText('LAND_AUTH_REMOVE_BUTTON'),
+                on_click=lambda p=player, l_id=land_id: self.show_remove_land_auth_panel(p, l_id)
+            )
+        
+        player.send_form(auth_panel)
+
+    def show_add_land_auth_panel(self, player: Player, land_id: int):
+        """显示添加领地授权面板"""
+        online_players = [p for p in self.server.online_players if p.name != player.name]
+        if not online_players:
+            no_players_panel = ActionForm(
+                title=self.language_manager.GetText('LAND_AUTH_ADD_PANEL_TITLE'),
+                content=self.language_manager.GetText('NO_OTHER_PLAYERS_ONLINE'),
+                on_close=lambda p=player, l_id=land_id: self.show_land_auth_manage_panel(p, l_id)
+            )
+            player.send_form(no_players_panel)
+            return
+
+        add_auth_panel = ActionForm(
+            title=self.language_manager.GetText('LAND_AUTH_ADD_PANEL_TITLE'),
+            content=self.language_manager.GetText('LAND_AUTH_SELECT_PLAYER_CONTENT'),
+            on_close=lambda p=player, l_id=land_id: self.show_land_auth_manage_panel(p, l_id)
+        )
+        
+        for target_player in online_players:
+            add_auth_panel.add_button(
+                self.language_manager.GetText('LAND_AUTH_ADD_TARGET_BUTTON').format(target_player.name),
+                on_click=lambda p=player, l_id=land_id, t=target_player: self.add_land_auth(p, l_id, t)
+            )
+        
+        player.send_form(add_auth_panel)
+
+    def show_remove_land_auth_panel(self, player: Player, land_id: int):
+        """显示移除领地授权面板"""
+        land_info = self.get_land_info(land_id)
+        if not land_info or not land_info['shared_users']:
+            no_auth_panel = ActionForm(
+                title=self.language_manager.GetText('LAND_AUTH_REMOVE_PANEL_TITLE'),
+                content=self.language_manager.GetText('LAND_AUTH_NO_SHARED_USERS'),
+                on_close=lambda p=player, l_id=land_id: self.show_land_auth_manage_panel(p, l_id)
+            )
+            player.send_form(no_auth_panel)
+            return
+
+        remove_auth_panel = ActionForm(
+            title=self.language_manager.GetText('LAND_AUTH_REMOVE_PANEL_TITLE'),
+            content=self.language_manager.GetText('LAND_AUTH_SELECT_REMOVE_CONTENT'),
+            on_close=lambda p=player, l_id=land_id: self.show_land_auth_manage_panel(p, l_id)
+        )
+        
+        for shared_uuid in land_info['shared_users']:
+            user_name = self.get_player_name_by_uuid(shared_uuid)
+            if user_name:
+                remove_auth_panel.add_button(
+                    self.language_manager.GetText('LAND_AUTH_REMOVE_TARGET_BUTTON').format(user_name),
+                    on_click=lambda p=player, l_id=land_id, uuid=shared_uuid, name=user_name: self.remove_land_auth(p, l_id, uuid, name)
+                )
+        
+        player.send_form(remove_auth_panel)
+
+    def add_land_auth(self, player: Player, land_id: int, target_player: Player):
+        """添加领地授权"""
+        try:
+            land_info = self.get_land_info(land_id)
+            if not land_info:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
+
+            target_uuid = str(target_player.unique_id)
+            
+            # 检查是否已经授权
+            if target_uuid in land_info['shared_users']:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_ALREADY_EXISTS').format(target_player.name))
+                self.show_land_auth_manage_panel(player, land_id)
+                return
+
+            # 添加授权
+            shared_users = land_info['shared_users']
+            shared_users.append(target_uuid)
+            
+            success = self.database_manager.execute(
+                "UPDATE lands SET shared_users = ? WHERE land_id = ?",
+                (json.dumps(shared_users), land_id)
+            )
+            
+            if success:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_SUCCESS_ADD').format(land_id, target_player.name))
+                target_player.send_message(self.language_manager.GetText('LAND_AUTH_NOTIFICATION').format(
+                    player.name, land_id, land_info['land_name']
+                ))
+            else:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_ADD'))
+                
+        except Exception as e:
+            self.logger.error(f"Add land auth error: {str(e)}")
+            player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_ADD'))
+        
+        self.show_land_auth_manage_panel(player, land_id)
+
+    def remove_land_auth(self, player: Player, land_id: int, target_uuid: str, target_name: str):
+        """移除领地授权"""
+        try:
+            land_info = self.get_land_info(land_id)
+            if not land_info:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
+
+            # 检查是否存在授权
+            if target_uuid not in land_info['shared_users']:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_NOT_EXISTS').format(target_name))
+                self.show_land_auth_manage_panel(player, land_id)
+                return
+
+            # 移除授权
+            shared_users = land_info['shared_users']
+            shared_users.remove(target_uuid)
+            
+            success = self.database_manager.execute(
+                "UPDATE lands SET shared_users = ? WHERE land_id = ?",
+                (json.dumps(shared_users), land_id)
+            )
+            
+            if success:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_SUCCESS_REMOVE').format(target_name, land_id))
+                # 通知被移除授权的玩家（如果在线）
+                target_player = self.server.get_player(target_name)
+                if target_player:
+                    target_player.send_message(self.language_manager.GetText('LAND_AUTH_REMOVE_NOTIFICATION').format(
+                        player.name, land_id, land_info['land_name']
+                    ))
+            else:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_REMOVE'))
+                
+        except Exception as e:
+            self.logger.error(f"Remove land auth error: {str(e)}")
+            player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_REMOVE'))
+        
+        self.show_land_auth_manage_panel(player, land_id)
+
+    def show_land_explosion_setting_panel(self, player: Player, land_id: int):
+        """显示领地爆炸保护设置面板"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        current_allow_explosion = land_info.get('allow_explosion', False)
+        status_text = self.language_manager.GetText('LAND_EXPLOSION_STATUS_ENABLED') if current_allow_explosion else self.language_manager.GetText('LAND_EXPLOSION_STATUS_DISABLED')
+        
+        explosion_setting_panel = ActionForm(
+            title=self.language_manager.GetText('LAND_EXPLOSION_SETTING_TITLE'),
+            content=self.language_manager.GetText('LAND_EXPLOSION_CURRENT_STATUS').format(status_text),
+            on_close=lambda p=player, l_id=land_id, l_info=land_info: self.show_own_land_detail_panel(p, l_id, l_info)
+        )
+        
+        if current_allow_explosion:
+            # 当前允许爆炸，显示禁止爆炸按钮
+            explosion_setting_panel.add_button(
+                self.language_manager.GetText('LAND_EXPLOSION_TOGGLE_DISABLE_BUTTON'),
+                on_click=lambda p=player, l_id=land_id: self.toggle_land_explosion_setting(p, l_id, False)
+            )
+        else:
+            # 当前禁止爆炸，显示允许爆炸按钮
+            explosion_setting_panel.add_button(
+                self.language_manager.GetText('LAND_EXPLOSION_TOGGLE_ENABLE_BUTTON'),
+                on_click=lambda p=player, l_id=land_id: self.toggle_land_explosion_setting(p, l_id, True)
+            )
+        
+        player.send_form(explosion_setting_panel)
+
+    def show_land_public_interact_setting_panel(self, player: Player, land_id: int):
+        """显示领地方块互动开放设置面板"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        current_allow_public_interact = land_info.get('allow_public_interact', False)
+        status_text = self.language_manager.GetText('LAND_PUBLIC_INTERACT_STATUS_ENABLED') if current_allow_public_interact else self.language_manager.GetText('LAND_PUBLIC_INTERACT_STATUS_DISABLED')
+        
+        public_interact_setting_panel = ActionForm(
+            title=self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_TITLE'),
+            content=self.language_manager.GetText('LAND_PUBLIC_INTERACT_CURRENT_STATUS').format(status_text),
+            on_close=lambda p=player, l_id=land_id, l_info=land_info: self.show_own_land_detail_panel(p, l_id, l_info)
+        )
+        
+        if current_allow_public_interact:
+            # 当前对所有人开放方块互动，显示关闭按钮
+            public_interact_setting_panel.add_button(
+                self.language_manager.GetText('LAND_PUBLIC_INTERACT_TOGGLE_DISABLE_BUTTON'),
+                on_click=lambda p=player, l_id=land_id: self.toggle_land_public_interact_setting(p, l_id, False)
+            )
+        else:
+            # 当前不对所有人开放方块互动，显示开启按钮
+            public_interact_setting_panel.add_button(
+                self.language_manager.GetText('LAND_PUBLIC_INTERACT_TOGGLE_ENABLE_BUTTON'),
+                on_click=lambda p=player, l_id=land_id: self.toggle_land_public_interact_setting(p, l_id, True)
+            )
+        
+        player.send_form(public_interact_setting_panel)
+
+    def toggle_land_public_interact_setting(self, player: Player, land_id: int, allow_public_interact: bool):
+        """切换领地方块互动开放设置"""
+        try:
+            success = self.database_manager.execute(
+                "UPDATE lands SET allow_public_interact = ? WHERE land_id = ?",
+                (1 if allow_public_interact else 0, land_id)
+            )
+            
+            if success:
+                if allow_public_interact:
+                    player.send_message(self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_UPDATED_ENABLE').format(land_id))
+                else:
+                    player.send_message(self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_UPDATED_DISABLE').format(land_id))
+            else:
+                player.send_message(self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_FAILED'))
+                
+            # 返回领地详情面板
+            land_info = self.get_land_info(land_id)
+            self.show_own_land_detail_panel(player, land_id, land_info)
+            
+        except Exception as e:
+            self.logger.error(f"Update land public interact setting error: {str(e)}")
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+
+    def toggle_land_explosion_setting(self, player: Player, land_id: int, allow_explosion: bool):
+        """切换领地爆炸保护设置"""
+        try:
+            success = self.database_manager.execute(
+                "UPDATE lands SET allow_explosion = ? WHERE land_id = ?",
+                (1 if allow_explosion else 0, land_id)
+            )
+            
+            if success:
+                if allow_explosion:
+                    player.send_message(self.language_manager.GetText('LAND_EXPLOSION_SETTING_UPDATED_ENABLE').format(land_id))
+                else:
+                    player.send_message(self.language_manager.GetText('LAND_EXPLOSION_SETTING_UPDATED_DISABLE').format(land_id))
+            else:
+                player.send_message(self.language_manager.GetText('LAND_EXPLOSION_SETTING_FAILED'))
+                
+        except Exception as e:
+            self.logger.error(f"Toggle land explosion setting error: {str(e)}")
+            player.send_message(self.language_manager.GetText('LAND_EXPLOSION_SETTING_FAILED'))
+        
+        # 返回领地详情页面
+        land_info = self.get_land_info(land_id)
+        if land_info:
+            self.show_own_land_detail_panel(player, land_id, land_info)
 
     def show_create_new_land_guide(self, player: Player):
         player.send_message(self.language_manager.GetText('CREATE_NEW_LAND_GUIDE'))
@@ -2640,15 +3089,10 @@ class ARCCorePlugin(Plugin):
 
     # Tool
     @staticmethod
-    def generate_tp_command(player_name: str, position: tuple):
-        return f'tp {player_name} {' '.join([str(int(_)) for _ in position])}'
-
-    @staticmethod
     def get_player_position_vector(player: Player):
         return (int(player.location.x), int(player.location.y), int(player.location.z))
 
     # Economy API methods for other plugins
-
     def api_get_all_money_data(self) -> dict:
         """
         获取所有玩家的金钱数据
@@ -2763,15 +3207,9 @@ class ARCCorePlugin(Plugin):
                 online_player = self.server.get_player(player_name)
                 if online_player is not None:
                     if money_to_change < 0:
-                        online_player.send_message(f'{ColorFormat.YELLOW}{self.language_manager.GetText("MONEY_CHANGE")}: '
-                                                f'{ColorFormat.RED}-{abs(money_to_change)}\n'
-                                                f'{ColorFormat.YELLOW}{self.language_manager.GetText("YOUR_MONEY")}: '
-                                                f'{ColorFormat.WHITE}{new_money}')
+                        online_player.send_message(self.language_manager.GetText('MONEY_REDUCE_HINT').format(abs(money_to_change), new_money))
                     else:
-                        online_player.send_message(f'{ColorFormat.YELLOW}{self.language_manager.GetText("MONEY_CHANGE")}: '
-                                                f'{ColorFormat.GREEN}+{money_to_change}\n'
-                                                f'{ColorFormat.YELLOW}{self.language_manager.GetText("YOUR_MONEY")}: '
-                                                f'{ColorFormat.WHITE}{new_money}')
+                        online_player.send_message(self.language_manager.GetText('MONEY_ADD_HINT').format(money_to_change, new_money))
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Change player money error: {str(e)}")
 
