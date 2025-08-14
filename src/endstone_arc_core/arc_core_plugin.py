@@ -1387,25 +1387,17 @@ class ARCCorePlugin(Plugin):
     # Teleport Functions
     def teleport_to_public_warp(self, player: Player, warp_name: str, warp_info: Dict[str, Any]):
         """传送到公共传送点"""
-        if player.location.dimension.name != warp_info['dimension']:
-            player.send_message(self.language_manager.GetText('TELEPORT_DIMENSION_ERROR').format(warp_name, warp_info['dimension']))
-            return
-        
-        self.start_teleport_to_position_countdown(player, warp_name, (warp_info['x'], warp_info['y'], warp_info['z']), 'PUBLIC_WARP')
+        self.start_teleport_to_position_countdown(player, warp_name, (warp_info['x'], warp_info['y'], warp_info['z']), 'PUBLIC_WARP', warp_info['dimension'])
 
     def teleport_to_home(self, player: Player, home_name: str, home_info: Dict[str, Any]):
         """传送到玩家传送点"""
-        if player.location.dimension.name != home_info['dimension']:
-            player.send_message(self.language_manager.GetText('TELEPORT_DIMENSION_ERROR').format(home_name, home_info['dimension']))
-            return
-        
-        self.start_teleport_to_position_countdown(player, home_name, (home_info['x'], home_info['y'], home_info['z']), 'HOME')
+        self.start_teleport_to_position_countdown(player, home_name, (home_info['x'], home_info['y'], home_info['z']), 'HOME', home_info['dimension'])
 
-    def start_teleport_to_position_countdown(self, player: Player, destination_name: str, position: tuple, teleport_type: str):
+    def start_teleport_to_position_countdown(self, player: Player, destination_name: str, position: tuple, teleport_type: str, dimension: str = 'overworld'):
         """开始传送到位置倒计时"""
         self.server.scheduler.run_task(
             self, 
-            lambda: self.execute_teleport_to_position(player, destination_name, position, teleport_type), 
+            lambda: self.execute_teleport_to_position(player, destination_name, position, teleport_type, dimension), 
             delay=45
         )
         
@@ -1430,7 +1422,7 @@ class ARCCorePlugin(Plugin):
         message = self.language_manager.GetText('TELEPORT_COUNTDOWN').format(target_player.name)
         player.send_message(message)
 
-    def execute_teleport_to_position(self, player: Player, destination_name: str, position: tuple, teleport_type: str):
+    def execute_teleport_to_position(self, player: Player, destination_name: str, position: tuple, teleport_type: str, dimension: str = 'overworld'):
         """执行传送"""
         if teleport_type == 'PUBLIC_WARP':
             message = self.language_manager.GetText('TELEPORT_TO_WARP_SUCCESS').format(destination_name)
@@ -1439,24 +1431,39 @@ class ARCCorePlugin(Plugin):
         else:
             message = self.language_manager.GetText('TELEPORT_SUCCESS').format(destination_name)
         player.send_message(message)
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position))
+        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position, dimension))
     
     def execute_teleport_to_player(self, player: Player, target_player: Player):
         """执行传送"""
         message = self.language_manager.GetText('TELEPORT_SUCCESS').format(target_player.name)
         player.send_message(message)
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_player(player.name, target_player.name))
+        # 获取目标玩家的当前维度
+        target_dimension = target_player.location.dimension.name
+        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_player(player.name, target_player.name, target_dimension))
     
     @staticmethod
-    def generate_tp_command_to_position(player_name: str, position: tuple):
-        formatted_name = f'"{player_name}"' if ' ' in player_name else player_name
-        return f'tp {formatted_name} {' '.join([str(int(_)) for _ in position])}'
+    def format_dimension_name(dimension: str) -> str:
+        """
+        将完整的维度名称转换为execute命令所需的格式
+        :param dimension: 完整维度名称 (如 'minecraft:overworld')
+        :return: 简化的维度名称 (如 'overworld')
+        """
+        if ':' in dimension:
+            return dimension.split(':')[1]
+        return dimension
 
     @staticmethod
-    def generate_tp_command_to_player(player_name: str, target_player_name: str):
+    def generate_tp_command_to_position(player_name: str, position: tuple, dimension: str = 'overworld'):
+        formatted_name = f'"{player_name}"' if ' ' in player_name else player_name
+        formatted_dimension = ARCCorePlugin.format_dimension_name(dimension)
+        return f'execute in {formatted_dimension} run tp {formatted_name} {' '.join([str(int(_)) for _ in position])}'
+
+    @staticmethod
+    def generate_tp_command_to_player(player_name: str, target_player_name: str, dimension: str = 'overworld'):
         formatted_player = f'"{player_name}"' if ' ' in player_name else player_name
         formatted_target = f'"{target_player_name}"' if ' ' in target_player_name else target_player_name
-        return f'tp {formatted_player} {formatted_target}'
+        formatted_dimension = ARCCorePlugin.format_dimension_name(dimension)
+        return f'execute in {formatted_dimension} run tp {formatted_player} {formatted_target}'
 
     # Death Location Teleport
     def teleport_to_death_location(self, player: Player):
@@ -1466,14 +1473,6 @@ class ARCCorePlugin(Plugin):
             return
         
         death_location = self.player_death_locations[player.name]
-        
-        # 检查维度
-        if player.location.dimension.name != death_location['dimension']:
-            player.send_message(self.language_manager.GetText('TELEPORT_DIMENSION_ERROR').format(
-                self.language_manager.GetText('DEATH_LOCATION_NAME'), 
-                death_location['dimension']
-            ))
-            return
         
         # 开始传送倒计时
         self.server.scheduler.run_task(
@@ -1492,10 +1491,11 @@ class ARCCorePlugin(Plugin):
         
         death_location = self.player_death_locations[player.name]
         position = (death_location['x'], death_location['y'], death_location['z'])
+        dimension = death_location['dimension']
         
         # 执行传送
         player.send_message(self.language_manager.GetText('TELEPORT_TO_DEATH_LOCATION_SUCCESS'))
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position))
+        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position, dimension))
         
         # 清理死亡位置记录
         del self.player_death_locations[player.name]
@@ -2538,17 +2538,14 @@ class ARCCorePlugin(Plugin):
         player.send_form(result_panel)
 
     def teleport_to_land(self, player: Player, land_id: int):
-        land_dimension = self.get_land_dimension(land_id)
-        if player.location.dimension.name != land_dimension:
-            player.send_message(self.language_manager.GetText('TELEPORT_TO_LAND_FAIL_DIMENSION_ERROR').format(land_id, land_dimension))
-            return
         tp_target_pos = self.get_land_teleport_point(land_id)
         self.server.scheduler.run_task(self, lambda p=player, l_id=land_id, pos=tp_target_pos: self.delay_teleport_to_land(p, l_id, pos), delay=45)
         player.send_message(self.language_manager.GetText('READY_TELEPORT_TO_LAND').format(land_id))
 
     def delay_teleport_to_land(self, player: Player, land_id: int, position: tuple):
         player.send_message(self.language_manager.GetText('TELEPORT_TO_LAND_START_HINT').format(land_id))
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position))
+        land_dimension = self.get_land_dimension(land_id)
+        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position, land_dimension))
 
     def confirm_delete_land(self, player: Player, land_id: int):
         deleta_land_info = self.get_land_info(land_id)
