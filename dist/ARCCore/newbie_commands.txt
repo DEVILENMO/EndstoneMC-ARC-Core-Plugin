@@ -1,0 +1,8 @@
+# 新人指令文件
+# 每行一个指令，{player} 会被替换为玩家名称
+# 示例：
+gamemode 0 {player}
+# clear {player}
+give {player} minecraft:bread 5
+give {player} krep:m1911
+give {player} krep:acp45 42

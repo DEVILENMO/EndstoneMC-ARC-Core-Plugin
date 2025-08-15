@@ -80,6 +80,7 @@ class ARCCorePlugin(Plugin):
     }
 
     def __init__(self):
+        # 在__init__中不能使用self.logger打印，因为self.logger还没有初始化
         super().__init__()
         self.setting_manager = SettingManager()
         default_language_dode = self.setting_manager.GetSetting('DEFAULT_LANGUAGE_CODE')
@@ -149,12 +150,120 @@ class ARCCorePlugin(Plugin):
         except (ValueError, TypeError):
             self.broadcast_interval = 300  # 默认5分钟（300秒）
 
+        # 新人欢迎系统
+        self.newbie_welcome_file = Path(MAIN_PATH) / "newbie_welcome.txt"
+        self.newbie_commands_file = Path(MAIN_PATH) / "newbie_commands.txt"
+        self._ensure_newbie_files_exist()
+
+        # 金钱排行榜设置
+        self.hide_op_in_money_ranking = self.setting_manager.GetSetting('HIDE_OP_IN_MONEY_RANKING')
+        if self.hide_op_in_money_ranking is None:
+            self.hide_op_in_money_ranking = True
+        else:
+            try:
+                self.hide_op_in_money_ranking = self.hide_op_in_money_ranking.lower() in ['true', '1', 'yes']
+            except (ValueError, AttributeError):
+                self.hide_op_in_money_ranking = True
+
         # 清道夫系统变量初始化
         self.enable_cleaner = False
         self.cleaner_interval = 600
 
     def on_load(self) -> None:
         self.logger.info(f"{ColorFormat.YELLOW}[ARC Core]Plugin loaded!")
+
+    def _safe_log(self, level: str, message: str):
+        """
+        安全的日志记录方法，在logger未初始化时使用print
+        :param level: 日志级别 (info, warning, error)
+        :param message: 日志消息
+        """
+        if hasattr(self, 'logger') and self.logger is not None:
+            if level.lower() == 'info':
+                self.logger.info(message)
+            elif level.lower() == 'warning':
+                self.logger.warning(message)
+            elif level.lower() == 'error':
+                self.logger.error(message)
+            else:
+                self.logger.info(message)
+        else:
+            # 如果logger未初始化，使用print
+            print(f"[{level.upper()}] {message}")
+
+    def _ensure_newbie_files_exist(self):
+        """确保新人欢迎相关文件存在"""
+        try:
+            # 确保目录存在
+            Path(MAIN_PATH).mkdir(exist_ok=True)
+            
+            # 创建新人欢迎消息文件
+            if not self.newbie_welcome_file.exists():
+                default_welcome = "欢迎来到我们的服务器！\n希望你在这里玩得愉快！\n如有疑问请联系管理员。"
+                self.newbie_welcome_file.write_text(default_welcome, encoding='utf-8')
+                # 在__init__期间不能使用self.logger，使用print代替
+                print(f"[ARC Core]Created default newbie welcome file: {self.newbie_welcome_file}")
+            
+            # 创建新人指令文件
+            if not self.newbie_commands_file.exists():
+                default_commands = "# 新人指令文件\n# 每行一个指令，{player} 会被替换为玩家名称\n# 示例：\n# gamemode 0 {player}\n# give {player} minecraft:bread 16\n# clear {player}"
+                self.newbie_commands_file.write_text(default_commands, encoding='utf-8')
+                # 在__init__期间不能使用self.logger，使用print代替
+                print(f"[ARC Core]Created default newbie commands file: {self.newbie_commands_file}")
+                
+        except Exception as e:
+            # 在__init__期间不能使用self.logger，使用print代替
+            print(f"[ARC Core]Failed to create newbie files: {str(e)}")
+
+    def _send_newbie_welcome_message(self, player: Player):
+        """发送新人欢迎消息"""
+        try:
+            if self.newbie_welcome_file.exists():
+                welcome_content = self.newbie_welcome_file.read_text(encoding='utf-8').strip()
+                if welcome_content:
+                    # 将换行符分割成多条消息
+                    messages = welcome_content.split('\n')
+                    for message in messages:
+                        if message.strip():  # 跳过空行
+                            player.send_message(f"§e[欢迎] §f{message.strip()}")
+                    self.logger.info(f"[ARC Core]Sent welcome message to new player: {player.name}")
+                else:
+                    self.logger.warning(f"[ARC Core]Welcome file is empty: {self.newbie_welcome_file}")
+            else:
+                self.logger.warning(f"[ARC Core]Welcome file not found: {self.newbie_welcome_file}")
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Failed to send welcome message to {player.name}: {str(e)}")
+
+    def _execute_newbie_commands(self, player: Player):
+        """执行新人指令"""
+        try:
+            if self.newbie_commands_file.exists():
+                commands_content = self.newbie_commands_file.read_text(encoding='utf-8').strip()
+                if commands_content:
+                    lines = commands_content.split('\n')
+                    executed_count = 0
+                    for line in lines:
+                        line = line.strip()
+                        # 跳过空行和注释行
+                        if line and not line.startswith('#'):
+                            # 替换玩家名称占位符
+                            command = line.replace('{player}', player.name)
+                            # 执行指令
+                            try:
+                                self.server.dispatch_command(self.server.command_sender, command)
+                                executed_count += 1
+                                self.logger.info(f"[ARC Core]Executed newbie command for {player.name}: {command}")
+                            except Exception as cmd_e:
+                                self.logger.error(f"[ARC Core]Failed to execute command '{command}' for {player.name}: {str(cmd_e)}")
+                    
+                    if executed_count > 0:
+                        self.logger.info(f"[ARC Core]Executed {executed_count} newbie commands for {player.name}")
+                else:
+                    self.logger.warning(f"[ARC Core]Commands file is empty: {self.newbie_commands_file}")
+            else:
+                self.logger.warning(f"[ARC Core]Commands file not found: {self.newbie_commands_file}")
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Failed to execute newbie commands for {player.name}: {str(e)}")
 
     def on_enable(self) -> None:
         self.register_events(self)
@@ -311,6 +420,16 @@ class ARCCorePlugin(Plugin):
     # Event handlers
     @event_handler
     def on_player_join(self, event: PlayerJoinEvent):
+        # 在玩家加入时立即初始化玩家数据（基本信息和经济数据）
+        success, is_new_player = self.ensure_player_data_initialized(event.player)
+        
+        # 如果是新玩家，执行新人欢迎功能
+        if is_new_player and success:
+            # 发送新人欢迎消息
+            self._send_newbie_welcome_message(event.player)
+            # 执行新人指令
+            self._execute_newbie_commands(event.player)
+        
         self.server.broadcast_message(self.language_manager.GetText('PLAYER_JOIN_MESSAGE').format(event.player.name))
         self.player_authentication_state[event.player.name] = False
         event.player.send_message(self.language_manager.GetText('PLAYER_JOIN_HINT'))
@@ -377,7 +496,7 @@ class ARCCorePlugin(Plugin):
         
         # 检查是否在领地内且不是领地主人
         if not self.land_interact_check(event.player, dimension, pos):
-            event.cancelled = True
+            event.is_cancelled = True
 
     @event_handler
     def on_actor_explode(self, event: ActorExplodeEvent):
@@ -392,7 +511,7 @@ class ARCCorePlugin(Plugin):
                 land_info = self.get_land_info(land_id)
                 if land_info and not land_info.get('allow_explosion', False):
                     # 如果领地不允许爆炸，则取消爆炸事件
-                    event.cancelled = True
+                    event.is_cancelled = True
                     return
                     
             # 检查爆炸影响的方块是否在领地内
@@ -505,15 +624,89 @@ class ARCCorePlugin(Plugin):
         self.init_teleport_tables()
 
     # Player basic info
+    def _column_exists(self, table: str, column: str) -> bool:
+        """
+        检查表中是否存在指定列
+        :param table: 表名
+        :param column: 列名
+        :return: 列是否存在
+        """
+        try:
+            result = self.database_manager.query_one(f"PRAGMA table_info({table})")
+            if not result:
+                return False
+            
+            # PRAGMA table_info 返回所有列的信息
+            columns_info = self.database_manager.query_all(f"PRAGMA table_info({table})")
+            for col_info in columns_info:
+                if col_info['name'] == column:
+                    return True
+            return False
+        except Exception as e:
+            # 在__init__期间不能使用self.logger，使用print代替
+            print(f"[ARC Core]Check column exists error: {str(e)}")
+            return False
+
+    def _add_column_if_not_exists(self, table: str, column: str, column_type: str) -> bool:
+        """
+        如果列不存在则添加列
+        :param table: 表名
+        :param column: 列名
+        :param column_type: 列类型定义
+        :return: 是否成功
+        """
+        try:
+            if not self._column_exists(table, column):
+                sql = f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
+                success = self.database_manager.execute(sql)
+                if success:
+                    # 在__init__期间不能使用self.logger，使用print代替
+                    print(f"[ARC Core]Added column '{column}' to table '{table}'")
+                else:
+                    print(f"[ARC Core]Failed to add column '{column}' to table '{table}'")
+                return success
+            return True  # 列已存在，返回成功
+        except Exception as e:
+            # 在__init__期间不能使用self.logger，使用print代替
+            print(f"[ARC Core]Add column error: {str(e)}")
+            return False
+
+    def _upgrade_player_basic_table(self) -> bool:
+        """
+        升级玩家基本信息表结构
+        """
+        try:
+            success = True
+            # 检查并添加 is_op 列
+            if not self._add_column_if_not_exists('player_basic_info', 'is_op', 'INTEGER DEFAULT 0'):
+                success = False
+            
+            # 可以在这里添加其他字段的升级逻辑
+            # if not self._add_column_if_not_exists('player_basic_info', 'other_field', 'TEXT'):
+            #     success = False
+            
+            return success
+        except Exception as e:
+            # 在__init__期间不能使用self.logger，使用print代替
+            print(f"[ARC Core]Upgrade player basic table error: {str(e)}")
+            return False
+
     def init_player_basic_table(self) -> bool:
         """初始化玩家基本信息表"""
         fields = {
             'uuid': 'TEXT PRIMARY KEY',  # 玩家UUID作为主键
             'xuid': 'TEXT NOT NULL',  # 玩家XUID
             'name': 'TEXT NOT NULL',  # 玩家名称
-            'password': 'TEXT'  # 玩家密码(加密后的)，允许为NULL
+            'password': 'TEXT',  # 玩家密码(加密后的)，允许为NULL
+            'is_op': 'INTEGER DEFAULT 0'  # 玩家是否为OP，默认为0(false)
         }
-        return self.database_manager.create_table('player_basic_info', fields)
+        result = self.database_manager.create_table('player_basic_info', fields)
+        
+        # 对于已存在的表，执行升级操作
+        if result:
+            self._upgrade_player_basic_table()
+        
+        return result
 
     def _hash_password(self, password: str) -> str:
         """
@@ -535,12 +728,93 @@ class ARCCorePlugin(Plugin):
                 'uuid': str(player.unique_id),
                 'xuid': str(player.xuid),
                 'name': player.name,
-                'password': None  # 初始密码为空
+                'password': None,  # 初始密码为空
+                'is_op': 1 if player.is_op else 0  # 根据玩家当前OP状态设置
             }
             return self.database_manager.insert('player_basic_info', player_data)
         except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Init player basic info error: {str(e)}")
+            self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Init player basic info error: {str(e)}")
             return False
+
+    def init_player_economy_info(self, player: Player) -> bool:
+        """
+        初始化玩家经济信息
+        :param player: 玩家对象
+        :return: 是否初始化成功
+        """
+        try:
+            player_uuid = str(player.unique_id)
+            # 检查玩家经济数据是否已存在
+            existing_data = self.database_manager.query_one(
+                "SELECT uuid FROM player_economy WHERE uuid = ?",
+                (player_uuid,)
+            )
+            if existing_data:
+                return True  # 已存在，无需重复创建
+
+            # 获取初始金钱设置
+            player_init_money_num = self.setting_manager.GetSetting('PLAYER_INIT_MONEY_NUM')
+            try:
+                init_money = int(player_init_money_num)
+            except (ValueError, TypeError):
+                init_money = 0
+
+            # 创建经济数据
+            economy_data = {
+                'uuid': player_uuid,
+                'money': init_money
+            }
+            return self.database_manager.insert('player_economy', economy_data)
+        except Exception as e:
+            self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Init player economy info error: {str(e)}")
+            return False
+
+    def ensure_player_data_initialized(self, player: Player) -> tuple[bool, bool]:
+        """
+        确保玩家数据已完全初始化（基本信息和经济数据）
+        :param player: 玩家对象
+        :return: (是否初始化成功, 是否为新玩家)
+        """
+        try:
+            player_uuid = str(player.unique_id)
+            success = True
+            is_new_player = False
+
+            # 检查并初始化玩家基本信息
+            basic_info = self.database_manager.query_one(
+                "SELECT uuid FROM player_basic_info WHERE uuid = ?",
+                (player_uuid,)
+            )
+            if not basic_info:
+                is_new_player = True  # 没有基本信息说明是新玩家
+                if not self.init_player_basic_info(player):
+                    self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Failed to init basic info for player {player.name}")
+                    success = False
+                else:
+                    self._safe_log('info', f"{ColorFormat.GREEN}[ARC Core]Initialized basic info for new player {player.name}")
+
+            # 更新玩家名称（如果发生变化）
+            self.update_player_name(player)
+
+            # 更新玩家OP状态
+            self.update_player_op_status(player)
+
+            # 检查并初始化玩家经济信息
+            if not self.init_player_economy_info(player):
+                self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Failed to init economy info for player {player.name}")
+                success = False
+            else:
+                # 获取初始化后的金钱数量用于日志
+                money = self.get_player_money(player)
+                if is_new_player:
+                    self._safe_log('info', f"{ColorFormat.GREEN}[ARC Core]Initialized economy data for new player {player.name}, balance: {money}")
+                else:
+                    self._safe_log('info', f"{ColorFormat.GREEN}[ARC Core]Ensured economy data for player {player.name}, balance: {money}")
+
+            return success, is_new_player
+        except Exception as e:
+            self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Ensure player data initialized error: {str(e)}")
+            return False, False
 
     def get_player_basic_info(self, player: Player) -> Optional[Dict[str, Any]]:
         """
@@ -630,13 +904,83 @@ class ARCCorePlugin(Plugin):
                     params=(str(player.unique_id),)
                 )
                 if success:
-                    self.logger.info(f"Player {current_info['name']} changed name to {player.name}")
+                    self._safe_log('info', f"Player {current_info['name']} changed name to {player.name}")
                 return success
 
             return True  # 名称没有变化，视为成功
         except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Update player name error: {str(e)}")
+            self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Update player name error: {str(e)}")
             return False
+
+    def update_player_op_status(self, player: Player) -> bool:
+        """
+        更新玩家OP状态
+        :param player: 玩家对象
+        :return: 是否更新成功
+        """
+        try:
+            current_op_status = 1 if player.is_op else 0
+            
+            # 检查当前数据库中的OP状态
+            current_info = self.database_manager.query_one(
+                "SELECT is_op FROM player_basic_info WHERE uuid = ?",
+                (str(player.unique_id),)
+            )
+            
+            if current_info is not None:
+                stored_op_status = current_info.get('is_op', 0)
+                if stored_op_status != current_op_status:
+                    # OP状态发生变化，更新数据库
+                    success = self.database_manager.update(
+                        table='player_basic_info',
+                        data={'is_op': current_op_status},
+                        where='uuid = ?',
+                        params=(str(player.unique_id),)
+                    )
+                    if success:
+                        status_text = "OP" if current_op_status else "非OP"
+                        self._safe_log('info', f"{ColorFormat.GREEN}[ARC Core]Updated player OP status: {player.name} -> {status_text}")
+                    return success
+            return True  # 状态未变化或记录不存在，返回成功
+        except Exception as e:
+            self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Update player OP status error: {str(e)}")
+            return False
+
+    def get_offline_player_op_status(self, player_name: str) -> Optional[bool]:
+        """
+        获取离线玩家的OP状态
+        :param player_name: 玩家名称
+        :return: OP状态，如果玩家不存在则返回None
+        """
+        try:
+            result = self.database_manager.query_one(
+                "SELECT is_op FROM player_basic_info WHERE name = ?",
+                (player_name,)
+            )
+            if result is not None:
+                return bool(result['is_op'])
+            return None
+        except Exception as e:
+            self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Get offline player OP status error: {str(e)}")
+            return None
+
+    def get_offline_player_op_status_by_uuid(self, player_uuid: str) -> Optional[bool]:
+        """
+        通过UUID获取离线玩家的OP状态
+        :param player_uuid: 玩家UUID
+        :return: OP状态，如果玩家不存在则返回None
+        """
+        try:
+            result = self.database_manager.query_one(
+                "SELECT is_op FROM player_basic_info WHERE uuid = ?",
+                (player_uuid,)
+            )
+            if result is not None:
+                return bool(result['is_op'])
+            return None
+        except Exception as e:
+            self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Get offline player OP status by UUID error: {str(e)}")
+            return None
 
     def get_player_name_by_uuid(self, player_uuid: str) -> Optional[str]:
         """
@@ -1036,11 +1380,28 @@ class ARCCorePlugin(Plugin):
         return error_code, receive_player, amount
 
     def show_money_rank_panel(self, player: Player):
-        rank_dict = self.get_top_richest_players(10)
+        # 获取更多的玩家数据以便过滤后仍有足够的显示数量
+        initial_count = 20 if self.hide_op_in_money_ranking else 10
+        rank_dict = self.get_top_richest_players(initial_count)
+        
+        # 如果启用了隐藏OP功能，在业务逻辑层过滤OP玩家
+        filtered_rank_dict = {}
+        for player_name, player_money in rank_dict.items():
+            if self.hide_op_in_money_ranking:
+                # 检查玩家是否为OP
+                is_op = self.get_offline_player_op_status(player_name)
+                if is_op is True:
+                    continue  # 跳过OP玩家
+            filtered_rank_dict[player_name] = player_money
+            # 如果已经有足够的显示数量，停止添加
+            if len(filtered_rank_dict) >= 10:
+                break
+        
         rank_list = []
-        for i, (player_name, player_money) in enumerate(rank_dict.items()):
+        for i, (player_name, player_money) in enumerate(filtered_rank_dict.items()):
             rank_list.append(
                 self.language_manager.GetText('MONEY_RANK_INFO_TEXT').format(i + 1, player_name, player_money))
+        
         rank_panel = ActionForm(
             title=self.language_manager.GetText('MONEY_RANK_PANEL_TITLE'),
             content='\n'.join(rank_list) + '\n' + self.language_manager.GetText('MONEY_RANK_PLYAER_RANK_INFO_TEXT').format(self.get_player_money(player), self.get_player_money_rank(player)),
