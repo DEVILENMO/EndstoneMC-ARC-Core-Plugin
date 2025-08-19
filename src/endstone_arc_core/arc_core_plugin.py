@@ -18,7 +18,7 @@ from endstone_arc_core.SettingManager import SettingManager
 MAIN_PATH = 'plugins/ARCCore'
 
 class ARCCorePlugin(Plugin):
-    api_version = "0.7"
+    api_version = "0.10"
     commands = {
         "updatespawnpos": {
             "description": "Update spawn position of current dimension.",
@@ -1087,10 +1087,16 @@ class ARCCorePlugin(Plugin):
             arc_menu.add_button(self.language_manager.GetText('LAND_MENU_NAME'), on_click=self.show_land_main_menu)
             if self.server.plugin_manager.get_plugin('ushop'):
                 arc_menu.add_button(self.language_manager.GetText('SHOP_MENU_NAME'), on_click=self.show_shop_menu)
+            if self.server.plugin_manager.get_plugin('arc_dtwt'):
+                arc_menu.add_button(self.language_manager.GetText('DTWT_MENU_NAME'), on_click=self.show_dtwt_panel)
             if player.is_op:
                 arc_menu.add_button(self.language_manager.GetText('OP_PANEL_NAME'), on_click=self.show_op_main_panel)
+            arc_menu.add_button(self.language_manager.GetText('SUICIDE_FUNC_BUTTON'), on_click=self.execute_suicide)
             arc_menu.on_close = None
             player.send_form(arc_menu)
+    
+    def execute_suicide(self, player: Player):
+        player.perform_command('suicide')
 
     # Register and login
     def login_successfully(self, player: Player):
@@ -1809,6 +1815,29 @@ class ARCCorePlugin(Plugin):
         :param dimension: 完整维度名称 (如 'minecraft:overworld')
         :return: 简化的维度名称 (如 'overworld')
         """
+        # 明确的维度名称映射，确保正确处理
+        dimension_mapping = {
+            # 标准Minecraft格式
+            'minecraft:overworld': 'overworld',
+            'minecraft:the_nether': 'the_nether', 
+            'minecraft:the_end': 'the_end',
+            # EndStone可能的格式
+            'Overworld': 'overworld',
+            'TheNether': 'the_nether',
+            'TheEnd': 'the_end',
+            # 其他可能的格式
+            'overworld': 'overworld',
+            'the_nether': 'the_nether',
+            'the_end': 'the_end',
+            'nether': 'the_nether',
+            'end': 'the_end'
+        }
+        
+        # 如果在映射表中，直接返回映射的值
+        if dimension in dimension_mapping:
+            return dimension_mapping[dimension]
+        
+        # 否则使用通用的处理方式（去掉命名空间前缀）
         if ':' in dimension:
             return dimension.split(':')[1]
         return dimension
@@ -2039,13 +2068,6 @@ class ARCCorePlugin(Plugin):
         
         if not sender:
             player.send_message(self.language_manager.GetText('REQUEST_SENDER_OFFLINE'))
-            del self.teleport_requests[player.name]
-            return
-        
-        # 检查维度
-        if sender.location.dimension.name != player.location.dimension.name:
-            player.send_message(self.language_manager.GetText('TELEPORT_REQUEST_DIMENSION_ERROR'))
-            sender.send_message(self.language_manager.GetText('TELEPORT_REQUEST_DIMENSION_ERROR'))
             del self.teleport_requests[player.name]
             return
         
@@ -3396,7 +3418,7 @@ class ARCCorePlugin(Plugin):
 
     def delay_drop_item(self):
         self.server.broadcast_message(self.language_manager.GetText('CLEAR_DROP_ITEM_BROADCAST'))
-        self.server.dispatch_command(self.server.command_sender, 'kill @e[type=item]')
+        self.execute_cleaner()
 
     def record_coordinate_1(self, player: Player):
         if not player.name in self.op_coordinate1_dict:
@@ -3444,6 +3466,10 @@ class ARCCorePlugin(Plugin):
             on_submit=try_execute_command
         )
         player.send_form(command_input_form)
+    
+    # DTWT Plugin related functions
+    def show_dtwt_panel(self, player: Player):
+        player.perform_command('dtwt')
 
     # Tool
     @staticmethod
@@ -3689,7 +3715,7 @@ class ARCCorePlugin(Plugin):
                 player.send_message(self.language_manager.GetText('CLEAR_DROP_ITEM_BROADCAST'))
 
             # 执行清理命令
-            self.server.dispatch_command(self.server.command_sender, "kill @e[type=item]")
+            self.server.dispatch_command(self.server.command_sender, "kill @e[type=item,name=!\"Trial Key\",name=!\"Ominous Trial Key\"]")
 
             # 发送清理完成消息
             self.server.scheduler.run_task(self, self.cleaner_complete_message, delay=20)  # 1秒后发送完成消息
