@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
 from endstone import ColorFormat, Player, GameMode
-from endstone._internal.endstone_python import ActionForm, TextInput, ModalForm
+from endstone.form import ActionForm, TextInput, ModalForm, Label
 from endstone.command import Command, CommandSender
 from endstone.event import event_handler, PlayerJoinEvent, PlayerQuitEvent, BlockBreakEvent, BlockPlaceEvent, PlayerDeathEvent, PlayerInteractEvent, ActorExplodeEvent 
 from endstone.plugin import Plugin
@@ -681,9 +681,10 @@ class ARCCorePlugin(Plugin):
             if not self._add_column_if_not_exists('player_basic_info', 'is_op', 'INTEGER DEFAULT 0'):
                 success = False
             
-            # 可以在这里添加其他字段的升级逻辑
-            # if not self._add_column_if_not_exists('player_basic_info', 'other_field', 'TEXT'):
-            #     success = False
+            # 检查并添加 remaining_free_land_blocks 列
+            default_free_blocks = self.setting_manager.GetSetting('DEFAULT_FREE_LAND_BLOCKS') or '100'
+            if not self._add_column_if_not_exists('player_basic_info', 'remaining_free_land_blocks', f'INTEGER DEFAULT {default_free_blocks}'):
+                success = False
             
             return success
         except Exception as e:
@@ -693,12 +694,16 @@ class ARCCorePlugin(Plugin):
 
     def init_player_basic_table(self) -> bool:
         """初始化玩家基本信息表"""
+        # 从配置文件获取默认免费领地格子数
+        default_free_blocks = self.setting_manager.GetSetting('DEFAULT_FREE_LAND_BLOCKS') or '100'
+        
         fields = {
             'uuid': 'TEXT PRIMARY KEY',  # 玩家UUID作为主键
             'xuid': 'TEXT NOT NULL',  # 玩家XUID
             'name': 'TEXT NOT NULL',  # 玩家名称
             'password': 'TEXT',  # 玩家密码(加密后的)，允许为NULL
-            'is_op': 'INTEGER DEFAULT 0'  # 玩家是否为OP，默认为0(false)
+            'is_op': 'INTEGER DEFAULT 0',  # 玩家是否为OP，默认为0(false)
+            'remaining_free_land_blocks': f'INTEGER DEFAULT {default_free_blocks}'  # 剩余免费领地格子数
         }
         result = self.database_manager.create_table('player_basic_info', fields)
         
@@ -724,12 +729,16 @@ class ARCCorePlugin(Plugin):
         :return: 是否初始化成功
         """
         try:
+            # 获取默认免费领地格子数
+            default_free_blocks = int(self.setting_manager.GetSetting('DEFAULT_FREE_LAND_BLOCKS') or '100')
+            
             player_data = {
                 'uuid': str(player.unique_id),
                 'xuid': str(player.xuid),
                 'name': player.name,
                 'password': None,  # 初始密码为空
-                'is_op': 1 if player.is_op else 0  # 根据玩家当前OP状态设置
+                'is_op': 1 if player.is_op else 0,  # 根据玩家当前OP状态设置
+                'remaining_free_land_blocks': default_free_blocks  # 设置默认免费格子数
             }
             return self.database_manager.insert('player_basic_info', player_data)
         except Exception as e:
@@ -1238,6 +1247,36 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Remove player money error: {str(e)}")
             return False
 
+    def get_player_free_land_blocks(self, player: Player) -> int:
+        """获取玩家剩余免费领地格子数"""
+        try:
+            player_uuid = str(player.unique_id)
+            result = self.database_manager.query_one(
+                "SELECT remaining_free_land_blocks FROM player_basic_info WHERE uuid = ?",
+                (player_uuid,)
+            )
+            if result is None:
+                # 如果没有记录，返回默认值
+                default_free_blocks = int(self.setting_manager.GetSetting('DEFAULT_FREE_LAND_BLOCKS') or '100')
+                return default_free_blocks
+            return result['remaining_free_land_blocks'] or 0
+        except Exception as e:
+            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player free land blocks error: {str(e)}")
+            return 0
+
+    def set_player_free_land_blocks(self, player: Player, amount: int) -> bool:
+        """设置玩家剩余免费领地格子数"""
+        try:
+            player_uuid = str(player.unique_id)
+            return self.database_manager.update(
+                'player_basic_info',
+                {'remaining_free_land_blocks': amount},
+                f"uuid = '{player_uuid}'"
+            )
+        except Exception as e:
+            self.logger.error(f"{ColorFormat.RED}[ARC Core]Set player free land blocks error: {str(e)}")
+            return False
+
     def get_top_richest_players(self, top_count: int) -> Dict[str, int]:
         try:
             results = self.database_manager.query_all(
@@ -1301,45 +1340,86 @@ class ARCCorePlugin(Plugin):
         player.send_form(bank_main_menu)
 
     def show_transfer_panel(self, player: Player):
-        player_name_input = TextInput(
-            label=self.language_manager.GetText('TRANSFER_PANEL_PLAYER_NAME_INPUT_LABEL'),
-            placeholder=self.language_manager.GetText('TRANSFER_PANEL_PLAYER_NAME_INPUT_PLACEHOLDER')
+        """显示在线玩家选择面板"""
+        online_players = self.server.online_players
+        # 过滤掉自己
+        available_players = [p for p in online_players if p.name != player.name]
+        
+        if not available_players:
+            # 没有其他在线玩家
+            no_players_form = ActionForm(
+                title=self.language_manager.GetText('TRANSFER_PANEL_TITLE'),
+                content=self.language_manager.GetText('TRANSFER_NO_ONLINE_PLAYERS_TEXT'),
+                on_close=self.show_bank_main_menu
+            )
+            player.send_form(no_players_form)
+            return
+        
+        # 创建玩家选择面板
+        player_select_panel = ActionForm(
+            title=self.language_manager.GetText('TRANSFER_PANEL_TITLE'),
+            content=self.language_manager.GetText('TRANSFER_SELECT_PLAYER_CONTENT').format(self.get_player_money(player))
         )
+        
+        # 为每个在线玩家添加按钮
+        for target_player in available_players:
+            player_select_panel.add_button(
+                f"{target_player.name}",
+                on_click=lambda sender, target=target_player: self.show_transfer_amount_panel(sender, target)
+            )
+        
+        # 添加返回按钮
+        player_select_panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=self.show_bank_main_menu
+        )
+        
+        player.send_form(player_select_panel)
+    
+    def show_transfer_amount_panel(self, player: Player, target_player: Player):
+        """显示转账金额输入面板"""
+        # 添加信息标签来显示转账信息
+        info_label = Label(
+            text=self.language_manager.GetText('TRANSFER_PANEL_INFO_LABEL').format(target_player.name, self.get_player_money(player))
+        )
+        
         money_amount_input = TextInput(
             label=self.language_manager.GetText('TRANSFER_PANEL_MONEY_AMOUNT_INPUT_LABEL'),
             placeholder=self.language_manager.GetText('TRANSFER_PANEL_MONEY_AMOUNT_INPUT_PLACEHOLDER'),
             default_value='0'
         )
 
-        def try_transfer(player: Player, json_str: str):
+        def try_transfer(sender: Player, json_str: str):
             data = json.loads(json_str)
-            error_code, receive_player, amount = self._validate_transfer_data(player, data)
+            # 直接使用目标玩家对象和金额进行转账
+            error_code, receive_player, amount = self._validate_transfer_data_new(sender, target_player, data[1])
             if error_code == 0:
-                self.decrease_player_money(player, amount)
+                self.decrease_player_money(sender, amount)
                 self.increase_player_money(receive_player, amount)
                 receive_player.send_message(self.language_manager.GetText('RECEIVE_PLAYER_TRANSFER_MESSAGE').format(
-                    player.name,
+                    sender.name,
                     amount,
                     self.get_player_money(receive_player)))
                 result_str = self.language_manager.GetText('TRANSFER_COMPLETED_HINT_TEXT').format(
                     receive_player.name,
                     amount,
-                    self.get_player_money(player)
+                    self.get_player_money(sender)
                 )
             else:
                 result_str = self.language_manager.GetText(f'TRANSFER_ERROR_{error_code}_TEXT')
                 if error_code == 2:
-                    result_str = result_str.format(data[0])
+                    result_str = result_str.format(target_player.name)
             result_form = ActionForm(
                 title=self.language_manager.GetText('TRANSFER_RESULT_PANEL_TITLE'),
                 content=result_str,
                 on_close=self.show_bank_main_menu
             )
-            player.send_form(result_form)
+            sender.send_form(result_form)
+
         transfer_panel = ModalForm(
             title=self.language_manager.GetText('TRANSFER_PANEL_TITLE'),
-            controls=[player_name_input, money_amount_input],
-            on_close=self.show_bank_main_menu,
+            controls=[info_label, money_amount_input],
+            on_close=lambda sender: self.show_transfer_panel(sender),
             on_submit=try_transfer
         )
         player.send_form(transfer_panel)
@@ -1384,6 +1464,42 @@ class ARCCorePlugin(Plugin):
             return 4, receive_player, amount
 
         return error_code, receive_player, amount
+
+    def _validate_transfer_data_new(self, player: Player, target_player: Player, amount_str: str) -> tuple[int, Optional[Player], Optional[int]]:
+        """
+        验证新转账流程的数据
+        :param player: 发起转账的玩家
+        :param target_player: 目标玩家对象
+        :param amount_str: 转账金额字符串
+        :return: (错误码, 接收玩家对象, 转账金额)
+        """
+        # 初始化返回值
+        error_code = 0
+        amount = None
+
+        # 检查目标玩家是否仍在线
+        if target_player not in self.server.online_players:
+            return 2, target_player, None
+
+        # 检查是否自己给自己转账（理论上不会发生，但保险起见）
+        if target_player.name == player.name:
+            return 6, target_player, None
+
+        # 检查并转换金额
+        try:
+            amount = int(amount_str)
+        except (ValueError, TypeError):
+            return 3, target_player, None
+
+        # 检查金额是否大于0
+        if amount <= 0:
+            return 5, target_player, amount
+
+        # 检查玩家余额是否足够
+        if not self.judge_if_player_has_enough_money(player, amount):
+            return 4, target_player, amount
+
+        return error_code, target_player, amount
 
     def show_money_rank_panel(self, player: Player):
         # 获取更多的玩家数据以便过滤后仍有足够的显示数量
@@ -2075,13 +2191,15 @@ class ARCCorePlugin(Plugin):
         if request['type'] == 'tpa':
             # TPA: 发送者传送到接受者处
             self.start_teleport_to_player_countdown(sender, player)
-            player.send_message(self.language_manager.GetText('TPA_REQUEST_ACCEPTED').format(sender.name))
-            sender.send_message(self.language_manager.GetText('TPA_REQUEST_ACCEPTED_BY_TARGET').format(player.name))
+            # 修正：接受者收到"你接受了XX的传送请求"，发起者收到"玩家XX接受了你的传送请求"
+            player.send_message(self.language_manager.GetText('TPA_REQUEST_ACCEPTED_BY_TARGET').format(sender.name))
+            sender.send_message(self.language_manager.GetText('TPA_REQUEST_ACCEPTED').format(player.name))
         else:
             # TPHERE: 接受者传送到发送者处
             self.start_teleport_to_player_countdown(player, sender)
-            player.send_message(self.language_manager.GetText('TPHERE_REQUEST_ACCEPTED').format(sender.name))
-            sender.send_message(self.language_manager.GetText('TPHERE_REQUEST_ACCEPTED_BY_TARGET').format(player.name))
+            # 修正：接受者收到"你接受了XX的传送到此地请求"，发起者收到"玩家XX接受了你的传送到此地请求"
+            player.send_message(self.language_manager.GetText('TPHERE_REQUEST_ACCEPTED_BY_TARGET').format(sender.name))
+            sender.send_message(self.language_manager.GetText('TPHERE_REQUEST_ACCEPTED').format(player.name))
         
         # 清理请求
         del self.teleport_requests[player.name]
@@ -3347,7 +3465,17 @@ class ARCCorePlugin(Plugin):
             max_z = max(int(self.player_new_land_creation_info[player.name][1][1]),
                         int(self.player_new_land_creation_info[player.name][2][1]))
             area = (max_x - min_x + 1) * (max_z - min_z + 1)
-            money_cost = area * self.land_price
+            
+            # 获取玩家剩余免费领地格子数
+            remaining_free_blocks = self.get_player_free_land_blocks(player)
+            
+            # 计算需要付费的格子数
+            paid_blocks = max(0, area - remaining_free_blocks)
+            money_cost = paid_blocks * self.land_price
+            
+            # 计算实际使用的免费格子数
+            used_free_blocks = min(area, remaining_free_blocks)
+            
             new_land_form = ActionForm(
                 title=self.language_manager.GetText('NEW_LAND_TITLE'),
                 content=self.language_manager.GetText('NEW_LAND_INFO_TEXT').replace('\\n', '\n').format(
@@ -3364,7 +3492,8 @@ class ARCCorePlugin(Plugin):
                 (min_x, min_z),  # start_pos
                 (max_x, max_z),  # end_pos
                 area,
-                money_cost
+                money_cost,
+                used_free_blocks
             ))
             player.send_form(new_land_form)
             return
@@ -3372,13 +3501,23 @@ class ARCCorePlugin(Plugin):
     def clear_new_land_creation_info_memory(self, player: Player):
         self.player_new_land_creation_info.pop(player.name)
 
-    def player_buy_new_land(self, player: Player, dimension: str, start_pos: tuple, end_pos: tuple, area: int, money_cost: int):
+    def player_buy_new_land(self, player: Player, dimension: str, start_pos: tuple, end_pos: tuple, area: int, money_cost: int, used_free_blocks: int = 0):
         if self.judge_if_player_has_enough_money(player, money_cost) or player.is_op:
             land_id = self.create_land(str(player.unique_id), self.language_manager.GetText('DEFAULT_LAND_NAME').format(player.name, self.get_player_land_count(str(player.unique_id)) + 1), dimension, start_pos[0], end_pos[0], start_pos[1], end_pos[1], player.location.x, player.location.y, player.location.z)
             if land_id is not None:
                 if not player.is_op:
-                    self.decrease_player_money(player, money_cost)
-                    player.send_message(self.language_manager.GetText('PAY_SUCCESS_HINT').format(money_cost, self.get_player_money(player)))
+                    # 扣除金钱
+                    if money_cost > 0:
+                        self.decrease_player_money(player, money_cost)
+                        player.send_message(self.language_manager.GetText('PAY_SUCCESS_HINT').format(money_cost, self.get_player_money(player)))
+                    
+                    # 扣除免费格子数
+                    if used_free_blocks > 0:
+                        current_free_blocks = self.get_player_free_land_blocks(player)
+                        new_free_blocks = max(0, current_free_blocks - used_free_blocks)
+                        self.set_player_free_land_blocks(player, new_free_blocks)
+                        player.send_message(self.language_manager.GetText('USE_FREE_BLOCKS_HINT', f'使用了 {used_free_blocks} 个免费格子').format(used_free_blocks))
+                
                 self.clear_new_land_creation_info_memory(player)
                 self.show_own_land_detail_panel(player, land_id, self.get_land_info(land_id))
             else:

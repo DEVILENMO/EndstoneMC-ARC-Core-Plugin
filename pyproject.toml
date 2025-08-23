@@ -4,12 +4,18 @@ build-backend = "hatchling.build"
 
 [project]
 name = "endstone_arc_core"
-version = "0.0.1"
+version = "0.0.1.6"
 dependencies = []
 authors = [
     { name = "DEVILENMO", email = "DEVILENMO@gmail.com" },
 ]
 description = "Core of ARC plugin series."
+readme = "README.md"
+license = { file = "LICENSE" }
+keywords = ["endstone", "plugin"]
+
+[project.urls]
+Homepage = "https://github.com/DEVILENMO/EndstoneMC-ARC-Core-Plugin"
 
 [project.entry-points."endstone"]
 arc_core = "endstone_arc_core:ARCCorePlugin"
