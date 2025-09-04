@@ -1,6 +1,8 @@
 import hashlib
 import json
 import math
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
@@ -14,6 +16,7 @@ from endstone.plugin import Plugin
 from endstone_arc_core.DatabaseManager import DatabaseManager
 from endstone_arc_core.LanguageManager import LanguageManager
 from endstone_arc_core.SettingManager import SettingManager
+from endstone_arc_core.MigrationManager import MigrationManager
 
 MAIN_PATH = 'plugins/ARCCore'
 
@@ -86,6 +89,7 @@ class ARCCorePlugin(Plugin):
         default_language_dode = self.setting_manager.GetSetting('DEFAULT_LANGUAGE_CODE')
         self.language_manager = LanguageManager(default_language_dode if default_language_dode is not None else 'ZH-CN')
         self.database_manager = DatabaseManager(Path(MAIN_PATH) / self.setting_manager.GetSetting('DATABASE_PATH'))
+        self.migration_manager = MigrationManager(self.database_manager)
         self.init_database()
 
         self.if_protect_spawn = self.setting_manager.GetSetting('IF_PROTECT_SPAWN')
@@ -121,6 +125,11 @@ class ARCCorePlugin(Plugin):
             self.land_sell_refund_coefficient = float(self.land_sell_refund_coefficient)
         except (ValueError, TypeError):
             self.land_sell_refund_coefficient = 0.9
+        self.land_min_size = self.setting_manager.GetSetting('LAND_MIN_SIZE')
+        try:
+            self.land_min_size = int(self.land_min_size)
+        except (ValueError, TypeError):
+            self.land_min_size = 5  # 默认最小尺寸为5
         self.player_new_land_creation_info = {}
 
         # OP坐标记录
@@ -129,6 +138,12 @@ class ARCCorePlugin(Plugin):
 
         # 玩家出入领地
         self.player_in_land_id_dict = {}
+        
+        # 多线程位置检测相关
+        self.position_thread = None
+        self.position_thread_running = False
+        self.position_thread_lock = threading.Lock()
+        self.position_check_interval = 0.5  # 每0.5秒检查一次，比原来的1.25秒更快
 
         # 死亡回归系统
         self.player_death_locations = {}  # 存储玩家死亡位置 {player_name: {'dimension': str, 'x': float, 'y': float, 'z': float}}
@@ -268,13 +283,21 @@ class ARCCorePlugin(Plugin):
     def on_enable(self) -> None:
         self.register_events(self)
         self.logger.info(f"{ColorFormat.YELLOW}[ARC Core]Plugin enabled!")
+        
+        # 设置迁移管理器的日志记录器并执行迁移
+        self.migration_manager.set_logger(self.logger)
+        if not self.migration_manager.migrate_to_xuid():
+            self.logger.error(f"{ColorFormat.RED}[ARC Core]Database migration failed! Plugin may not work correctly.")
 
         # 初始化公告系统和清道夫系统
         self._load_broadcast_messages()
         self._init_cleaner_system()
 
+        # 启动多线程位置检测系统
+        self.start_position_thread()
+
         # Scheduler tasks
-        self.server.scheduler.run_task(self, self.player_position_listener, delay=0, period=25)
+        # 移除了原有的 player_position_listener，现在使用多线程方式
         self.server.scheduler.run_task(self, self.cleanup_expired_teleport_requests, delay=0, period=100)  # 每5秒清理一次过期请求
         
         # 公告系统定时任务
@@ -290,6 +313,8 @@ class ARCCorePlugin(Plugin):
             self.logger.info(f"[ARC Core]Cleaner system started, interval: {self.cleaner_interval} seconds")
 
     def on_disable(self) -> None:
+        # 停止位置检测线程
+        self.stop_position_thread()
         self.logger.info(f"{ColorFormat.YELLOW}[ARC Core]Plugin disabled!")
 
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
@@ -439,6 +464,11 @@ class ARCCorePlugin(Plugin):
         self.server.broadcast_message(self.language_manager.GetText('PLAYER_QUIT_MESSAGE').format(event.player.name))
         self.player_authentication_state[event.player.name] = False
         
+        # 线程安全地清理玩家领地位置记录
+        with self.position_thread_lock:
+            if event.player.name in self.player_in_land_id_dict:
+                del self.player_in_land_id_dict[event.player.name]
+        
         # 清理死亡位置记录
         if event.player.name in self.player_death_locations:
             del self.player_death_locations[event.player.name]
@@ -541,12 +571,12 @@ class ARCCorePlugin(Plugin):
             if not land_info:
                 return True
                 
-            owner_uuid = land_info['owner_uuid']
+            owner_xuid = land_info['owner_xuid']
             shared_users = land_info['shared_users']
             
             # 检查是否是领地主人或授权用户
-            if owner_uuid != str(player.unique_id) and str(player.unique_id) not in shared_users:
-                player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.get_player_name_by_uuid(owner_uuid)))
+            if owner_xuid != str(player.xuid) and str(player.xuid) not in shared_users:
+                player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.get_player_name_by_xuid(owner_xuid)))
                 return False
         return True
 
@@ -562,12 +592,12 @@ class ARCCorePlugin(Plugin):
             if land_info.get('allow_public_interact', False):
                 return True
                 
-            owner_uuid = land_info['owner_uuid']
+            owner_xuid = land_info['owner_xuid']
             shared_users = land_info['shared_users']
             
             # 检查是否是领地主人或授权用户
-            if owner_uuid != str(player.unique_id) and str(player.unique_id) not in shared_users:
-                player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.get_player_name_by_uuid(owner_uuid)))
+            if owner_xuid != str(player.xuid) and str(player.xuid) not in shared_users:
+                player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.get_player_name_by_xuid(owner_xuid)))
                 return False
         return True
     
@@ -580,6 +610,7 @@ class ARCCorePlugin(Plugin):
 
     # Listeners
     def player_position_listener(self):
+        """原始的位置监听器方法，保留作为备用"""
         for player in self.server.online_players:
             player_pos = self.get_player_position_vector(player)
             land_id = self.get_land_at_pos(player.location.dimension.name, player_pos[0], player_pos[2])
@@ -591,10 +622,115 @@ class ARCCorePlugin(Plugin):
                 self.player_in_land_id_dict[player.name] = land_id
                 if land_id is not None:
                     new_land_name = self.get_land_name(land_id)
-                    land_owner = self.get_player_name_by_uuid(self.get_land_owner(land_id))
+                    land_owner = self.get_player_name_by_xuid(self.get_land_owner(land_id))
                     player.send_title(self.language_manager.GetText('STEP_IN_LAND_TITLE').format(new_land_name),
                                       self.language_manager.GetText('STEP_IN_LAND_SUBTITLE').format(land_owner),
                                       5, 20, 5)
+
+    def _threaded_position_listener(self):
+        """多线程位置检测方法"""
+        self.logger.info(f"{ColorFormat.GREEN}[ARC Core]Position detection thread started")
+        
+        while self.position_thread_running:
+            try:
+                # 检查是否有在线玩家，如果没有则跳过此次检测
+                if not self.server.online_players:
+                    time.sleep(self.position_check_interval)
+                    continue
+                
+                # 批量处理所有在线玩家
+                players_to_process = list(self.server.online_players)
+                
+                for player in players_to_process:
+                    if not self.position_thread_running:  # 提前退出检查
+                        break
+                        
+                    try:
+                        # 获取玩家位置信息
+                        player_pos = self.get_player_position_vector(player)
+                        dimension = player.location.dimension.name
+                        land_id = self.get_land_at_pos(dimension, player_pos[0], player_pos[2])
+                        
+                        # 使用锁保护共享数据
+                        with self.position_thread_lock:
+                            # 初始化玩家领地记录
+                            if player.name not in self.player_in_land_id_dict:
+                                self.player_in_land_id_dict[player.name] = None
+                            
+                            # 检查领地变化
+                            old_land_id = self.player_in_land_id_dict[player.name]
+                            if self.is_land_id_changed(old_land_id, land_id):
+                                self.player_in_land_id_dict[player.name] = land_id
+                                
+                                # 进入新领地时发送提示
+                                if land_id is not None:
+                                    try:
+                                        new_land_name = self.get_land_name(land_id)
+                                        land_owner = self.get_player_name_by_xuid(self.get_land_owner(land_id))
+                                        
+                                        # 创建固定参数的闭包，避免循环变量捕获问题
+                                        def create_land_message_sender(target_player, land_name, owner_name):
+                                            def send_land_message():
+                                                try:
+                                                    target_player.send_title(
+                                                        self.language_manager.GetText('STEP_IN_LAND_TITLE').format(land_name),
+                                                        self.language_manager.GetText('STEP_IN_LAND_SUBTITLE').format(owner_name),
+                                                        5, 20, 5
+                                                    )
+                                                except Exception as e:
+                                                    self.logger.warning(f"[ARC Core]Failed to send land message to {target_player.name}: {str(e)}")
+                                            return send_land_message
+                                        
+                                        # 创建消息发送器，固定当前玩家和领地信息
+                                        message_sender = create_land_message_sender(player, new_land_name, land_owner)
+                                        
+                                        # 在主线程中执行UI操作
+                                        if hasattr(self.server, 'scheduler'):
+                                            self.server.scheduler.run_task(self, message_sender, delay=0)
+                                        
+                                    except Exception as e:
+                                        self.logger.warning(f"[ARC Core]Error processing land change for {player.name}: {str(e)}")
+                                        
+                    except Exception as e:
+                        self.logger.warning(f"[ARC Core]Error processing player {player.name} position: {str(e)}")
+                        continue
+                
+                # 等待下次检测
+                time.sleep(self.position_check_interval)
+                
+            except Exception as e:
+                self.logger.error(f"[ARC Core]Position detection thread error: {str(e)}")
+                time.sleep(1)  # 发生错误时等待1秒再继续
+        
+        self.logger.info(f"{ColorFormat.YELLOW}[ARC Core]Position detection thread stopped")
+
+    def start_position_thread(self):
+        """启动位置检测线程"""
+        if self.position_thread is None or not self.position_thread.is_alive():
+            self.position_thread_running = True
+            self.position_thread = threading.Thread(
+                target=self._threaded_position_listener,
+                daemon=True,  # 设为守护线程，主程序退出时自动结束
+                name="ARCCore-PositionDetection"
+            )
+            self.position_thread.start()
+            self.logger.info(f"{ColorFormat.GREEN}[ARC Core]Position detection thread initialized")
+        else:
+            self.logger.warning(f"{ColorFormat.YELLOW}[ARC Core]Position detection thread already running")
+
+    def stop_position_thread(self):
+        """停止位置检测线程"""
+        if self.position_thread and self.position_thread.is_alive():
+            self.position_thread_running = False
+            try:
+                self.position_thread.join(timeout=2.0)  # 等待最多2秒让线程正常结束
+                if self.position_thread.is_alive():
+                    self.logger.warning(f"{ColorFormat.YELLOW}[ARC Core]Position detection thread did not stop gracefully")
+                else:
+                    self.logger.info(f"{ColorFormat.GREEN}[ARC Core]Position detection thread stopped successfully")
+            except Exception as e:
+                self.logger.error(f"[ARC Core]Error stopping position detection thread: {str(e)}")
+        self.position_thread = None
 
     @staticmethod
     def is_land_id_changed(old_land_id: int | None, new_land_id: int | None) -> bool:
@@ -752,11 +888,11 @@ class ARCCorePlugin(Plugin):
         :return: 是否初始化成功
         """
         try:
-            player_uuid = str(player.unique_id)
+            player_xuid = str(player.xuid)
             # 检查玩家经济数据是否已存在
             existing_data = self.database_manager.query_one(
-                "SELECT uuid FROM player_economy WHERE uuid = ?",
-                (player_uuid,)
+                "SELECT xuid FROM player_economy WHERE xuid = ?",
+                (player_xuid,)
             )
             if existing_data:
                 return True  # 已存在，无需重复创建
@@ -770,7 +906,7 @@ class ARCCorePlugin(Plugin):
 
             # 创建经济数据
             economy_data = {
-                'uuid': player_uuid,
+                'xuid': player_xuid,
                 'money': init_money
             }
             return self.database_manager.insert('player_economy', economy_data)
@@ -785,14 +921,14 @@ class ARCCorePlugin(Plugin):
         :return: (是否初始化成功, 是否为新玩家)
         """
         try:
-            player_uuid = str(player.unique_id)
+            player_xuid = str(player.xuid)
             success = True
             is_new_player = False
 
-            # 检查并初始化玩家基本信息
+            # 检查并初始化玩家基本信息（使用XUID作为主键）
             basic_info = self.database_manager.query_one(
-                "SELECT uuid FROM player_basic_info WHERE uuid = ?",
-                (player_uuid,)
+                "SELECT xuid FROM player_basic_info WHERE xuid = ?",
+                (player_xuid,)
             )
             if not basic_info:
                 is_new_player = True  # 没有基本信息说明是新玩家
@@ -833,8 +969,8 @@ class ARCCorePlugin(Plugin):
         """
         try:
             result = self.database_manager.query_one(
-                "SELECT * FROM player_basic_info WHERE uuid = ?",
-                (str(player.unique_id),)
+                "SELECT * FROM player_basic_info WHERE xuid = ?",
+                (str(player.xuid),)
             )
             if result is None:
                 # 玩家第一次进入服务器，初始化信息
@@ -863,8 +999,8 @@ class ARCCorePlugin(Plugin):
             return self.database_manager.update(
                 table='player_basic_info',
                 data={'password': hashed_password},
-                where='uuid = ?',
-                params=(str(player.unique_id),)
+                where='xuid = ?',
+                params=(str(player.xuid),)
             )
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Set player password error: {str(e)}")
@@ -879,8 +1015,8 @@ class ARCCorePlugin(Plugin):
         """
         try:
             result = self.database_manager.query_one(
-                "SELECT password FROM player_basic_info WHERE uuid = ?",
-                (str(player.unique_id),)
+                "SELECT password FROM player_basic_info WHERE xuid = ?",
+                (str(player.xuid),)
             )
             if not result or not result['password']:
                 return False
@@ -897,8 +1033,8 @@ class ARCCorePlugin(Plugin):
         """
         try:
             current_info = self.database_manager.query_one(
-                "SELECT name FROM player_basic_info WHERE uuid = ?",
-                (str(player.unique_id),)
+                "SELECT name FROM player_basic_info WHERE xuid = ?",
+                (str(player.xuid),)
             )
 
             if not current_info:
@@ -909,8 +1045,8 @@ class ARCCorePlugin(Plugin):
                 success = self.database_manager.update(
                     table='player_basic_info',
                     data={'name': player.name},
-                    where='uuid = ?',
-                    params=(str(player.unique_id),)
+                    where='xuid = ?',
+                    params=(str(player.xuid),)
                 )
                 if success:
                     self._safe_log('info', f"Player {current_info['name']} changed name to {player.name}")
@@ -932,8 +1068,8 @@ class ARCCorePlugin(Plugin):
             
             # 检查当前数据库中的OP状态
             current_info = self.database_manager.query_one(
-                "SELECT is_op FROM player_basic_info WHERE uuid = ?",
-                (str(player.unique_id),)
+                "SELECT is_op FROM player_basic_info WHERE xuid = ?",
+                (str(player.xuid),)
             )
             
             if current_info is not None:
@@ -943,8 +1079,8 @@ class ARCCorePlugin(Plugin):
                     success = self.database_manager.update(
                         table='player_basic_info',
                         data={'is_op': current_op_status},
-                        where='uuid = ?',
-                        params=(str(player.unique_id),)
+                        where='xuid = ?',
+                        params=(str(player.xuid),)
                     )
                     if success:
                         status_text = "OP" if current_op_status else "非OP"
@@ -973,9 +1109,27 @@ class ARCCorePlugin(Plugin):
             self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Get offline player OP status error: {str(e)}")
             return None
 
+    def get_offline_player_op_status_by_xuid(self, player_xuid: str) -> Optional[bool]:
+        """
+        通过XUID获取离线玩家的OP状态
+        :param player_xuid: 玩家XUID
+        :return: OP状态，如果玩家不存在则返回None
+        """
+        try:
+            result = self.database_manager.query_one(
+                "SELECT is_op FROM player_basic_info WHERE xuid = ?",
+                (player_xuid,)
+            )
+            if result is not None:
+                return bool(result['is_op'])
+            return None
+        except Exception as e:
+            self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Get offline player OP status by XUID error: {str(e)}")
+            return None
+
     def get_offline_player_op_status_by_uuid(self, player_uuid: str) -> Optional[bool]:
         """
-        通过UUID获取离线玩家的OP状态
+        通过UUID获取离线玩家的OP状态 (兼容性方法, 建议使用get_offline_player_op_status_by_xuid)
         :param player_uuid: 玩家UUID
         :return: OP状态，如果玩家不存在则返回None
         """
@@ -991,36 +1145,36 @@ class ARCCorePlugin(Plugin):
             self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Get offline player OP status by UUID error: {str(e)}")
             return None
 
-    def get_player_name_by_uuid(self, player_uuid: str) -> Optional[str]:
+    def get_player_name_by_xuid(self, player_xuid: str) -> Optional[str]:
         """
-        通过UUID获取玩家名称
-        :param player_uuid: 玩家UUID字符串
+        通过XUID获取玩家名称
+        :param player_xuid: 玩家XUID字符串
         :return: 玩家名称，如果未找到则返回None
         """
         try:
             result = self.database_manager.query_one(
-                "SELECT name FROM player_basic_info WHERE uuid = ?",
-                (player_uuid,)
+                "SELECT name FROM player_basic_info WHERE xuid = ?",
+                (player_xuid,)
             )
             return result['name'] if result else None
         except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player name by UUID error: {str(e)}")
+            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player name by XUID error: {str(e)}")
             return None
     
-    def get_player_uuid_by_name(self, player_name: str) -> Optional[str]:
+    def get_player_xuid_by_name(self, player_name: str) -> Optional[str]:
         """
-        通过玩家名称获取UUID
+        通过玩家名称获取XUID
         :param player_name: 玩家名称
-        :return: 玩家UUID字符串，如果未找到则返回None
+        :return: 玩家XUID字符串，如果未找到则返回None
         """
         try:
             result = self.database_manager.query_one(
-                "SELECT uuid FROM player_basic_info WHERE name = ?",
+                "SELECT xuid FROM player_basic_info WHERE name = ?",
                 (player_name,)
             )
-            return result['uuid'] if result else None
+            return result['xuid'] if result else None
         except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player UUID by name error: {str(e)}")
+            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player XUID by name error: {str(e)}")
             return None
 
     # Spawn protect
@@ -1096,6 +1250,8 @@ class ARCCorePlugin(Plugin):
             arc_menu.add_button(self.language_manager.GetText('LAND_MENU_NAME'), on_click=self.show_land_main_menu)
             if self.server.plugin_manager.get_plugin('ushop'):
                 arc_menu.add_button(self.language_manager.GetText('SHOP_MENU_NAME'), on_click=self.show_shop_menu)
+            if self.server.plugin_manager.get_plugin('arc_button_shop'):
+                arc_menu.add_button(self.language_manager.GetText('BUTTON_SHOP_MENU_NAME'), on_click=self.show_button_shop_menu)
             if self.server.plugin_manager.get_plugin('arc_dtwt'):
                 arc_menu.add_button(self.language_manager.GetText('DTWT_MENU_NAME'), on_click=self.show_dtwt_panel)
             if player.is_op:
@@ -1177,38 +1333,60 @@ class ARCCorePlugin(Plugin):
     def init_economy_table(self) -> bool:
         """初始化经济系统表格"""
         fields = {
-            'uuid': 'TEXT PRIMARY KEY',  # 玩家UUID字符串作为主键
+            'xuid': 'TEXT PRIMARY KEY',  # 玩家XUID字符串作为主键
             'money': 'INTEGER NOT NULL DEFAULT 0'  # 玩家金钱数量，默认值0
         }
         return self.database_manager.create_table('player_economy', fields)
 
-    def _set_player_money(self, player: Player, amount: int) -> bool:
+    def _set_player_money_by_name(self, player_name: str, amount: int) -> bool:
         """
-        设置玩家金钱
-        :param player: 玩家对象
+        设置玩家金钱（底层函数，基于玩家名称）
+        :param player_name: 玩家名称
         :param amount: 金钱数量
         :return: 是否设置成功
         """
         try:
             # 限制金钱范围在32位整数范围内
             amount = max(-2147483648, min(2147483647, amount))
-            player_uuid = str(player.unique_id)  # 转换UUID为字符串
+            
+            player_xuid = self.get_player_xuid_by_name(player_name)
+            if not player_xuid:
+                self.logger.error(f"{ColorFormat.RED}[ARC Core]Player {player_name} not found")
+                return False
+            
             return self.database_manager.update(
                 table='player_economy',
                 data={'money': amount},
-                where='uuid = ?',
-                params=(player_uuid,)
+                where='xuid = ?',
+                params=(player_xuid,)
             )
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Set player money error: {str(e)}")
             return False
 
-    def get_player_money(self, player: Player) -> int:
+    def _set_player_money(self, player: Player, amount: int) -> bool:
+        """
+        设置玩家金钱（Player对象封装器）
+        :param player: 玩家对象
+        :param amount: 金钱数量
+        :return: 是否设置成功
+        """
+        return self._set_player_money_by_name(player.name, amount)
+
+    def get_player_money_by_name(self, player_name: str) -> int:
+        """
+        获取玩家金钱（底层函数，基于玩家名称）
+        :param player_name: 玩家名称
+        :return: 玩家金钱数量
+        """
         try:
-            player_uuid = str(player.unique_id)  # 转换UUID为字符串
+            player_xuid = self.get_player_xuid_by_name(player_name)
+            if not player_xuid:
+                return 0
+            
             result = self.database_manager.query_one(
-                "SELECT money FROM player_economy WHERE uuid = ?",
-                (player_uuid,)
+                "SELECT money FROM player_economy WHERE xuid = ?",
+                (player_xuid,)
             )
             if result is None:
                 # 玩家不存在，创建新记录
@@ -1219,7 +1397,7 @@ class ARCCorePlugin(Plugin):
                     init_money = 0
                 self.database_manager.insert(
                     'player_economy',
-                    {'uuid': player_uuid, 'money': init_money}
+                    {'xuid': player_xuid, 'money': init_money}
                 )
                 return init_money
             return result['money']
@@ -1227,33 +1405,106 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money error: {str(e)}")
             return 0
 
-    def increase_player_money(self, player: Player, amount: int) -> bool:
+    def get_player_money(self, player: Player) -> int:
+        """
+        获取玩家金钱（Player对象封装器）
+        :param player: 玩家对象
+        :return: 玩家金钱数量
+        """
+        return self.get_player_money_by_name(player.name)
+
+    def increase_player_money_by_name(self, player_name: str, amount: int, notify: bool = True) -> bool:
+        """
+        增加玩家金钱（底层函数，基于玩家名称）
+        :param player_name: 玩家名称
+        :param amount: 增加的金钱数量
+        :param notify: 是否通知在线玩家
+        :return: 是否操作成功
+        """
         try:
             if amount < 0:
                 amount *= -1
-            current_money = self.get_player_money(player)
-            return self._set_player_money(player, current_money + amount)
+            current_money = self.get_player_money_by_name(player_name)
+            success = self._set_player_money_by_name(player_name, current_money + amount)
+            
+            # 通知在线玩家
+            if success and notify:
+                online_player = self.server.get_player(player_name)
+                if online_player is not None:
+                    new_money = current_money + amount
+                    online_player.send_message(self.language_manager.GetText('MONEY_ADD_HINT').format(amount, new_money))
+            
+            return success
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Add player money error: {str(e)}")
             return False
 
-    def decrease_player_money(self, player: Player, amount: int) -> bool:
+    def decrease_player_money_by_name(self, player_name: str, amount: int, notify: bool = True) -> bool:
+        """
+        减少玩家金钱（底层函数，基于玩家名称）
+        :param player_name: 玩家名称
+        :param amount: 减少的金钱数量
+        :param notify: 是否通知在线玩家
+        :return: 是否操作成功
+        """
         try:
             if amount < 0:
                 amount *= -1
-            current_money = self.get_player_money(player)
-            return self._set_player_money(player, current_money - amount)
+            current_money = self.get_player_money_by_name(player_name)
+            success = self._set_player_money_by_name(player_name, current_money - amount)
+            
+            # 通知在线玩家
+            if success and notify:
+                online_player = self.server.get_player(player_name)
+                if online_player is not None:
+                    new_money = current_money - amount
+                    online_player.send_message(self.language_manager.GetText('MONEY_REDUCE_HINT').format(amount, new_money))
+            
+            return success
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Remove player money error: {str(e)}")
             return False
 
+    def change_player_money_by_name(self, player_name: str, money_to_change: int, notify: bool = True) -> bool:
+        """
+        改变玩家金钱（底层函数，基于玩家名称）
+        :param player_name: 玩家名称
+        :param money_to_change: 要改变的金钱数量（正数为增加，负数为减少）
+        :param notify: 是否通知在线玩家
+        :return: 是否操作成功
+        """
+        if money_to_change == 0:
+            return True
+        elif money_to_change > 0:
+            return self.increase_player_money_by_name(player_name, money_to_change, notify)
+        else:
+            return self.decrease_player_money_by_name(player_name, abs(money_to_change), notify)
+
+    def increase_player_money(self, player: Player, amount: int) -> bool:
+        """
+        增加玩家金钱（Player对象封装器）
+        :param player: 玩家对象
+        :param amount: 增加的金钱数量
+        :return: 是否操作成功
+        """
+        return self.increase_player_money_by_name(player.name, amount)
+
+    def decrease_player_money(self, player: Player, amount: int) -> bool:
+        """
+        减少玩家金钱（Player对象封装器）
+        :param player: 玩家对象
+        :param amount: 减少的金钱数量
+        :return: 是否操作成功
+        """
+        return self.decrease_player_money_by_name(player.name, amount)
+
     def get_player_free_land_blocks(self, player: Player) -> int:
         """获取玩家剩余免费领地格子数"""
         try:
-            player_uuid = str(player.unique_id)
+            player_xuid = str(player.xuid)
             result = self.database_manager.query_one(
-                "SELECT remaining_free_land_blocks FROM player_basic_info WHERE uuid = ?",
-                (player_uuid,)
+                "SELECT remaining_free_land_blocks FROM player_basic_info WHERE xuid = ?",
+                (player_xuid,)
             )
             if result is None:
                 # 如果没有记录，返回默认值
@@ -1267,11 +1518,11 @@ class ARCCorePlugin(Plugin):
     def set_player_free_land_blocks(self, player: Player, amount: int) -> bool:
         """设置玩家剩余免费领地格子数"""
         try:
-            player_uuid = str(player.unique_id)
+            player_xuid = str(player.xuid)
             return self.database_manager.update(
                 'player_basic_info',
                 {'remaining_free_land_blocks': amount},
-                f"uuid = '{player_uuid}'"
+                f"xuid = '{player_xuid}'"
             )
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Set player free land blocks error: {str(e)}")
@@ -1287,8 +1538,8 @@ class ARCCorePlugin(Plugin):
             rich_list = {}
             for entry in results:
                 try:
-                    uuid_str = entry['uuid']
-                    player_name = self.get_player_name_by_uuid(uuid_str)
+                    xuid_str = entry['xuid']
+                    player_name = self.get_player_name_by_xuid(xuid_str)
                     if player_name:
                         rich_list[player_name] = entry['money']
                 except Exception:
@@ -1309,22 +1560,37 @@ class ARCCorePlugin(Plugin):
             # 使用SQL的ROW_NUMBER()函数来获取排名
             result = self.database_manager.query_one("""
                 WITH RankedPlayers AS (
-                    SELECT uuid, money,
+                    SELECT xuid, money,
                     ROW_NUMBER() OVER (ORDER BY money DESC) as rank
                     FROM player_economy
                 )
                 SELECT rank 
                 FROM RankedPlayers 
-                WHERE uuid = ?
-            """, (str(player.unique_id),))
+                WHERE xuid = ?
+            """, (str(player.xuid),))
 
             return result['rank'] if result else None
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money rank error: {str(e)}")
             return None
 
+    def judge_if_player_has_enough_money_by_name(self, player_name: str, amount: int) -> bool:
+        """
+        判断玩家是否有足够金钱（底层函数，基于玩家名称）
+        :param player_name: 玩家名称
+        :param amount: 需要的金钱数量
+        :return: 是否有足够金钱
+        """
+        return self.get_player_money_by_name(player_name) >= abs(amount)
+
     def judge_if_player_has_enough_money(self, player: Player, amount: int) -> bool:
-        return self.get_player_money(player) >= abs(amount)
+        """
+        判断玩家是否有足够金钱（Player对象封装器）
+        :param player: 玩家对象
+        :param amount: 需要的金钱数量
+        :return: 是否有足够金钱
+        """
+        return self.judge_if_player_has_enough_money_by_name(player.name, amount)
 
     # Bank
     def show_bank_main_menu(self, player: Player):
@@ -1460,7 +1726,7 @@ class ARCCorePlugin(Plugin):
             return 5, receive_player, amount
 
         # 检查玩家余额是否足够
-        if self.judge_if_player_has_enough_money(player, amount):
+        if not self.judge_if_player_has_enough_money(player, amount):
             return 4, receive_player, amount
 
         return error_code, receive_player, amount
@@ -1535,6 +1801,9 @@ class ARCCorePlugin(Plugin):
     def show_shop_menu(self, player: Player):
         player.perform_command('us')
 
+    def show_button_shop_menu(self, player: Player):
+        player.perform_command('shop')
+
     # Teleport menu
     def show_teleport_menu(self, player: Player):
         teleport_main_menu = ActionForm(
@@ -1576,14 +1845,14 @@ class ARCCorePlugin(Plugin):
                 'x': 'REAL NOT NULL',
                 'y': 'REAL NOT NULL',
                 'z': 'REAL NOT NULL',
-                'created_by': 'TEXT NOT NULL',  # 创建者UUID
+                'created_by': 'TEXT NOT NULL',  # 创建者XUID
                 'created_time': 'INTEGER NOT NULL'  # 创建时间戳
             }
             
             # 玩家私人传送点表
             home_fields = {
                 'home_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
-                'owner_uuid': 'TEXT NOT NULL',
+                'owner_xuid': 'TEXT NOT NULL',
                 'home_name': 'TEXT NOT NULL',
                 'dimension': 'TEXT NOT NULL',
                 'x': 'REAL NOT NULL',
@@ -1599,7 +1868,7 @@ class ARCCorePlugin(Plugin):
             return False
 
     # Public Warps Management
-    def create_public_warp(self, warp_name: str, dimension: str, x: float, y: float, z: float, creator_uuid: str) -> bool:
+    def create_public_warp(self, warp_name: str, dimension: str, x: float, y: float, z: float, creator_xuid: str) -> bool:
         """创建公共传送点"""
         try:
             import time
@@ -1609,7 +1878,7 @@ class ARCCorePlugin(Plugin):
                 'x': x,
                 'y': y,
                 'z': z,
-                'created_by': creator_uuid,
+                'created_by': creator_xuid,
                 'created_time': int(time.time())
             }
             return self.database_manager.insert('public_warps', warp_data)
@@ -1650,12 +1919,12 @@ class ARCCorePlugin(Plugin):
         return self.get_public_warp(warp_name) is not None
 
     # Player Homes Management
-    def create_player_home(self, owner_uuid: str, home_name: str, dimension: str, x: float, y: float, z: float) -> bool:
+    def create_player_home(self, owner_xuid: str, home_name: str, dimension: str, x: float, y: float, z: float) -> bool:
         """创建玩家传送点"""
         try:
             import time
             home_data = {
-                'owner_uuid': owner_uuid,
+                'owner_xuid': owner_xuid,
                 'home_name': home_name,
                 'dimension': dimension,
                 'x': x,
@@ -1668,52 +1937,52 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"Create player home error: {str(e)}")
             return False
 
-    def delete_player_home(self, owner_uuid: str, home_name: str) -> bool:
+    def delete_player_home(self, owner_xuid: str, home_name: str) -> bool:
         """删除玩家传送点"""
         try:
-            return self.database_manager.delete('player_homes', 'owner_uuid = ? AND home_name = ?', (owner_uuid, home_name))
+            return self.database_manager.delete('player_homes', 'owner_xuid = ? AND home_name = ?', (owner_xuid, home_name))
         except Exception as e:
             self.logger.error(f"Delete player home error: {str(e)}")
             return False
 
-    def get_player_home(self, owner_uuid: str, home_name: str) -> Optional[Dict[str, Any]]:
+    def get_player_home(self, owner_xuid: str, home_name: str) -> Optional[Dict[str, Any]]:
         """获取玩家传送点信息"""
         try:
             return self.database_manager.query_one(
-                "SELECT * FROM player_homes WHERE owner_uuid = ? AND home_name = ?",
-                (owner_uuid, home_name)
+                "SELECT * FROM player_homes WHERE owner_xuid = ? AND home_name = ?",
+                (owner_xuid, home_name)
             )
         except Exception as e:
             self.logger.error(f"Get player home error: {str(e)}")
             return None
 
-    def get_player_homes(self, owner_uuid: str) -> Dict[str, Dict[str, Any]]:
+    def get_player_homes(self, owner_xuid: str) -> Dict[str, Dict[str, Any]]:
         """获取玩家所有传送点"""
         try:
             results = self.database_manager.query_all(
-                "SELECT * FROM player_homes WHERE owner_uuid = ? ORDER BY home_name",
-                (owner_uuid,)
+                "SELECT * FROM player_homes WHERE owner_xuid = ? ORDER BY home_name",
+                (owner_xuid,)
             )
             return {row['home_name']: row for row in results}
         except Exception as e:
             self.logger.error(f"Get player homes error: {str(e)}")
             return {}
 
-    def get_player_home_count(self, owner_uuid: str) -> int:
+    def get_player_home_count(self, owner_xuid: str) -> int:
         """获取玩家传送点数量"""
         try:
             result = self.database_manager.query_one(
-                "SELECT COUNT(*) as count FROM player_homes WHERE owner_uuid = ?",
-                (owner_uuid,)
+                "SELECT COUNT(*) as count FROM player_homes WHERE owner_xuid = ?",
+                (owner_xuid,)
             )
             return result['count'] if result else 0
         except Exception as e:
             self.logger.error(f"Get player home count error: {str(e)}")
             return 0
 
-    def player_home_exists(self, owner_uuid: str, home_name: str) -> bool:
+    def player_home_exists(self, owner_xuid: str, home_name: str) -> bool:
         """检查玩家传送点是否存在"""
-        return self.get_player_home(owner_uuid, home_name) is not None
+        return self.get_player_home(owner_xuid, home_name) is not None
 
     # Teleport System UI
     def show_public_warp_menu(self, player: Player):
@@ -1735,7 +2004,7 @@ class ARCCorePlugin(Plugin):
         )
         
         for warp_name, warp_info in public_warps.items():
-            creator_name = self.get_player_name_by_uuid(warp_info['created_by']) or 'Unknown'
+            creator_name = self.get_player_name_by_xuid(warp_info['created_by']) or 'Unknown'
             warp_menu.add_button(
                 self.language_manager.GetText('PUBLIC_WARP_BUTTON_TEXT').format(warp_name, warp_info['dimension'], creator_name),
                 on_click=lambda p=player, w_name=warp_name, w_info=warp_info: self.teleport_to_public_warp(p, w_name, w_info)
@@ -1745,7 +2014,7 @@ class ARCCorePlugin(Plugin):
 
     def show_home_menu(self, player: Player):
         """显示玩家传送点菜单"""
-        player_homes = self.get_player_homes(str(player.unique_id))
+        player_homes = self.get_player_homes(str(player.xuid))
         home_count = len(player_homes)
         
         home_menu = ActionForm(
@@ -1812,14 +2081,14 @@ class ARCCorePlugin(Plugin):
                 return
             
             home_name = data[0].strip()
-            if self.player_home_exists(str(player.unique_id), home_name):
+            if self.player_home_exists(str(player.xuid), home_name):
                 player.send_message(self.language_manager.GetText('CREATE_HOME_NAME_EXISTS_ERROR').format(home_name))
                 self.show_create_home_panel(player)
                 return
             
             # 创建传送点
             success = self.create_player_home(
-                str(player.unique_id),
+                str(player.xuid),
                 home_name,
                 player.location.dimension.name,
                 player.location.x,
@@ -1860,7 +2129,7 @@ class ARCCorePlugin(Plugin):
 
     def delete_home_confirmed(self, player: Player, home_name: str):
         """确认删除传送点"""
-        success = self.delete_player_home(str(player.unique_id), home_name)
+        success = self.delete_player_home(str(player.xuid), home_name)
         if success:
             player.send_message(self.language_manager.GetText('DELETE_HOME_SUCCESS').format(home_name))
         else:
@@ -2274,7 +2543,7 @@ class ARCCorePlugin(Plugin):
                 player.location.x,
                 player.location.y,
                 player.location.z,
-                str(player.unique_id)
+                str(player.xuid)
             )
             
             if success:
@@ -2308,7 +2577,7 @@ class ARCCorePlugin(Plugin):
         )
         
         for warp_name, warp_info in public_warps.items():
-            creator_name = self.get_player_name_by_uuid(warp_info['created_by']) or 'Unknown'
+            creator_name = self.get_player_name_by_xuid(warp_info['created_by']) or 'Unknown'
             delete_menu.add_button(
                 self.language_manager.GetText('DELETE_WARP_BUTTON_TEXT').format(warp_name, creator_name),
                 on_click=lambda p=player, w_name=warp_name: self.confirm_delete_warp(p, w_name)
@@ -2361,7 +2630,7 @@ class ARCCorePlugin(Plugin):
             # 只创建领地基本信息表
             land_fields = {
                 'land_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',  # 领地编号
-                'owner_uuid': 'TEXT NOT NULL',  # 领地主人UUID
+                'owner_xuid': 'TEXT NOT NULL',  # 领地主人XUID
                 'land_name': 'TEXT NOT NULL',  # 领地名称
                 'dimension': 'TEXT NOT NULL',  # 领地所在维度
                 'min_x': 'INTEGER NOT NULL',  # 最小X坐标
@@ -2487,7 +2756,7 @@ class ARCCorePlugin(Plugin):
 
         return chunk_keys
 
-    def create_land(self, owner_uuid: str, land_name: str, dimension: str,
+    def create_land(self, owner_xuid: str, land_name: str, dimension: str,
                     min_x: int, max_x: int, min_z: int, max_z: int,
                     tp_x: float, tp_y: float, tp_z: float) -> Optional[int]:
         """创建新领地"""
@@ -2498,9 +2767,9 @@ class ARCCorePlugin(Plugin):
 
             # 插入领地基本信息
             self.database_manager.execute(
-                "INSERT INTO lands (owner_uuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, shared_users, allow_explosion, allow_public_interact) "
+                "INSERT INTO lands (owner_xuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, shared_users, allow_explosion, allow_public_interact) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (owner_uuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, '[]', 0, 0)
+                (owner_xuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, '[]', 0, 0)
             )
             result = self.database_manager.query_one("SELECT last_insert_rowid() as land_id")
             land_id = result['land_id']
@@ -2678,26 +2947,26 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"[ARC Core]Check land availability error: {str(e)}")
             return False, 'SYSTEM_ERROR'
 
-    def get_player_land_count(self, uuid: str) -> int:
+    def get_player_land_count(self, xuid: str) -> int:
         """
         获取玩家拥有的领地数量
-        :param uuid: 玩家UUID
+        :param xuid: 玩家XUID
         :return: 领地数量
         """
         try:
             result = self.database_manager.query_one(
-                "SELECT COUNT(*) as count FROM lands WHERE owner_uuid = ?",
-                (uuid,)
+                "SELECT COUNT(*) as count FROM lands WHERE owner_xuid = ?",
+                (xuid,)
             )
             return result['count'] if result else 0
         except Exception as e:
             self.logger.error(f"Get player land count error: {str(e)}")
             return 0
 
-    def get_player_lands(self, uuid: str) -> dict[int, dict]:
+    def get_player_lands(self, xuid: str) -> dict[int, dict]:
         """
         获取玩家拥有的所有领地信息
-        :param uuid: 玩家UUID
+        :param xuid: 玩家XUID
         :return: 字典 {领地ID: {
             'land_name': 领地名称,
             'dimension': 维度,
@@ -2708,13 +2977,13 @@ class ARCCorePlugin(Plugin):
             'tp_x': 传送点X坐标,
             'tp_y': 传送点Y坐标,
             'tp_z': 传送点Z坐标,
-            'shared_users': 共享玩家UUID列表
+            'shared_users': 共享玩家XUID列表
         }}
         """
         try:
             results = self.database_manager.query_all(
-                "SELECT * FROM lands WHERE owner_uuid = ?",
-                (uuid,)
+                "SELECT * FROM lands WHERE owner_xuid = ?",
+                (xuid,)
             )
 
             lands_info = {}
@@ -2754,8 +3023,8 @@ class ARCCorePlugin(Plugin):
             'tp_x': 传送点X坐标,
             'tp_y': 传送点Y坐标,
             'tp_z': 传送点Z坐标,
-            'shared_users': 共享玩家UUID列表,
-            'owner_uuid': 拥有者UUID
+            'shared_users': 共享玩家XUID列表,
+            'owner_xuid': 拥有者XUID
         } 不存在则返回空字典
         """
         try:
@@ -2776,7 +3045,7 @@ class ARCCorePlugin(Plugin):
                     'tp_y': result['tp_y'],
                     'tp_z': result['tp_z'],
                     'shared_users': json.loads(result['shared_users']),
-                    'owner_uuid': result['owner_uuid'],
+                    'owner_xuid': result['owner_xuid'],
                     'allow_explosion': bool(result.get('allow_explosion', 0)),
                     'allow_public_interact': bool(result.get('allow_public_interact', 0))
                 }
@@ -2788,16 +3057,16 @@ class ARCCorePlugin(Plugin):
 
     def get_land_owner(self, land_id: int) -> str:
         """
-        获取领地拥有者的UUID
+        获取领地拥有者的XUID
         :param land_id: 领地ID
-        :return: 拥有者UUID，不存在则返回空字符串
+        :return: 拥有者XUID，不存在则返回空字符串
         """
         try:
             result = self.database_manager.query_one(
-                "SELECT owner_uuid FROM lands WHERE land_id = ?",
+                "SELECT owner_xuid FROM lands WHERE land_id = ?",
                 (land_id,)
             )
-            return result['owner_uuid'] if result else ""
+            return result['owner_xuid'] if result else ""
 
         except Exception as e:
             self.logger.error(f"Get land owner error: {str(e)}")
@@ -2919,7 +3188,7 @@ class ARCCorePlugin(Plugin):
         land_main_menu = ActionForm(
             title=self.language_manager.GetText('LAND_MAIN_MENU_TITLE'),
             content=self.language_manager.GetText('LAND_MAIN_MENU_CONTENT').format(
-                self.get_player_land_count(str(player.unique_id)))
+                self.get_player_land_count(str(player.xuid)))
         )
         land_main_menu.add_button(self.language_manager.GetText('LAND_MAIN_MENU_MANAGE_LAND_TEXT'),
                                   on_click=self.show_own_land_menu)
@@ -2931,12 +3200,12 @@ class ARCCorePlugin(Plugin):
         player.send_form(land_main_menu)
 
     def show_own_land_menu(self, player: Player):
-        player_land_num = self.get_player_land_count(str(player.unique_id))
+        player_land_num = self.get_player_land_count(str(player.xuid))
         if player_land_num == 0:
             own_land_panel = ActionForm(
                 title=self.language_manager.GetText('OWN_LAND_PANEL_TITLE'),
                 content=self.language_manager.GetText('OWN_LAND_PANEL_NO_LAND_EXIST_CONTENT').format(
-                    self.get_player_land_count(str(player.unique_id))),
+                    self.get_player_land_count(str(player.xuid))),
                 on_close=self.show_land_main_menu
             )
             player.send_form(own_land_panel)
@@ -2946,7 +3215,7 @@ class ARCCorePlugin(Plugin):
                 title=self.language_manager.GetText('OWN_LAND_PANEL_TITLE'),
                 on_close=self.show_land_main_menu
             )
-            player_lands = self.get_player_lands(str(player.unique_id))
+            player_lands = self.get_player_lands(str(player.xuid))
             for land_id in player_lands.keys():
                 own_land_panel.add_button(
                     self.language_manager.GetText('OWN_LAND_PANEL_LAND_BUTTON_TEXT').format(
@@ -2960,7 +3229,7 @@ class ARCCorePlugin(Plugin):
     def show_own_land_detail_panel(self, player: Player, land_id: int, land_info: dict):
         # 处理具体领地的详情显示
         if len(land_info['shared_users']):
-            shared_user_names = [self.get_player_name_by_uuid(uu_id) for uu_id in land_info['shared_users']]
+            shared_user_names = [self.get_player_name_by_xuid(uu_id) for uu_id in land_info['shared_users']]
             shared_user_name_str = '\n'.join(shared_user_names)
         else:
             shared_user_name_str = self.language_manager.GetText('LAND_DETAIL_NO_SHARED_USER_TEXT')
@@ -3119,11 +3388,11 @@ class ARCCorePlugin(Plugin):
         )
         player.send_form(confirm_panel)
 
-    def transfer_land(self, land_id: int, new_owner_uuid: str) -> bool:
+    def transfer_land(self, land_id: int, new_owner_xuid: str) -> bool:
         """
         移交领地给新的拥有者
         :param land_id: 领地ID
-        :param new_owner_uuid: 新拥有者的UUID
+        :param new_owner_xuid: 新拥有者的XUID
         :return: 是否成功
         """
         try:
@@ -3133,8 +3402,8 @@ class ARCCorePlugin(Plugin):
 
             # 更新领地拥有者
             self.database_manager.execute(
-                "UPDATE lands SET owner_uuid = ? WHERE land_id = ?",
-                (new_owner_uuid, land_id)
+                "UPDATE lands SET owner_xuid = ? WHERE land_id = ?",
+                (new_owner_xuid, land_id)
             )
 
             return True
@@ -3158,7 +3427,7 @@ class ARCCorePlugin(Plugin):
             return
 
         # 执行移交
-        success = self.transfer_land(land_id, str(target_player.unique_id))
+        success = self.transfer_land(land_id, str(target_player.xuid))
         if success:
             # 通知当前玩家
             player.send_message(self.language_manager.GetText('TRANSFER_LAND_SUCCESS').format(land_id, target_player.name))
@@ -3244,7 +3513,7 @@ class ARCCorePlugin(Plugin):
         )
         
         for shared_uuid in land_info['shared_users']:
-            user_name = self.get_player_name_by_uuid(shared_uuid)
+            user_name = self.get_player_name_by_xuid(shared_uuid)
             if user_name:
                 remove_auth_panel.add_button(
                     self.language_manager.GetText('LAND_AUTH_REMOVE_TARGET_BUTTON').format(user_name),
@@ -3261,17 +3530,17 @@ class ARCCorePlugin(Plugin):
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
                 return
 
-            target_uuid = str(target_player.unique_id)
+            target_xuid = str(target_player.xuid)
             
             # 检查是否已经授权
-            if target_uuid in land_info['shared_users']:
+            if target_xuid in land_info['shared_users']:
                 player.send_message(self.language_manager.GetText('LAND_AUTH_ALREADY_EXISTS').format(target_player.name))
                 self.show_land_auth_manage_panel(player, land_id)
                 return
 
             # 添加授权
             shared_users = land_info['shared_users']
-            shared_users.append(target_uuid)
+            shared_users.append(target_xuid)
             
             success = self.database_manager.execute(
                 "UPDATE lands SET shared_users = ? WHERE land_id = ?",
@@ -3464,7 +3733,17 @@ class ARCCorePlugin(Plugin):
                         int(self.player_new_land_creation_info[player.name][2][1]))
             max_z = max(int(self.player_new_land_creation_info[player.name][1][1]),
                         int(self.player_new_land_creation_info[player.name][2][1]))
-            area = (max_x - min_x + 1) * (max_z - min_z + 1)
+            
+            # 计算长宽
+            length = max_x - min_x + 1
+            width = max_z - min_z + 1
+            
+            # 检查尺寸限制：长宽必须都大于配置的最小尺寸
+            if length <= self.land_min_size or width <= self.land_min_size:
+                player.send_message(self.language_manager.GetText('CREATE_NEW_LAND_SIZE_TOO_SMALL').format(length, width, self.land_min_size))
+                return
+            
+            area = length * width
             
             # 获取玩家剩余免费领地格子数
             remaining_free_blocks = self.get_player_free_land_blocks(player)
@@ -3503,7 +3782,7 @@ class ARCCorePlugin(Plugin):
 
     def player_buy_new_land(self, player: Player, dimension: str, start_pos: tuple, end_pos: tuple, area: int, money_cost: int, used_free_blocks: int = 0):
         if self.judge_if_player_has_enough_money(player, money_cost) or player.is_op:
-            land_id = self.create_land(str(player.unique_id), self.language_manager.GetText('DEFAULT_LAND_NAME').format(player.name, self.get_player_land_count(str(player.unique_id)) + 1), dimension, start_pos[0], end_pos[0], start_pos[1], end_pos[1], player.location.x, player.location.y, player.location.z)
+            land_id = self.create_land(str(player.xuid), self.language_manager.GetText('DEFAULT_LAND_NAME').format(player.name, self.get_player_land_count(str(player.xuid)) + 1), dimension, start_pos[0], end_pos[0], start_pos[1], end_pos[1], player.location.x, player.location.y, player.location.z)
             if land_id is not None:
                 if not player.is_op:
                     # 扣除金钱
@@ -3516,7 +3795,7 @@ class ARCCorePlugin(Plugin):
                         current_free_blocks = self.get_player_free_land_blocks(player)
                         new_free_blocks = max(0, current_free_blocks - used_free_blocks)
                         self.set_player_free_land_blocks(player, new_free_blocks)
-                        player.send_message(self.language_manager.GetText('USE_FREE_BLOCKS_HINT', f'使用了 {used_free_blocks} 个免费格子').format(used_free_blocks))
+                        player.send_message(self.language_manager.GetText('USE_FREE_BLOCKS_HINT').format(used_free_blocks))
                 
                 self.clear_new_land_creation_info_memory(player)
                 self.show_own_land_detail_panel(player, land_id, self.get_land_info(land_id))
@@ -3556,7 +3835,6 @@ class ARCCorePlugin(Plugin):
         self.server.broadcast_message(self.language_manager.GetText('READY_TO_CLEAR_DROP_ITEM_BROADCAST'))
 
     def delay_drop_item(self):
-        self.server.broadcast_message(self.language_manager.GetText('CLEAR_DROP_ITEM_BROADCAST'))
         self.execute_cleaner()
 
     def record_coordinate_1(self, player: Player):
@@ -3613,9 +3891,13 @@ class ARCCorePlugin(Plugin):
     # Tool
     @staticmethod
     def get_player_position_vector(player: Player):
-        return (int(player.location.x), int(player.location.y), int(player.location.z))
+        """
+        获取玩家所在方块的坐标
+        使用 math.floor() 确保负坐标也能正确计算方块位置
+        """
+        return (math.floor(player.location.x), math.floor(player.location.y), math.floor(player.location.z))
 
-    # Economy API methods for other plugins
+    # API methods for other plugins
     def api_get_all_money_data(self) -> dict:
         """
         获取所有玩家的金钱数据
@@ -3623,13 +3905,13 @@ class ARCCorePlugin(Plugin):
         """
         try:
             results = self.database_manager.query_all(
-                "SELECT uuid, money FROM player_economy"
+                "SELECT xuid, money FROM player_economy"
             )
             money_data = {}
             for entry in results:
                 try:
-                    uuid_str = entry['uuid']
-                    player_name = self.get_player_name_by_uuid(uuid_str)
+                    xuid_str = entry['xuid']
+                    player_name = self.get_player_name_by_xuid(xuid_str)
                     if player_name:
                         money_data[player_name] = entry['money']
                 except Exception:
@@ -3641,23 +3923,11 @@ class ARCCorePlugin(Plugin):
 
     def api_get_player_money(self, player_name: str) -> int:
         """
-        获取目标玩家的金钱
+        获取目标玩家的金钱（API封装器）
         :param player_name: 玩家名称
         :return: 玩家金钱数量
         """
-        try:
-            player_uuid = self.get_player_uuid_by_name(player_name)
-            if not player_uuid:
-                return 0
-            
-            result = self.database_manager.query_one(
-                "SELECT money FROM player_economy WHERE uuid = ?",
-                (player_uuid,)
-            )
-            return result['money'] if result else 0
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money error: {str(e)}")
-            return 0
+        return self.get_player_money_by_name(player_name)
 
     def api_get_richest_player_money_data(self) -> list:
         """
@@ -3666,10 +3936,10 @@ class ARCCorePlugin(Plugin):
         """
         try:
             result = self.database_manager.query_one(
-                "SELECT uuid, money FROM player_economy ORDER BY money DESC LIMIT 1"
+                "SELECT xuid, money FROM player_economy ORDER BY money DESC LIMIT 1"
             )
             if result:
-                player_name = self.get_player_name_by_uuid(result['uuid'])
+                player_name = self.get_player_name_by_xuid(result['xuid'])
                 if player_name:
                     return [player_name, result['money']]
             return ["", 0]
@@ -3684,10 +3954,10 @@ class ARCCorePlugin(Plugin):
         """
         try:
             result = self.database_manager.query_one(
-                "SELECT uuid, money FROM player_economy ORDER BY money ASC LIMIT 1"
+                "SELECT xuid, money FROM player_economy ORDER BY money ASC LIMIT 1"
             )
             if result:
-                player_name = self.get_player_name_by_uuid(result['uuid'])
+                player_name = self.get_player_name_by_xuid(result['xuid'])
                 if player_name:
                     return [player_name, result['money']]
             return ["", 0]
@@ -3695,46 +3965,30 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money bottom error: {str(e)}")
             return ["", 0]
 
-    def api_change_player_money(self, player_name: str, money_to_change: int) -> None:
+    def api_change_player_money(self, player_name: str, money_to_change: int) -> bool:
         """
-        改变目标玩家的金钱
+        改变目标玩家的金钱（API封装器）
         :param player_name: 玩家名称
         :param money_to_change: 要改变的金钱数量（正数为增加，负数为减少）
+        :return: 是否操作成功
         """
-        try:
-            if money_to_change == 0:
-                self.logger.error(f'{ColorFormat.RED}[ARC Core]Money change cannot be zero...')
-                return
-            
-            player_uuid = self.get_player_uuid_by_name(player_name)
-            if not player_uuid:
-                self.logger.error(f"{ColorFormat.RED}[ARC Core]Player {player_name} not found")
-                return
-            
-            # 获取当前金钱
-            current_money = self.api_get_player_money(player_name)
-            new_money = current_money + money_to_change
-            
-            # 限制金钱范围在32位整数范围内
-            new_money = max(-2147483648, min(2147483647, new_money))
-            
-            success = self.database_manager.update(
-                table='player_economy',
-                data={'money': new_money},
-                where='uuid = ?',
-                params=(player_uuid,)
-            )
-            
-            if success:
-                # 如果玩家在线，发送消息
-                online_player = self.server.get_player(player_name)
-                if online_player is not None:
-                    if money_to_change < 0:
-                        online_player.send_message(self.language_manager.GetText('MONEY_REDUCE_HINT').format(abs(money_to_change), new_money))
-                    else:
-                        online_player.send_message(self.language_manager.GetText('MONEY_ADD_HINT').format(money_to_change, new_money))
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Change player money error: {str(e)}")
+        if money_to_change == 0:
+            self.logger.error(f'{ColorFormat.RED}[ARC Core]Money change cannot be zero...')
+            return False
+        
+        return self.change_player_money_by_name(player_name, money_to_change, notify=True)
+    
+    def api_if_position_in_land(self, position: tuple) -> int:
+        """
+        判断位置是否在玩家领地内，不在的话返回None
+        """
+        return self.get_land_at_pos(math.floor(position[0]), math.floor(position[2]))
+    
+    def api_get_land_info(self, land_id: int) -> dict:
+        """
+        获取领地信息，不存在的话返回空字典
+        """
+        return self.get_land_info(land_id)
 
     # 公告系统
     def _load_broadcast_messages(self):

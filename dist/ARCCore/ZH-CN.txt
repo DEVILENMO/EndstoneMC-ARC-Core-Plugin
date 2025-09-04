@@ -42,7 +42,8 @@ MAIN_MENU_TITLE=弧光核心-主菜单
 BANK_MENU_NAME=银行
 TELEPORT_MENU_NAME=传送系统
 LAND_MENU_NAME=领地系统
-SHOP_MENU_NAME=商店
+SHOP_MENU_NAME=在线商店
+BUTTON_SHOP_MENU_NAME=按钮商店
 OP_PANEL_NAME=OP面板
 RETURN_BUTTON_TEXT=返回
 DTWT_MENU_NAME=别踩白块小游戏
@@ -76,6 +77,7 @@ PAY_SUCCESS_HINT=[弧光核心]成功支付了{0}元，您剩余余额为{1}元
 PAY_FAIL_NO_ENOUGH_MONEY=[弧光核心]扣款{0}元失败，您的余额不足，当前余额为{1}元
 MONEY_ADD_HINT=[弧光核心]你收到了{0}元，当前余额为{1}元
 MONEY_REDUCE_HINT=[弧光核心]你被扣款了{0}元，当前余额为{1}元
+USE_FREE_BLOCKS_HINT=[弧光核心]使用了 {0} 个免费格子
 
 # 领地系统
 LAND_MAIN_MENU_TITLE=领地系统
@@ -91,6 +93,7 @@ LAND_DETAIL_NO_SHARED_USER_TEXT=暂无授权玩家
 CREATE_NEW_LAND_GUIDE=[弧光核心]您可以创建一个矩形领地，首先站在矩形领地任意一个角落在聊天框发送“/pos1”指令，随后沿着对角线前往对角点角落发送“/pos2”指令，即会出现新领地的各项信息预览~
 CHECK_NEW_LAND_AVAILABILITY_FAIL_SYSTEM_ERROR=[弧光核心]系统错误，请联系服务器管理员！
 CHECK_NEW_LAND_AVAILABILITY_FAIL_LAND_MIN_DISTANCE_NOT_SATISFIED=[弧光核心]您选定的新领地与其他领地重叠或者过于接近！
+CREATE_NEW_LAND_SIZE_TOO_SMALL=[弧光核心]领地尺寸过小！当前尺寸: {0}x{1}，长宽必须都大于{2}格。请重新设置坐标。
 NEW_LAND_INFO_TEXT=维度：{0}\n坐标范围：{1} -> {2}\n面积大小：{3}格\n领地售价： {4}
 BUY_NEW_LAND_TEXT=确认购买新领地
 NEW_LAND_TITLE=新领地信息
