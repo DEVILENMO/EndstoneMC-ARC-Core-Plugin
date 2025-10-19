@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional, Set
 from endstone import ColorFormat, Player, GameMode
 from endstone.form import ActionForm, TextInput, ModalForm, Label
 from endstone.command import Command, CommandSender
-from endstone.event import event_handler, PlayerJoinEvent, PlayerQuitEvent, BlockBreakEvent, BlockPlaceEvent, PlayerDeathEvent, PlayerInteractEvent, ActorExplodeEvent 
+from endstone.event import event_handler, PlayerJoinEvent, PlayerQuitEvent, BlockBreakEvent, BlockPlaceEvent, PlayerDeathEvent, PlayerInteractEvent, ActorExplodeEvent, PlayerInteractActorEvent, ActorDamageEvent 
 from endstone.plugin import Plugin
 
 from endstone_arc_core.DatabaseManager import DatabaseManager
@@ -287,7 +287,7 @@ class ARCCorePlugin(Plugin):
         # 设置迁移管理器的日志记录器并执行迁移
         self.migration_manager.set_logger(self.logger)
         if not self.migration_manager.migrate_to_xuid():
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Database migration failed! Plugin may not work correctly.")
+            self.logger.warning(f"{ColorFormat.RED}[ARC Core]No migration executed.")
 
         # 初始化公告系统和清道夫系统
         self._load_broadcast_messages()
@@ -311,6 +311,10 @@ class ARCCorePlugin(Plugin):
             cleaner_period = self.cleaner_interval * 20  # 转换为ticks
             self.server.scheduler.run_task(self, self.start_cleaner_warning, delay=cleaner_period, period=cleaner_period)
             self.logger.info(f"[ARC Core]Cleaner system started, interval: {self.cleaner_interval} seconds")
+        
+        # 别踩白块接入
+        self.dtwt_plugin = self.server.plugin_manager.get_plugin('arc_dtwt')
+        print('[ARC Core]DTWT plugin loaded:', self.dtwt_plugin is not None)
 
     def on_disable(self) -> None:
         # 停止位置检测线程
@@ -418,7 +422,7 @@ class ARCCorePlugin(Plugin):
             if not self.if_player_logined(sender):
                 self.show_main_menu(sender)
                 return True
-            self.player_new_land_creation_info[sender.name] = [sender.location.dimension.name, (int(sender.location.x), int(sender.location.z))]
+            self.player_new_land_creation_info[sender.name] = [sender.location.dimension.name, (math.floor(sender.location.x), math.floor(sender.location.z))]
             sender.send_message(self.language_manager.GetText('CREATE_NEW_LAND_POS1_SET').format(
                 self.player_new_land_creation_info[sender.name][0],
                 self.player_new_land_creation_info[sender.name][1])
@@ -437,7 +441,7 @@ class ARCCorePlugin(Plugin):
             if sender.location.dimension.name != self.player_new_land_creation_info[sender.name][0]:
                 sender.send_message(self.language_manager.GetText('CREATE_NEW_LAND_POS2_SET_FAIL_DIMENSION_CHANGED'))
                 return True
-            self.player_new_land_creation_info[sender.name].append((int(sender.location.x), int(sender.location.z)))
+            self.player_new_land_creation_info[sender.name].append((math.floor(sender.location.x), math.floor(sender.location.z)))
             self.show_new_land_info(sender)
             return True
         return False
@@ -477,6 +481,11 @@ class ARCCorePlugin(Plugin):
     def on_block_break(self, event: BlockBreakEvent):
         if event.player.is_op:
             return
+
+        if self.dtwt_plugin is not None and self.dtwt_plugin.api_judge_if_start_block(event.block.location.x, event.block.location.y, event.block.location.z, event.block.dimension.name):
+            # print('DTWT block break, ignore')
+            return
+
         if not self.land_operation_check(event.player, event.block.location.dimension.name,
                                     (event.block.location.x, event.block.location.y, event.block.location.z)):
             event.is_cancelled = True
@@ -489,6 +498,7 @@ class ARCCorePlugin(Plugin):
     def on_block_place(self, event: BlockPlaceEvent):
         if event.player.is_op:
             return
+        print(event.player.name, event.block.location.x, event.block.location.y, event.block.location.z, event.block.dimension.name)
         if not self.land_operation_check(event.player, event.block.location.dimension.name,
                                     (event.block.location.x, event.block.location.y, event.block.location.z)):
             event.is_cancelled = True
@@ -515,6 +525,10 @@ class ARCCorePlugin(Plugin):
         if event.player.is_op:
             return
         
+        if self.dtwt_plugin is not None and self.dtwt_plugin.api_judge_if_start_block(event.block.location.x, event.block.location.y, event.block.location.z, event.block.dimension.name):
+            # print('DTWT block break, ignore')
+            return
+        
         # 只检查有方块的交互事件
         if not event.has_block:
             return
@@ -536,7 +550,7 @@ class ARCCorePlugin(Plugin):
             dimension = explosion_location.dimension.name
             
             # 检查爆炸位置是否在任何领地内
-            land_id = self.get_land_at_pos(dimension, int(explosion_location.x), int(explosion_location.z))
+            land_id = self.get_land_at_pos(dimension, math.floor(explosion_location.x), math.floor(explosion_location.z))
             if land_id is not None:
                 land_info = self.get_land_info(land_id)
                 if land_info and not land_info.get('allow_explosion', False):
@@ -547,7 +561,7 @@ class ARCCorePlugin(Plugin):
             # 检查爆炸影响的方块是否在领地内
             filtered_blocks = []
             for block in event.block_list:
-                block_land_id = self.get_land_at_pos(dimension, int(block.location.x), int(block.location.z))
+                block_land_id = self.get_land_at_pos(dimension, math.floor(block.location.x), math.floor(block.location.z))
                 if block_land_id is not None:
                     block_land_info = self.get_land_info(block_land_id)
                     if block_land_info and block_land_info.get('allow_explosion', False):
@@ -564,7 +578,87 @@ class ARCCorePlugin(Plugin):
         except Exception as e:
             self.logger.error(f"Handle actor explode event error: {str(e)}")
 
+    @event_handler
+    def on_player_interact_actor(self, event: PlayerInteractActorEvent):
+        """处理玩家与生物交互事件，保护领地内生物免受非法交互"""
+        # OP玩家跳过检查
+        if event.player.is_op:
+            return
+        
+        # 获取生物位置
+        actor_location = event.actor.location
+        dimension = actor_location.dimension.name
+        pos = (math.floor(actor_location.x), math.floor(actor_location.z))
+        
+        # 检查生物是否在领地内
+        land_id = self.get_land_at_pos(dimension, pos[0], pos[1])
+        if land_id is not None:
+            land_info = self.get_land_info(land_id)
+            if land_info and not land_info.get('allow_actor_interaction', False):
+                # 检查玩家是否有权限（领地主人或授权用户）
+                if not self._check_land_permission(event.player, land_info):
+                    event.is_cancelled = True
+                    event.player.send_message(self.language_manager.GetText('LAND_ACTOR_INTERACTION_DENIED'))
+
+    @event_handler
+    def on_actor_damage(self, event: ActorDamageEvent):
+        """处理生物受伤事件，保护领地内生物免受攻击"""
+        # 检查攻击者是否为玩家
+        attacker = event.damage_source.actor
+        if attacker is None or attacker.type != "minecraft:player":
+            return
+
+        # 如果玩家是op则不判断
+        if attacker.is_op:
+            return
+
+        # 获取被攻击生物位置
+        actor_location = event.actor.location
+        dimension = actor_location.dimension.name
+        pos = (math.floor(actor_location.x), math.floor(actor_location.z))
+        
+        # 检查生物是否在领地内
+        land_id = self.get_land_at_pos(dimension, pos[0], pos[1])
+        if land_id is not None:
+            land_info = self.get_land_info(land_id)
+            if land_info and not land_info.get('allow_actor_damage', False):
+                # 检查攻击者是否有权限（领地主人或授权用户）
+                # 首先根据attacker.name获取玩家的xuid
+                attacker_xuid = self.get_player_xuid_by_name(attacker.name)
+                if attacker_xuid is None:
+                    # 如果无法获取攻击者的xuid，则拒绝攻击
+                    event.is_cancelled = True
+                    attacker.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_DENIED'))
+                    return
+                
+                # 然后根据xuid判断有没有领地的权限
+                owner_xuid = land_info['owner_xuid']
+                shared_users = land_info.get('shared_users', [])
+                
+                # 检查是否是领地主人或授权用户
+                if owner_xuid != attacker_xuid and attacker_xuid not in shared_users:
+                    event.is_cancelled = True
+                    attacker.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_DENIED'))
+
+    def _check_land_permission(self, player: Player, land_info: dict) -> bool:
+        """
+        检查玩家是否有领地权限（领地主人或授权用户）
+        :param player: 玩家对象
+        :param land_info: 领地信息字典
+        :return: 是否有权限
+        """
+        try:
+            owner_xuid = land_info['owner_xuid']
+            shared_users = land_info.get('shared_users', [])
+            
+            # 检查是否是领地主人或授权用户
+            return owner_xuid == str(player.xuid) or str(player.xuid) in shared_users
+        except Exception as e:
+            self.logger.error(f"Check land permission error: {str(e)}")
+            return False
+
     def land_operation_check(self, player: Player, dimension: str, pos: tuple):
+        # print("land_operation_check", player.name, dimension, pos)
         land_id = self.get_land_at_pos(dimension, pos[0], pos[2])
         if land_id is not None:
             land_info = self.get_land_info(land_id)
@@ -582,6 +676,7 @@ class ARCCorePlugin(Plugin):
 
     def land_interact_check(self, player: Player, dimension: str, pos: tuple):
         """检查玩家是否有权限在领地内进行方块互动"""
+        # print("land_interact_check", player.name, dimension, pos)
         land_id = self.get_land_at_pos(dimension, pos[0], pos[2])
         if land_id is not None:
             land_info = self.get_land_info(land_id)
@@ -608,25 +703,7 @@ class ARCCorePlugin(Plugin):
                 return False
         return True
 
-    # Listeners
-    def player_position_listener(self):
-        """原始的位置监听器方法，保留作为备用"""
-        for player in self.server.online_players:
-            player_pos = self.get_player_position_vector(player)
-            land_id = self.get_land_at_pos(player.location.dimension.name, player_pos[0], player_pos[2])
-
-            if not player.name in self.player_in_land_id_dict:
-                self.player_in_land_id_dict[player.name] = None
-
-            if self.is_land_id_changed(self.player_in_land_id_dict[player.name], land_id):
-                self.player_in_land_id_dict[player.name] = land_id
-                if land_id is not None:
-                    new_land_name = self.get_land_name(land_id)
-                    land_owner = self.get_player_name_by_xuid(self.get_land_owner(land_id))
-                    player.send_title(self.language_manager.GetText('STEP_IN_LAND_TITLE').format(new_land_name),
-                                      self.language_manager.GetText('STEP_IN_LAND_SUBTITLE').format(land_owner),
-                                      5, 20, 5)
-
+    # Listener
     def _threaded_position_listener(self):
         """多线程位置检测方法"""
         self.logger.info(f"{ColorFormat.GREEN}[ARC Core]Position detection thread started")
@@ -669,20 +746,27 @@ class ARCCorePlugin(Plugin):
                                         land_owner = self.get_player_name_by_xuid(self.get_land_owner(land_id))
                                         
                                         # 创建固定参数的闭包，避免循环变量捕获问题
-                                        def create_land_message_sender(target_player, land_name, owner_name):
+                                        def create_land_message_sender(target_player, land_name, owner_name, land_id):
                                             def send_land_message():
                                                 try:
-                                                    target_player.send_title(
-                                                        self.language_manager.GetText('STEP_IN_LAND_TITLE').format(land_name),
-                                                        self.language_manager.GetText('STEP_IN_LAND_SUBTITLE').format(owner_name),
-                                                        5, 20, 5
-                                                    )
+                                                    # 发送领地信息字幕
+                                                    target_player.send_popup(
+                                                        f'{self.language_manager.GetText('STEP_IN_LAND_TITLE').format(land_name)}\n{self.language_manager.GetText('STEP_IN_LAND_SUBTITLE').format(owner_name)}'
+                                                        )
+                                                    # 显示领地边界粒子效果
+                                                    land_info = self.get_land_info(land_id)
+                                                    if land_info:
+                                                        pos = self.get_player_position_vector(target_player)
+                                                        if pos:
+                                                            y_coord = math.ceil(pos[1])
+                                                            self.display_land_particle_boundary(target_player, land_info, y_coord)
+                                                    
                                                 except Exception as e:
                                                     self.logger.warning(f"[ARC Core]Failed to send land message to {target_player.name}: {str(e)}")
                                             return send_land_message
                                         
                                         # 创建消息发送器，固定当前玩家和领地信息
-                                        message_sender = create_land_message_sender(player, new_land_name, land_owner)
+                                        message_sender = create_land_message_sender(player, new_land_name, land_owner, land_id)
                                         
                                         # 在主线程中执行UI操作
                                         if hasattr(self.server, 'scheduler'):
@@ -1254,6 +1338,8 @@ class ARCCorePlugin(Plugin):
                 arc_menu.add_button(self.language_manager.GetText('BUTTON_SHOP_MENU_NAME'), on_click=self.show_button_shop_menu)
             if self.server.plugin_manager.get_plugin('arc_dtwt'):
                 arc_menu.add_button(self.language_manager.GetText('DTWT_MENU_NAME'), on_click=self.show_dtwt_panel)
+            if self.server.plugin_manager.get_plugin('up_and_down'):
+                arc_menu.add_button(self.language_manager.GetText('STOCK_MARKET_NAME'), on_click=self.show_stock_ui)
             if player.is_op:
                 arc_menu.add_button(self.language_manager.GetText('OP_PANEL_NAME'), on_click=self.show_op_main_panel)
             arc_menu.add_button(self.language_manager.GetText('SUICIDE_FUNC_BUTTON'), on_click=self.execute_suicide)
@@ -2642,7 +2728,9 @@ class ARCCorePlugin(Plugin):
                 'tp_z': 'REAL NOT NULL',  # 传送点Z坐标
                 'shared_users': 'TEXT',  # 共有人UUID列表(JSON字符串)
                 'allow_explosion': 'INTEGER DEFAULT 0',  # 是否允许爆炸 (0=不允许, 1=允许)
-                'allow_public_interact': 'INTEGER DEFAULT 0'  # 是否对所有人开放方块互动 (0=不开放, 1=开放)
+                'allow_public_interact': 'INTEGER DEFAULT 0',  # 是否对所有人开放方块互动 (0=不开放, 1=开放)
+                'allow_actor_interaction': 'INTEGER DEFAULT 0',  # 是否允许生物互动 (0=不允许, 1=允许)
+                'allow_actor_damage': 'INTEGER DEFAULT 0'  # 是否允许攻击生物 (0=不允许, 1=允许)
             }
 
             # 检查表是否已经存在
@@ -2686,6 +2774,28 @@ class ARCCorePlugin(Plugin):
                     print("[ARC Core]Land table already has allow_public_interact column")
                 else:
                     print(f"[ARC Core]Could not add allow_public_interact column: {str(alter_error)}")
+            
+            # 尝试添加allow_actor_interaction字段，如果字段已存在会失败但不影响功能
+            try:
+                self.database_manager.execute("ALTER TABLE lands ADD COLUMN allow_actor_interaction INTEGER DEFAULT 0")
+                print("[ARC Core]Upgraded land table: added allow_actor_interaction column")
+            except Exception as alter_error:
+                # 字段可能已经存在，这是正常的
+                if "duplicate column name" in str(alter_error).lower() or "already exists" in str(alter_error).lower():
+                    print("[ARC Core]Land table already has allow_actor_interaction column")
+                else:
+                    print(f"[ARC Core]Could not add allow_actor_interaction column: {str(alter_error)}")
+            
+            # 尝试添加allow_actor_damage字段，如果字段已存在会失败但不影响功能
+            try:
+                self.database_manager.execute("ALTER TABLE lands ADD COLUMN allow_actor_damage INTEGER DEFAULT 0")
+                print("[ARC Core]Upgraded land table: added allow_actor_damage column")
+            except Exception as alter_error:
+                # 字段可能已经存在，这是正常的
+                if "duplicate column name" in str(alter_error).lower() or "already exists" in str(alter_error).lower():
+                    print("[ARC Core]Land table already has allow_actor_damage column")
+                else:
+                    print(f"[ARC Core]Could not add allow_actor_damage column: {str(alter_error)}")
             
             return True
         except Exception as e:
@@ -3194,6 +3304,8 @@ class ARCCorePlugin(Plugin):
                                   on_click=self.show_own_land_menu)
         land_main_menu.add_button(self.language_manager.GetText('LAND_MAIN_MENU_CREATE_NEW_LAND_TEXT'),
                                   on_click=self.show_create_new_land_guide)
+        land_main_menu.add_button(self.language_manager.GetText('LAND_MAIN_MENU_CHECK_CURRENT_LAND_TEXT'),
+                                  on_click=self.show_current_land_info)
         # 返回
         land_main_menu.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
                                   on_click=self.show_main_menu)
@@ -3260,6 +3372,12 @@ class ARCCorePlugin(Plugin):
         land_detail_panel.add_button(self.language_manager.GetText('LAND_EXPLOSION_SETTING_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.show_land_explosion_setting_panel(p, l_id)
                                      )
+        land_detail_panel.add_button(self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_BUTTON_TEXT'),
+                                     on_click=lambda p=player, l_id=land_id: self.show_land_actor_interaction_setting_panel(p, l_id)
+                                     )
+        land_detail_panel.add_button(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_BUTTON_TEXT'),
+                                     on_click=lambda p=player, l_id=land_id: self.show_land_actor_damage_setting_panel(p, l_id)
+                                     )
         land_detail_panel.add_button(self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.show_land_public_interact_setting_panel(p, l_id)
                                      )
@@ -3293,11 +3411,11 @@ class ARCCorePlugin(Plugin):
         player.send_form(rename_panel)
 
     def set_player_pos_as_land_tp_pos(self, player: Player, land_id: int):
-        on_land_id = self.get_land_at_pos(player.location.dimension.name, int(player.location.x), int(player.location.z))
+        on_land_id = self.get_land_at_pos(player.location.dimension.name, math.floor(player.location.x), math.floor(player.location.z))
         if on_land_id is None or on_land_id != land_id:
             result = self.language_manager.GetText('SET_LAND_TP_POS_FAIL_OUT_LAND')
         else:
-            new_pos = (int(player.location.x), int(player.location.y), int(player.location.z))
+            new_pos = (math.floor(player.location.x), math.floor(player.location.y), math.floor(player.location.z))
             self.set_land_teleport_point(land_id, new_pos[0], new_pos[1], new_pos[2])
             result = self.language_manager.GetText('SET_LAND_TP_POS_SUCCESS').format(land_id, new_pos)
         result_panel = ActionForm(
@@ -3712,8 +3830,249 @@ class ARCCorePlugin(Plugin):
         if land_info:
             self.show_own_land_detail_panel(player, land_id, land_info)
 
+    def show_land_actor_interaction_setting_panel(self, player: Player, land_id: int):
+        """显示领地生物互动设置面板"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        current_allow_actor_interaction = land_info.get('allow_actor_interaction', False)
+        status_text = self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_ENABLED') if current_allow_actor_interaction else self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_DISABLED')
+        
+        actor_interaction_setting_panel = ActionForm(
+            title=self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_TITLE'),
+            content=self.language_manager.GetText('LAND_ACTOR_INTERACTION_CURRENT_STATUS').format(status_text),
+            on_close=lambda p=player, l_id=land_id, l_info=land_info: self.show_own_land_detail_panel(p, l_id, l_info)
+        )
+        
+        if current_allow_actor_interaction:
+            # 当前允许生物互动，显示禁止生物互动按钮
+            actor_interaction_setting_panel.add_button(
+                self.language_manager.GetText('LAND_ACTOR_INTERACTION_TOGGLE_DISABLE_BUTTON'),
+                on_click=lambda p=player, l_id=land_id: self.toggle_land_actor_interaction_setting(p, l_id, False)
+            )
+        else:
+            # 当前禁止生物互动，显示允许生物互动按钮
+            actor_interaction_setting_panel.add_button(
+                self.language_manager.GetText('LAND_ACTOR_INTERACTION_TOGGLE_ENABLE_BUTTON'),
+                on_click=lambda p=player, l_id=land_id: self.toggle_land_actor_interaction_setting(p, l_id, True)
+            )
+        
+        player.send_form(actor_interaction_setting_panel)
+
+    def show_land_actor_damage_setting_panel(self, player: Player, land_id: int):
+        """显示领地生物攻击设置面板"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        current_allow_actor_damage = land_info.get('allow_actor_damage', False)
+        status_text = self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_ENABLED') if current_allow_actor_damage else self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_DISABLED')
+        
+        actor_damage_setting_panel = ActionForm(
+            title=self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_TITLE'),
+            content=self.language_manager.GetText('LAND_ACTOR_DAMAGE_CURRENT_STATUS').format(status_text),
+            on_close=lambda p=player, l_id=land_id, l_info=land_info: self.show_own_land_detail_panel(p, l_id, l_info)
+        )
+        
+        if current_allow_actor_damage:
+            # 当前允许攻击生物，显示禁止攻击生物按钮
+            actor_damage_setting_panel.add_button(
+                self.language_manager.GetText('LAND_ACTOR_DAMAGE_TOGGLE_DISABLE_BUTTON'),
+                on_click=lambda p=player, l_id=land_id: self.toggle_land_actor_damage_setting(p, l_id, False)
+            )
+        else:
+            # 当前禁止攻击生物，显示允许攻击生物按钮
+            actor_damage_setting_panel.add_button(
+                self.language_manager.GetText('LAND_ACTOR_DAMAGE_TOGGLE_ENABLE_BUTTON'),
+                on_click=lambda p=player, l_id=land_id: self.toggle_land_actor_damage_setting(p, l_id, True)
+            )
+        
+        player.send_form(actor_damage_setting_panel)
+
+    def toggle_land_actor_interaction_setting(self, player: Player, land_id: int, allow_actor_interaction: bool):
+        """切换领地生物互动设置"""
+        try:
+            success = self.database_manager.execute(
+                "UPDATE lands SET allow_actor_interaction = ? WHERE land_id = ?",
+                (1 if allow_actor_interaction else 0, land_id)
+            )
+            
+            if success:
+                if allow_actor_interaction:
+                    player.send_message(self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_UPDATED_ENABLE').format(land_id))
+                else:
+                    player.send_message(self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_UPDATED_DISABLE').format(land_id))
+            else:
+                player.send_message(self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_FAILED'))
+                
+        except Exception as e:
+            self.logger.error(f"Toggle land actor interaction setting error: {str(e)}")
+            player.send_message(self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_FAILED'))
+        
+        # 返回领地详情页面
+        land_info = self.get_land_info(land_id)
+        if land_info:
+            self.show_own_land_detail_panel(player, land_id, land_info)
+
+    def toggle_land_actor_damage_setting(self, player: Player, land_id: int, allow_actor_damage: bool):
+        """切换领地生物攻击设置"""
+        try:
+            success = self.database_manager.execute(
+                "UPDATE lands SET allow_actor_damage = ? WHERE land_id = ?",
+                (1 if allow_actor_damage else 0, land_id)
+            )
+            
+            if success:
+                if allow_actor_damage:
+                    player.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_UPDATED_ENABLE').format(land_id))
+                else:
+                    player.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_UPDATED_DISABLE').format(land_id))
+            else:
+                player.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_FAILED'))
+                
+        except Exception as e:
+            self.logger.error(f"Toggle land actor damage setting error: {str(e)}")
+            player.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_FAILED'))
+        
+        # 返回领地详情页面
+        land_info = self.get_land_info(land_id)
+        if land_info:
+            self.show_own_land_detail_panel(player, land_id, land_info)
+
     def show_create_new_land_guide(self, player: Player):
         player.send_message(self.language_manager.GetText('CREATE_NEW_LAND_GUIDE'))
+
+    def show_current_land_info(self, player: Player):
+        """显示玩家当前位置的领地信息并绘制粒子边界"""
+        try:
+            # 获取玩家当前位置
+            pos = self.get_player_position_vector(player)
+            if not pos:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
+            
+            x, y, z = pos
+            dimension = player.dimension.name.lower()
+            
+            # 获取当前位置的领地ID
+            land_id = self.get_land_at_pos(dimension, x, z)
+            
+            if not land_id:
+                player.send_message(self.language_manager.GetText('LAND_CURRENT_POSITION_NO_LAND'))
+                return
+            
+            # 获取领地详细信息
+            land_info = self.get_land_info(land_id)
+            if not land_info:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
+            
+            # 获取领地拥有者名称
+            owner_name = self.get_player_name_by_xuid(land_info['owner_xuid']) or '未知玩家'
+            
+            # 格式化爆炸保护状态
+            explosion_status = (self.language_manager.GetText('LAND_CURRENT_POSITION_EXPLOSION_ENABLED') 
+                              if land_info.get('allow_explosion', False) 
+                              else self.language_manager.GetText('LAND_CURRENT_POSITION_EXPLOSION_DISABLED'))
+            
+            # 格式化公共互动状态
+            public_interact_status = (self.language_manager.GetText('LAND_CURRENT_POSITION_PUBLIC_INTERACT_ENABLED') 
+                                    if land_info.get('allow_public_interact', False) 
+                                    else self.language_manager.GetText('LAND_CURRENT_POSITION_PUBLIC_INTERACT_DISABLED'))
+            
+            # 发送领地信息
+            land_message = self.language_manager.GetText('LAND_CURRENT_POSITION_INFO').format(
+                land_id,
+                land_info['land_name'],
+                owner_name,
+                land_info['dimension'],
+                land_info['min_x'], land_info['min_z'],
+                land_info['max_x'], land_info['max_z'],
+                land_info['tp_x'], land_info['tp_y'], land_info['tp_z'],
+                explosion_status,
+                public_interact_status
+            ).replace('\\n', '\n')
+            player.send_message(land_message)
+            
+            # 发送授权玩家信息
+            shared_users = land_info.get('shared_users', [])
+            if shared_users:
+                shared_names = []
+                for xuid in shared_users:
+                    name = self.get_player_name_by_xuid(xuid)
+                    if name:
+                        shared_names.append(name)
+                if shared_names:
+                    shared_message = self.language_manager.GetText('LAND_CURRENT_POSITION_SHARED_USERS').format(', '.join(shared_names))
+                    player.send_message(shared_message)
+            else:
+                player.send_message(self.language_manager.GetText('LAND_CURRENT_POSITION_NO_SHARED_USERS'))
+            
+            # 显示粒子边界
+            self.display_land_particle_boundary(player, land_info, math.ceil(y))
+            
+        except Exception as e:
+            self.logger.error(f"Show current land info error: {str(e)}")
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+
+    def display_land_particle_boundary(self, player: Player, land_info: dict, y_coord: float):
+        """显示领地粒子边界"""
+        try:
+            # player.send_message(self.language_manager.GetText('LAND_CURRENT_POSITION_PARTICLE_DISPLAY'))
+            
+            min_x = land_info['min_x']
+            max_x = land_info['max_x']
+            min_z = land_info['min_z']
+            max_z = land_info['max_z']
+            
+            # 计算四个角点坐标
+            corners = [
+                (min_x, y_coord, min_z),  # 左下角
+                (max_x, y_coord, min_z),  # 右下角
+                (max_x, y_coord, max_z),  # 右上角
+                (min_x, y_coord, max_z)   # 左上角
+            ]
+            
+            # 发送四个角点的粒子
+            for x, y, z in corners:
+                particle_cmd = f"particle minecraft:crop_growth_emitter {x} {y} {z}"
+                self.server.dispatch_command(self.server.command_sender, particle_cmd)
+            
+            # 计算每条边的插值点（每条边8个点，不包括端点）
+            # 底边 (min_x, min_z) -> (max_x, min_z)
+            for i in range(1, 8):
+                x = min_x + (max_x - min_x) * i / 8
+                z = min_z
+                particle_cmd = f"particle minecraft:crop_growth_emitter {x} {y_coord} {z}"
+                self.server.dispatch_command(self.server.command_sender, particle_cmd)
+            
+            # 右边 (max_x, min_z) -> (max_x, max_z)
+            for i in range(1, 8):
+                x = max_x
+                z = min_z + (max_z - min_z) * i / 8
+                particle_cmd = f"particle minecraft:crop_growth_emitter {x} {y_coord} {z}"
+                self.server.dispatch_command(self.server.command_sender, particle_cmd)
+            
+            # 顶边 (max_x, max_z) -> (min_x, max_z)
+            for i in range(1, 8):
+                x = max_x - (max_x - min_x) * i / 8
+                z = max_z
+                particle_cmd = f"particle minecraft:crop_growth_emitter {x} {y_coord} {z}"
+                self.server.dispatch_command(self.server.command_sender, particle_cmd)
+            
+            # 左边 (min_x, max_z) -> (min_x, min_z)
+            for i in range(1, 8):
+                x = min_x
+                z = max_z - (max_z - min_z) * i / 8
+                particle_cmd = f"particle minecraft:crop_growth_emitter {x} {y_coord} {z}"
+                self.server.dispatch_command(self.server.command_sender, particle_cmd)
+                
+        except Exception as e:
+            self.logger.error(f"Display land particle boundary error: {str(e)}")
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
 
     def show_new_land_info(self, player: Player):
         if_allowed, reason = self.check_land_availability(self.player_new_land_creation_info[player.name][0],
@@ -3887,6 +4246,10 @@ class ARCCorePlugin(Plugin):
     # DTWT Plugin related functions
     def show_dtwt_panel(self, player: Player):
         player.perform_command('dtwt')
+    
+    # Stock Market Plugin related functions
+    def show_stock_ui(self, player: Player):
+        player.perform_command('stock ui')
 
     # Tool
     @staticmethod
@@ -3978,15 +4341,28 @@ class ARCCorePlugin(Plugin):
         
         return self.change_player_money_by_name(player_name, money_to_change, notify=True)
     
-    def api_if_position_in_land(self, position: tuple) -> int:
+    def api_if_position_in_land(self, dimension: str, position: tuple) -> int:
         """
-        判断位置是否在玩家领地内，不在的话返回None
+        判断位置是否在玩家领地内，不在的话返回None，存在的话返回领地id
         """
-        return self.get_land_at_pos(math.floor(position[0]), math.floor(position[2]))
+        return self.get_land_at_pos(dimension, math.floor(position[0]), math.floor(position[2]))
     
     def api_get_land_info(self, land_id: int) -> dict:
         """
-        获取领地信息，不存在的话返回空字典
+        获取领地信息
+        :return: 领地信息字典 {
+            'land_name': 领地名称,
+            'dimension': 维度,
+            'min_x': 最小X坐标,
+            'max_x': 最大X坐标,
+            'min_z': 最小Z坐标,
+            'max_z': 最大Z坐标,
+            'tp_x': 传送点X坐标,
+            'tp_y': 传送点Y坐标,
+            'tp_z': 传送点Z坐标,
+            'shared_users': 共享玩家XUID列表,
+            'owner_xuid': 拥有者XUID
+        } 不存在则返回空字典
         """
         return self.get_land_info(land_id)
 
