@@ -3110,7 +3110,9 @@ class ARCCorePlugin(Plugin):
                     'tp_z': land['tp_z'],
                     'shared_users': json.loads(land['shared_users']),
                     'allow_explosion': bool(land.get('allow_explosion', 0)),
-                    'allow_public_interact': bool(land.get('allow_public_interact', 0))
+                    'allow_public_interact': bool(land.get('allow_public_interact', 0)),
+                    'allow_actor_interaction': bool(land.get('allow_actor_interaction', 0)),
+                    'allow_actor_damage': bool(land.get('allow_actor_damage', 0))
                 }
 
             return lands_info
@@ -3157,7 +3159,9 @@ class ARCCorePlugin(Plugin):
                     'shared_users': json.loads(result['shared_users']),
                     'owner_xuid': result['owner_xuid'],
                     'allow_explosion': bool(result.get('allow_explosion', 0)),
-                    'allow_public_interact': bool(result.get('allow_public_interact', 0))
+                    'allow_public_interact': bool(result.get('allow_public_interact', 0)),
+                    'allow_actor_interaction': bool(result.get('allow_actor_interaction', 0)),
+                    'allow_actor_damage': bool(result.get('allow_actor_damage', 0))
                 }
             return {}
 

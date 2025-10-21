@@ -432,7 +432,7 @@ from endstone.plugin import Plugin
 class MyPlugin(Plugin):
     def on_enable(self):
         # 获取 ARC Core 插件实例
-        self.arc_core = self.server.get_plugin('ARCCore')
+        self.arc_core = self.server.get_plugin('arc_core')
         
         if self.arc_core is None:
             self.logger.error("ARC Core plugin not found!")
@@ -454,31 +454,6 @@ class MyPlugin(Plugin):
             
         except Exception as e:
             self.logger.error(f"Failed to give reward: {e}")
-    
-    def get_server_economy_stats(self):
-        """获取服务器经济统计"""
-        try:
-            # 获取所有玩家金钱数据
-            all_money = self.arc_core.api_get_all_money_data()
-            
-            # 获取最富有和最贫穷的玩家
-            richest = self.arc_core.api_get_richest_player_money_data()
-            poorest = self.arc_core.api_get_poorest_player_money_data()
-            
-            # 计算统计信息
-            total_money = sum(all_money.values())
-            player_count = len(all_money)
-            average_money = total_money / player_count if player_count > 0 else 0
-            
-            self.logger.info(f"Economy Stats:")
-            self.logger.info(f"- Total Players: {player_count}")
-            self.logger.info(f"- Total Money: {total_money}")
-            self.logger.info(f"- Average Money: {average_money:.2f}")
-            self.logger.info(f"- Richest: {richest[0]} ({richest[1]})")
-            self.logger.info(f"- Poorest: {poorest[0]} ({poorest[1]})")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to get economy stats: {e}")
 ```
 
 ### 📋 API 注意事项
@@ -516,6 +491,13 @@ class MyPlugin(Plugin):
   - **完整UI支持** - 在领地设置中提供便捷的开关控制
   - **数据库自动升级** - 为现有领地自动添加新的保护字段
   - **多语言支持** - 完整的中文界面和提示信息
+
+- ✅ **别踩白块小游戏设施适配** - 智能游戏设施保护机制
+  - **设施识别** - 自动识别别踩白块小游戏设施方块，避免误拦截
+  - **方块破坏保护** - 在方块破坏事件中优先检查是否为DTWT设施，允许正常游戏操作
+  - **方块交互保护** - 在方块交互事件中跳过DTWT设施的权限检查，确保游戏正常运行
+  - **插件联动** - 与arc_dtwt插件无缝集成，提供完整的游戏体验
+  - **智能检测** - 使用DTWT插件的API接口判断方块是否为游戏设施起始方块
 
 - ✅ **股票系统适配** - 新增up_and_down插件集成支持
   - 在主菜单中新增"股票市场"按钮，玩家可直接访问股票交易功能
