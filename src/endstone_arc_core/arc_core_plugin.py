@@ -517,6 +517,9 @@ class ARCCorePlugin(Plugin):
             'z': event.player.location.z
         }
         event.player.send_message(self.language_manager.GetText('DEATH_LOCATION_RECORDED'))
+        
+        # 发送死亡播报
+        self._send_death_broadcast(event)
 
     @event_handler
     def on_player_interact(self, event: PlayerInteractEvent):
@@ -525,12 +528,12 @@ class ARCCorePlugin(Plugin):
         if event.player.is_op:
             return
         
-        if self.dtwt_plugin is not None and self.dtwt_plugin.api_judge_if_start_block(event.block.location.x, event.block.location.y, event.block.location.z, event.block.dimension.name):
-            # print('DTWT block break, ignore')
-            return
-        
         # 只检查有方块的交互事件
         if not event.has_block:
+            return
+
+        if self.dtwt_plugin is not None and self.dtwt_plugin.api_judge_if_start_block(event.block.location.x, event.block.location.y, event.block.location.z, event.block.dimension.name):
+            # print('DTWT block break, ignore')
             return
             
         # 获取交互位置
@@ -3351,7 +3354,7 @@ class ARCCorePlugin(Plugin):
             shared_user_name_str = self.language_manager.GetText('LAND_DETAIL_NO_SHARED_USER_TEXT')
         land_detail_panel = ActionForm(
             title=self.language_manager.GetText('LAND_DETAIL_PANEL_TITLE'),
-            content=self.language_manager.GetText('LAND_DETAIL_PANEL_CONTENT').replace('\\n', '\n').format(
+            content=self.language_manager.GetText('LAND_DETAIL_PANEL_CONTENT').format(
                 land_id,
                 land_info['land_name'],
                 land_info['dimension'],
@@ -3445,7 +3448,7 @@ class ARCCorePlugin(Plugin):
         return_money = int(land_area * self.land_price * self.land_sell_refund_coefficient)
         confirm_panel = ActionForm(
             title=self.language_manager.GetText('CONFIRM_DELETE_LAND_TITLE').format(land_id),
-            content=self.language_manager.GetText('CONFIRM_DELETE_LAND_CONTENT').replace('\\n', '\n').format(land_id, deleta_land_info['land_name'], self.land_sell_refund_coefficient, return_money),
+            content=self.language_manager.GetText('CONFIRM_DELETE_LAND_CONTENT').format(land_id, deleta_land_info['land_name'], self.land_sell_refund_coefficient, return_money),
             on_close=self.show_own_land_detail_panel(player, land_id, deleta_land_info)
         )
         confirm_panel.add_button(self.language_manager.GetText('CONFIRM_DELETE_LAND_BUTTON').format(land_id),
@@ -3497,7 +3500,7 @@ class ARCCorePlugin(Plugin):
 
         confirm_panel = ActionForm(
             title=self.language_manager.GetText('CONFIRM_TRANSFER_LAND_TITLE').format(land_id),
-            content=self.language_manager.GetText('CONFIRM_TRANSFER_LAND_CONTENT').replace('\\n', '\n').format(
+            content=self.language_manager.GetText('CONFIRM_TRANSFER_LAND_CONTENT').format(
                 land_id, 
                 land_info['land_name'], 
                 target_player.name
@@ -3998,7 +4001,7 @@ class ARCCorePlugin(Plugin):
                 land_info['tp_x'], land_info['tp_y'], land_info['tp_z'],
                 explosion_status,
                 public_interact_status
-            ).replace('\\n', '\n')
+            )
             player.send_message(land_message)
             
             # 发送授权玩家信息
@@ -4120,7 +4123,7 @@ class ARCCorePlugin(Plugin):
             
             new_land_form = ActionForm(
                 title=self.language_manager.GetText('NEW_LAND_TITLE'),
-                content=self.language_manager.GetText('NEW_LAND_INFO_TEXT').replace('\\n', '\n').format(
+                content=self.language_manager.GetText('NEW_LAND_INFO_TEXT').format(
                     self.player_new_land_creation_info[player.name][0],
                     (min_x, min_z),
                     (max_x, max_z),
@@ -4435,6 +4438,214 @@ class ARCCorePlugin(Plugin):
         except Exception as e:
             self.logger.error(f"[ARC Core]Process broadcast placeholders error: {str(e)}")
             return message  # 如果处理失败，返回原消息
+
+    def _send_death_broadcast(self, event: PlayerDeathEvent):
+        """发送死亡播报消息"""
+        try:
+            player_name = event.player.name
+            dimension_raw = event.player.location.dimension.name
+            dimension = self._translate_dimension_name(dimension_raw)
+            x = int(event.player.location.x)
+            y = int(event.player.location.y)
+            z = int(event.player.location.z)
+            
+            # 尝试获取死亡原因
+            death_cause_raw = self._get_death_cause(event)
+            death_cause_translated = self._translate_death_cause(death_cause_raw) if death_cause_raw else ""
+            
+            # 尝试获取攻击者信息
+            attacker_name = self._get_entity_name_from_damage_source(event)
+            
+            # 根据死亡原因和攻击者信息选择消息格式
+            if attacker_name and death_cause_translated in ['生物攻击', '玩家攻击']:
+                # 被生物或玩家杀死的情况
+                game_message = self.language_manager.GetText('DEATH_BROADCAST_MESSAGE_WITH_CAUSE').format(
+                    player_name, dimension, x, y, z, f"{death_cause_translated}({attacker_name})"
+                )
+                qq_message = self.language_manager.GetText('DEATH_QQ_MESSAGE_WITH_ENTITY').format(
+                    player_name, dimension, x, y, z, attacker_name
+                )
+            elif death_cause_translated:
+                # 只有死亡原因
+                game_message = self.language_manager.GetText('DEATH_BROADCAST_MESSAGE_WITH_CAUSE').format(
+                    player_name, dimension, x, y, z, death_cause_translated
+                )
+                qq_message = self.language_manager.GetText('DEATH_QQ_MESSAGE_WITH_CAUSE').format(
+                    player_name, dimension, x, y, z, death_cause_translated
+                )
+            else:
+                # 没有死亡原因
+                game_message = self.language_manager.GetText('DEATH_BROADCAST_MESSAGE').format(
+                    player_name, dimension, x, y, z
+                )
+                qq_message = self.language_manager.GetText('DEATH_QQ_MESSAGE').format(
+                    player_name, dimension, x, y, z
+                )
+            
+            # 发送给所有在线玩家
+            for player in self.server.online_players:
+                player.send_message(game_message)
+            
+            # 发送到QQ群
+            self._send_to_qq_group(qq_message)
+                
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Send death broadcast error: {str(e)}")
+
+    def _get_death_cause(self, event: PlayerDeathEvent) -> str:
+        """获取死亡原因"""
+        try:
+            # 根据EndStone文档，PlayerDeathEvent有damage_source属性
+            if hasattr(event, 'damage_source') and event.damage_source:
+                damage_source = event.damage_source
+                
+                # 尝试获取伤害源类型
+                if hasattr(damage_source, 'damage_type'):
+                    return str(damage_source.damage_type)
+                elif hasattr(damage_source, 'type'):
+                    return str(damage_source.type)
+                else:
+                    return str(damage_source)
+            # 兼容性检查其他可能的属性
+            elif hasattr(event, 'death_cause'):
+                return str(event.death_cause)
+            elif hasattr(event, 'cause'):
+                return str(event.cause)
+            else:
+                return ""
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Get death cause error: {str(e)}")
+            return ""
+
+    def _translate_death_cause(self, death_cause: str) -> str:
+        """翻译死亡原因"""
+        try:
+            if not death_cause:
+                return ""
+            
+            # 将死亡原因转换为大写并添加前缀
+            death_cause_key = f"DEATH_CAUSE_{death_cause.upper()}"
+            
+            # 使用 LanguageManager 获取翻译
+            translation = self.language_manager.GetText(death_cause_key)
+            
+            # 如果找到了翻译，返回翻译结果
+            if translation:
+                return translation
+            
+            # 如果没找到翻译，尝试部分匹配
+            # 处理一些特殊情况，比如 minecraft:fall 这样的格式
+            if ':' in death_cause:
+                simple_cause = death_cause.split(':')[-1]
+                simple_key = f"DEATH_CAUSE_{simple_cause.upper()}"
+                simple_translation = self.language_manager.GetText(simple_key)
+                if simple_translation:
+                    return simple_translation
+            
+            # 如果找不到翻译，返回原字符串
+            return death_cause
+            
+        except Exception as e:
+            self.logger.error(f"[ARC Core] 翻译死亡原因错误: {str(e)}")
+            return death_cause
+
+    def _get_entity_name_from_damage_source(self, event: PlayerDeathEvent) -> str:
+        """从伤害源获取生物名称"""
+        try:
+            if hasattr(event, 'damage_source') and event.damage_source:
+                damage_source = event.damage_source
+                
+                # 优先尝试从 damage_source 的 actor 属性获取名称
+                if hasattr(damage_source, 'actor') and damage_source.actor:
+                    return self._translate_entity_name(damage_source.actor)
+                
+                # 尝试 damaging_actor 属性
+                if hasattr(damage_source, 'damaging_actor') and damage_source.damaging_actor:
+                    return self._translate_entity_name(damage_source.damaging_actor)
+                
+                # 尝试获取攻击者实体对象
+                if hasattr(damage_source, 'damaging_entity'):
+                    entity = damage_source.damaging_entity
+                    if entity:
+                        return self._translate_entity_name(entity)
+                
+                # 尝试其他可能的属性
+                if hasattr(damage_source, 'entity'):
+                    entity = damage_source.entity
+                    if entity:
+                        return self._translate_entity_name(entity)
+                
+                if hasattr(damage_source, 'attacker'):
+                    entity = damage_source.attacker
+                    if entity:
+                        return self._translate_entity_name(entity)
+            
+            return ""
+        except Exception as e:
+            self.logger.error(f"[ARC Core] 获取生物名称错误: {str(e)}")
+            return ""
+
+    def _translate_entity_name(self, entity) -> str:
+        """翻译生物名称"""
+        try:
+            if not entity:
+                return ""
+            
+            # 尝试获取实体的名称
+            if hasattr(entity, 'name') and entity.name:
+                return str(entity.name).strip()
+            
+            # 如果没有名称，返回实体类型
+            return str(type(entity).__name__)
+            
+        except Exception as e:
+            self.logger.error(f"[ARC Core] 翻译生物名称错误: {str(e)}")
+            return str(entity) if entity else ""
+
+    def _translate_dimension_name(self, dimension_name: str) -> str:
+        """翻译维度名称"""
+        try:
+            if not dimension_name:
+                return ""
+            
+            # 将维度名称转换为大写并添加前缀
+            dimension_key = f"DIMENSION_{dimension_name.upper()}"
+            
+            # 使用 LanguageManager 获取翻译
+            translation = self.language_manager.GetText(dimension_key)
+            
+            # 如果找到了翻译，返回翻译结果
+            if translation:
+                return translation
+            
+            # 如果没找到翻译，返回原字符串
+            return dimension_name
+            
+        except Exception as e:
+            self.logger.error(f"[ARC Core] 翻译维度名称错误: {str(e)}")
+            return dimension_name
+
+    def _send_to_qq_group(self, message: str):
+        """
+        发送消息到QQ群
+        :param message: 要发送的消息
+        """
+        try:
+            # 获取 qqsync_plugin 插件
+            qqsync = self.server.plugin_manager.get_plugin('qqsync_plugin')
+            if qqsync is None:
+                self.logger.warning("[ARC Core] QQSync 插件未找到，无法发送群消息")
+                return
+            
+            # 发送消息到QQ群
+            success = qqsync.api_send_message(message)
+            if success:
+                self.logger.info(f"[ARC Core] 死亡消息已发送到QQ群: {message}")
+            else:
+                self.logger.warning(f"[ARC Core] QQ群消息发送失败: {message}")
+        except Exception as e:
+            self.logger.error(f"[ARC Core] QQ群消息发送异常: {str(e)}")
+            # 即使QQ群发送失败，也不影响游戏正常运行
 
     # 清道夫系统
     def _init_cleaner_system(self):

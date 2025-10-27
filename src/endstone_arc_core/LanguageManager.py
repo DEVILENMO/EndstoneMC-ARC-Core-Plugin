@@ -50,4 +50,4 @@ class LanguageManager:
             print(f'[ARC Core]Key {key} not found in language file {target_lang}.txt.')
             return ''
         else:
-            return LanguageManager.language_dict[target_lang][key]
+            return LanguageManager.language_dict[target_lang][key].replace('\\n', '\n')
