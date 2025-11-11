@@ -524,26 +524,50 @@ class ARCCorePlugin(Plugin):
     @event_handler
     def on_player_interact(self, event: PlayerInteractEvent):
         """处理玩家交互事件，保护领地免受非法交互"""
-        # OP玩家跳过检查
-        if event.player.is_op:
-            return
-        
-        # 只检查有方块的交互事件
-        if not event.has_block:
-            return
+        try:
+            # 玩家或OP判定
+            if not hasattr(event, 'player') or event.player is None:
+                return
+            if getattr(event.player, 'is_op', False):
+                return
 
-        if self.dtwt_plugin is not None and self.dtwt_plugin.api_judge_if_start_block(event.block.location.x, event.block.location.y, event.block.location.z, event.block.dimension.name):
-            # print('DTWT block break, ignore')
-            return
-            
-        # 获取交互位置
-        block_location = event.block.location
-        dimension = event.player.location.dimension.name
-        pos = (block_location.x, block_location.y, block_location.z)
-        
-        # 检查是否在领地内且不是领地主人
-        if not self.land_interact_check(event.player, dimension, pos):
-            event.is_cancelled = True
+            # 只检查有方块的交互事件
+            if not getattr(event, 'has_block', False):
+                return
+
+            block = getattr(event, 'block', None)
+            if block is None or not hasattr(block, 'location') or block.location is None:
+                return
+
+            block_location = block.location
+
+            # DTWT 设施判定（若可用）
+            try:
+                if (
+                    self.dtwt_plugin is not None and
+                    hasattr(block, 'dimension') and block.dimension is not None and hasattr(block.dimension, 'name') and
+                    self.dtwt_plugin.api_judge_if_start_block(block_location.x, block_location.y, block_location.z, block.dimension.name)
+                ):
+                    return
+            except Exception:
+                # 外部插件异常不影响主流程
+                pass
+
+            # 维度与坐标
+            if hasattr(block, 'dimension') and block.dimension is not None and hasattr(block.dimension, 'name'):
+                dimension = block.dimension.name
+            else:
+                # 回退到玩家维度
+                dimension = event.player.location.dimension.name if hasattr(event.player, 'location') and event.player.location else ''
+
+            pos = (block_location.x, block_location.y, block_location.z)
+
+            # 检查是否在领地内且不是领地主人
+            if not self.land_interact_check(event.player, dimension, pos):
+                event.is_cancelled = True
+        except Exception as e:
+            pass
+            # self.logger.error(f"[ARC Core] on_player_interact error: {str(e)}")
 
     @event_handler
     def on_actor_explode(self, event: ActorExplodeEvent):
@@ -754,7 +778,7 @@ class ARCCorePlugin(Plugin):
                                                 try:
                                                     # 发送领地信息字幕
                                                     target_player.send_popup(
-                                                        f'{self.language_manager.GetText('STEP_IN_LAND_TITLE').format(land_name)}\n{self.language_manager.GetText('STEP_IN_LAND_SUBTITLE').format(owner_name)}'
+                                                        f'{self.language_manager.GetText("STEP_IN_LAND_TITLE").format(land_name)}\n{self.language_manager.GetText("STEP_IN_LAND_SUBTITLE").format(owner_name)}'
                                                         )
                                                     # 显示领地边界粒子效果
                                                     land_info = self.get_land_info(land_id)
@@ -2320,7 +2344,7 @@ class ARCCorePlugin(Plugin):
     def generate_tp_command_to_position(player_name: str, position: tuple, dimension: str = 'overworld'):
         formatted_name = f'"{player_name}"' if ' ' in player_name else player_name
         formatted_dimension = ARCCorePlugin.format_dimension_name(dimension)
-        return f'execute in {formatted_dimension} run tp {formatted_name} {' '.join([str(int(_)) for _ in position])}'
+        return f'execute in {formatted_dimension} run tp {formatted_name} {" ".join([str(int(_)) for _ in position])}'
 
     @staticmethod
     def generate_tp_command_to_player(player_name: str, target_player_name: str, dimension: str = 'overworld'):
