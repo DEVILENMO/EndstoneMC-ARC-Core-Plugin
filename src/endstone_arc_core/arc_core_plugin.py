@@ -155,6 +155,71 @@ class ARCCorePlugin(Plugin):
         except (ValueError, TypeError):
             self.max_player_home_num = 3
         self.teleport_requests = {}  # 存储传送请求 {player_name: {'type': 'tpa'/'tphere', 'target': target_name, 'expire_time': time}}
+        
+        # 随机传送配置
+        self.enable_random_teleport = self.setting_manager.GetSetting('ENABLE_RANDOM_TELEPORT')
+        if self.enable_random_teleport is None:
+            self.enable_random_teleport = True
+        else:
+            try:
+                self.enable_random_teleport = str(self.enable_random_teleport).lower() in ['true', '1', 'yes']
+            except (ValueError, AttributeError):
+                self.enable_random_teleport = True
+        
+        self.random_teleport_center_x = self.setting_manager.GetSetting('RANDOM_TELEPORT_CENTER_X')
+        try:
+            self.random_teleport_center_x = int(self.random_teleport_center_x)
+        except (ValueError, TypeError):
+            self.random_teleport_center_x = 0
+            
+        self.random_teleport_center_z = self.setting_manager.GetSetting('RANDOM_TELEPORT_CENTER_Z')
+        try:
+            self.random_teleport_center_z = int(self.random_teleport_center_z)
+        except (ValueError, TypeError):
+            self.random_teleport_center_z = 0
+            
+        self.random_teleport_radius = self.setting_manager.GetSetting('RANDOM_TELEPORT_RADIUS')
+        try:
+            self.random_teleport_radius = int(self.random_teleport_radius)
+        except (ValueError, TypeError):
+            self.random_teleport_radius = 5000
+        
+        # 传送收费配置
+        self.teleport_cost_public_warp = self.setting_manager.GetSetting('TELEPORT_COST_PUBLIC_WARP')
+        try:
+            self.teleport_cost_public_warp = int(self.teleport_cost_public_warp)
+        except (ValueError, TypeError):
+            self.teleport_cost_public_warp = 0
+            
+        self.teleport_cost_home = self.setting_manager.GetSetting('TELEPORT_COST_HOME')
+        try:
+            self.teleport_cost_home = int(self.teleport_cost_home)
+        except (ValueError, TypeError):
+            self.teleport_cost_home = 0
+            
+        self.teleport_cost_land = self.setting_manager.GetSetting('TELEPORT_COST_LAND')
+        try:
+            self.teleport_cost_land = int(self.teleport_cost_land)
+        except (ValueError, TypeError):
+            self.teleport_cost_land = 0
+            
+        self.teleport_cost_death_location = self.setting_manager.GetSetting('TELEPORT_COST_DEATH_LOCATION')
+        try:
+            self.teleport_cost_death_location = int(self.teleport_cost_death_location)
+        except (ValueError, TypeError):
+            self.teleport_cost_death_location = 0
+            
+        self.teleport_cost_random = self.setting_manager.GetSetting('TELEPORT_COST_RANDOM')
+        try:
+            self.teleport_cost_random = int(self.teleport_cost_random)
+        except (ValueError, TypeError):
+            self.teleport_cost_random = 100
+            
+        self.teleport_cost_player = self.setting_manager.GetSetting('TELEPORT_COST_PLAYER')
+        try:
+            self.teleport_cost_player = int(self.teleport_cost_player)
+        except (ValueError, TypeError):
+            self.teleport_cost_player = 50
 
         # 公告系统
         self.broadcast_messages = []  # 存储公告消息列表
@@ -1923,21 +1988,40 @@ class ARCCorePlugin(Plugin):
             title=self.language_manager.GetText('TELEPORT_MAIN_MENU_TITLE'),
             content=self.language_manager.GetText('TELEPORT_MAIN_MENU_CONTENT')
         )
-        teleport_main_menu.add_button(self.language_manager.GetText('TELEPORT_MAIN_MENU_PUBLIC_WARP_BUTTON'),
-                                      on_click=self.show_public_warp_menu)
-        teleport_main_menu.add_button(self.language_manager.GetText('TELEPORT_MAIN_MENU_HOME_BUTTON'),
-                                      on_click=self.show_home_menu)
+        
+        # 公共传送点按钮
+        public_warp_text = self.language_manager.GetText('TELEPORT_MAIN_MENU_PUBLIC_WARP_BUTTON')
+        if self.teleport_cost_public_warp > 0:
+            public_warp_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(public_warp_text, self.teleport_cost_public_warp)
+        teleport_main_menu.add_button(public_warp_text, on_click=self.show_public_warp_menu)
+        
+        # 私人传送点按钮
+        home_text = self.language_manager.GetText('TELEPORT_MAIN_MENU_HOME_BUTTON')
+        if self.teleport_cost_home > 0:
+            home_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(home_text, self.teleport_cost_home)
+        teleport_main_menu.add_button(home_text, on_click=self.show_home_menu)
+        
+        # 随机传送按钮
+        if self.enable_random_teleport:
+            random_text = self.language_manager.GetText('TELEPORT_MAIN_MENU_RANDOM_BUTTON')
+            if self.teleport_cost_random > 0:
+                random_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(random_text, self.teleport_cost_random)
+            teleport_main_menu.add_button(random_text, on_click=self.start_random_teleport)
         
         # 如果玩家有死亡位置记录，显示返回死亡地点的按钮
         if player.name in self.player_death_locations:
             death_location = self.player_death_locations[player.name]
-            teleport_main_menu.add_button(
-                self.language_manager.GetText('TELEPORT_MAIN_MENU_DEATH_LOCATION_BUTTON').format(death_location['dimension']),
-                on_click=self.teleport_to_death_location
-            )
+            death_text = self.language_manager.GetText('TELEPORT_MAIN_MENU_DEATH_LOCATION_BUTTON').format(death_location['dimension'])
+            if self.teleport_cost_death_location > 0:
+                death_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(death_text, self.teleport_cost_death_location)
+            teleport_main_menu.add_button(death_text, on_click=self.teleport_to_death_location)
         
-        teleport_main_menu.add_button(self.language_manager.GetText('TELEPORT_MAIN_MENU_PLAYER_REQUEST_BUTTON'),
-                                      on_click=self.show_player_teleport_request_menu)
+        # 玩家传送请求按钮
+        player_request_text = self.language_manager.GetText('TELEPORT_MAIN_MENU_PLAYER_REQUEST_BUTTON')
+        if self.teleport_cost_player > 0:
+            player_request_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(player_request_text, self.teleport_cost_player)
+        teleport_main_menu.add_button(player_request_text, on_click=self.show_player_teleport_request_menu)
+        
         if player.is_op:
             teleport_main_menu.add_button(self.language_manager.GetText('TELEPORT_MAIN_MENU_OP_MANAGE_WARP_BUTTON'),
                                           on_click=self.show_op_warp_manage_menu)
@@ -2118,8 +2202,12 @@ class ARCCorePlugin(Plugin):
         
         for warp_name, warp_info in public_warps.items():
             creator_name = self.get_player_name_by_xuid(warp_info['created_by']) or 'Unknown'
+            warp_button_text = self.language_manager.GetText('PUBLIC_WARP_BUTTON_TEXT').format(warp_name, warp_info['dimension'], creator_name)
+            # 如果公共传送点收费，显示价格
+            if self.teleport_cost_public_warp > 0:
+                warp_button_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(warp_button_text, self.teleport_cost_public_warp)
             warp_menu.add_button(
-                self.language_manager.GetText('PUBLIC_WARP_BUTTON_TEXT').format(warp_name, warp_info['dimension'], creator_name),
+                warp_button_text,
                 on_click=lambda p=player, w_name=warp_name, w_info=warp_info: self.teleport_to_public_warp(p, w_name, w_info)
             )
         
@@ -2166,8 +2254,12 @@ class ARCCorePlugin(Plugin):
             on_close=self.show_home_menu
         )
         
+        # 私人传送点传送按钮（显示价格）
+        home_teleport_text = self.language_manager.GetText('HOME_TELEPORT_BUTTON')
+        if self.teleport_cost_home > 0:
+            home_teleport_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(home_teleport_text, self.teleport_cost_home)
         detail_menu.add_button(
-            self.language_manager.GetText('HOME_TELEPORT_BUTTON'),
+            home_teleport_text,
             on_click=lambda p=player, h_name=home_name, h_info=home_info: self.teleport_to_home(p, h_name, h_info)
         )
         
@@ -2252,10 +2344,46 @@ class ARCCorePlugin(Plugin):
     # Teleport Functions
     def teleport_to_public_warp(self, player: Player, warp_name: str, warp_info: Dict[str, Any]):
         """传送到公共传送点"""
+        # 检查费用
+        if self.teleport_cost_public_warp > 0:
+            player_money = self.get_player_money(player)
+            if player_money < self.teleport_cost_public_warp:
+                player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
+                    self.teleport_cost_public_warp, player_money
+                ))
+                return
+            
+            # 扣除费用
+            if self.decrease_player_money(player, self.teleport_cost_public_warp):
+                player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
+                    self.teleport_cost_public_warp, self.get_player_money(player)
+                ))
+            else:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
+        
         self.start_teleport_to_position_countdown(player, warp_name, (warp_info['x'], warp_info['y'], warp_info['z']), 'PUBLIC_WARP', warp_info['dimension'])
 
     def teleport_to_home(self, player: Player, home_name: str, home_info: Dict[str, Any]):
         """传送到玩家传送点"""
+        # 检查费用
+        if self.teleport_cost_home > 0:
+            player_money = self.get_player_money(player)
+            if player_money < self.teleport_cost_home:
+                player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
+                    self.teleport_cost_home, player_money
+                ))
+                return
+            
+            # 扣除费用
+            if self.decrease_player_money(player, self.teleport_cost_home):
+                player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
+                    self.teleport_cost_home, self.get_player_money(player)
+                ))
+            else:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
+        
         self.start_teleport_to_position_countdown(player, home_name, (home_info['x'], home_info['y'], home_info['z']), 'HOME', home_info['dimension'])
 
     def start_teleport_to_position_countdown(self, player: Player, destination_name: str, position: tuple, teleport_type: str, dimension: str = 'overworld'):
@@ -2360,6 +2488,24 @@ class ARCCorePlugin(Plugin):
             player.send_message(self.language_manager.GetText('NO_DEATH_LOCATION_RECORDED'))
             return
         
+        # 检查费用
+        if self.teleport_cost_death_location > 0:
+            player_money = self.get_player_money(player)
+            if player_money < self.teleport_cost_death_location:
+                player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
+                    self.teleport_cost_death_location, player_money
+                ))
+                return
+            
+            # 扣除费用
+            if self.decrease_player_money(player, self.teleport_cost_death_location):
+                player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
+                    self.teleport_cost_death_location, self.get_player_money(player)
+                ))
+            else:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
+        
         death_location = self.player_death_locations[player.name]
         
         # 开始传送倒计时
@@ -2387,6 +2533,80 @@ class ARCCorePlugin(Plugin):
         
         # 清理死亡位置记录
         del self.player_death_locations[player.name]
+
+    # Random Teleport System
+    def start_random_teleport(self, player: Player):
+        """开始随机传送"""
+        # 检查功能是否启用
+        if not self.enable_random_teleport:
+            player.send_message(self.language_manager.GetText('RANDOM_TELEPORT_DISABLED'))
+            return
+        
+        # 检查费用
+        if self.teleport_cost_random > 0:
+            player_money = self.get_player_money(player)
+            if player_money < self.teleport_cost_random:
+                player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
+                    self.teleport_cost_random, player_money
+                ))
+                return
+            
+            # 扣除费用
+            if self.decrease_player_money(player, self.teleport_cost_random):
+                player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
+                    self.teleport_cost_random, self.get_player_money(player)
+                ))
+            else:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
+        
+        # 发送倒计时消息
+        player.send_message(self.language_manager.GetText('RANDOM_TELEPORT_COUNTDOWN'))
+        
+        # 延迟执行传送
+        self.server.scheduler.run_task(
+            self,
+            lambda: self.execute_random_teleport(player),
+            delay=45
+        )
+    
+    def execute_random_teleport(self, player: Player):
+        """执行随机传送"""
+        import random
+        
+        # 生成随机坐标
+        angle = random.uniform(0, 2 * math.pi)
+        distance = random.uniform(0, self.random_teleport_radius)
+        
+        random_x = self.random_teleport_center_x + int(distance * math.cos(angle))
+        random_z = self.random_teleport_center_z + int(distance * math.sin(angle))
+        random_y = 256
+        
+        # 执行传送到主世界
+        position = (random_x, random_y, random_z)
+        dimension = 'overworld'
+        
+        player.send_message(self.language_manager.GetText('RANDOM_TELEPORT_SUCCESS').format(random_x, random_z))
+        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position, dimension))
+        
+        # 添加羽落效果（10秒）
+        self.server.scheduler.run_task(
+            self,
+            lambda: self.apply_slow_falling_effect(player),
+            delay=2  # 稍微延迟以确保传送完成
+        )
+    
+    def apply_slow_falling_effect(self, player: Player):
+        """给玩家添加羽落效果"""
+        try:
+            # 使用 effect 命令给玩家添加缓降效果
+            self.server.dispatch_command(
+                self.server.command_sender,
+                f'effect "{player.name}" slow_falling 10 255 true'
+            )
+            player.send_message(self.language_manager.GetText('RANDOM_TELEPORT_SLOW_FALLING_APPLIED'))
+        except Exception as e:
+            self.logger.error(f"Failed to apply slow falling effect: {str(e)}")
 
     # Player Teleport Request System
     def show_player_teleport_request_menu(self, player: Player):
@@ -2473,6 +2693,24 @@ class ARCCorePlugin(Plugin):
         """发送TPA请求（请求传送到目标玩家处）"""
         import time
         
+        # 检查费用
+        if self.teleport_cost_player > 0:
+            player_money = self.get_player_money(sender)
+            if player_money < self.teleport_cost_player:
+                sender.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
+                    self.teleport_cost_player, player_money
+                ))
+                return
+            
+            # 扣除费用
+            if self.decrease_player_money(sender, self.teleport_cost_player):
+                sender.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
+                    self.teleport_cost_player, self.get_player_money(sender)
+                ))
+            else:
+                sender.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
+        
         # 检查是否已有请求
         if target.name in self.teleport_requests:
             sender.send_message(self.language_manager.GetText('TELEPORT_REQUEST_ALREADY_EXISTS').format(target.name))
@@ -2492,6 +2730,24 @@ class ARCCorePlugin(Plugin):
     def send_tphere_request(self, sender: Player, target: Player):
         """发送TPHERE请求（请求目标玩家传送过来）"""
         import time
+        
+        # 检查费用
+        if self.teleport_cost_player > 0:
+            player_money = self.get_player_money(sender)
+            if player_money < self.teleport_cost_player:
+                sender.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
+                    self.teleport_cost_player, player_money
+                ))
+                return
+            
+            # 扣除费用
+            if self.decrease_player_money(sender, self.teleport_cost_player):
+                sender.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
+                    self.teleport_cost_player, self.get_player_money(sender)
+                ))
+            else:
+                sender.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
         
         # 检查是否已有请求
         if target.name in self.teleport_requests:
@@ -3389,8 +3645,12 @@ class ARCCorePlugin(Plugin):
             ),
             on_close=self.show_own_land_menu
         )
-        land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_TELEPORT_BUTTON_TEXT'),
-                                     on_click=lambda p=player, l_id=land_id: self.teleport_to_land(p, l_id))
+        
+        # 领地传送按钮（显示价格）
+        land_teleport_text = self.language_manager.GetText('LAND_DETAIL_PANEL_TELEPORT_BUTTON_TEXT')
+        if self.teleport_cost_land > 0:
+            land_teleport_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(land_teleport_text, self.teleport_cost_land)
+        land_detail_panel.add_button(land_teleport_text, on_click=lambda p=player, l_id=land_id: self.teleport_to_land(p, l_id))
         land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_RENAME_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.show_rename_own_land_panel(p, l_id)
                                      )
@@ -3457,6 +3717,24 @@ class ARCCorePlugin(Plugin):
         player.send_form(result_panel)
 
     def teleport_to_land(self, player: Player, land_id: int):
+        # 检查费用
+        if self.teleport_cost_land > 0:
+            player_money = self.get_player_money(player)
+            if player_money < self.teleport_cost_land:
+                player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
+                    self.teleport_cost_land, player_money
+                ))
+                return
+            
+            # 扣除费用
+            if self.decrease_player_money(player, self.teleport_cost_land):
+                player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
+                    self.teleport_cost_land, self.get_player_money(player)
+                ))
+            else:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                return
+        
         tp_target_pos = self.get_land_teleport_point(land_id)
         self.server.scheduler.run_task(self, lambda p=player, l_id=land_id, pos=tp_target_pos: self.delay_teleport_to_land(p, l_id, pos), delay=45)
         player.send_message(self.language_manager.GetText('READY_TELEPORT_TO_LAND').format(land_id))

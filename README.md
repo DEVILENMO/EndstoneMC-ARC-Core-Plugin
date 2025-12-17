@@ -8,8 +8,9 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 
 - **作者**: DEVILENMO
 - **邮箱**: DEVILENMO@gmail.com
-- **版本**: 0.0.1.11
+- **版本**: 0.0.1.12
 - **API 版本**: 0.7+
+- **推荐 Python 版本**: 3.13
 
 ## ✨ 主要功能
 
@@ -63,6 +64,8 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 - **公共传送点 (Warp)** - 管理员可创建公共传送点
 - **玩家传送请求 (TPA/TPHERE)** - 玩家间传送请求系统
 - **死亡回归系统** - 玩家死亡后可传送回死亡地点
+- **随机传送系统 (v0.0.1.12新增)** - 随机传送到指定范围内，自动附加羽落效果
+- **传送付费系统 (v0.0.1.12新增)** - 每种传送类型可独立配置收费，支持余额检查
 - **跨维度传送支持** - 支持在主世界、下界、末地之间自由传送
 - **智能维度处理** - 自动使用 `execute in <dimension> run tp` 指令格式
 - 传送倒计时提示
@@ -172,6 +175,20 @@ LAND_MIN_SIZE=5                      # 领地最小尺寸 (长宽必须都大于
 
 # 传送系统
 MAX_PLAYER_HOME_NUM=5                # 玩家最大家园数量
+
+# 随机传送配置 (v0.0.1.12新增)
+ENABLE_RANDOM_TELEPORT=True          # 是否启用随机传送功能
+RANDOM_TELEPORT_CENTER_X=0           # 随机传送中心点X坐标
+RANDOM_TELEPORT_CENTER_Z=0           # 随机传送中心点Z坐标
+RANDOM_TELEPORT_RADIUS=5000          # 随机传送半径 (格)
+
+# 传送收费配置 (v0.0.1.12新增，0表示免费)
+TELEPORT_COST_PUBLIC_WARP=0          # 公共传送点费用
+TELEPORT_COST_HOME=0                 # 私人传送点费用
+TELEPORT_COST_LAND=0                 # 领地传送费用
+TELEPORT_COST_DEATH_LOCATION=0       # 死亡地点传送费用
+TELEPORT_COST_RANDOM=100             # 随机传送费用
+TELEPORT_COST_PLAYER=50              # 玩家互传费用 (TPA/TPHERE)
 
 # 公告系统
 BROADCAST_INTERVAL=180               # 公告发送间隔 (秒)
@@ -484,7 +501,7 @@ class MyPlugin(Plugin):
 ## 📋 更新日志
 
 ### v0.0.1.11 (当前版本)
-- ✅ **死亡消息系统升级** - 全新的死亡通知机制
+- ✅ **死亡消息系统升级** - 全新的Q群死亡通知机制
   - **幽默死亡原因翻译** - 为各种死亡原因添加了有趣的翻译
     - 摔落 → "验证了牛顿第一定律"
     - 溺水 → "明白了学游泳的重要性"
@@ -509,7 +526,7 @@ class MyPlugin(Plugin):
     - 游戏内和QQ群同步显示死亡信息
     - 支持完整的死亡信息格式化
   - **代码兼容性修复** - 修复字符串格式化问题
-    - 统一使用单引号包裹f-string，双引号用于内部字符串，提升代码兼容性
+    - 统一使用单引号包裹f-string，双引号用于内部字符串，提升代码兼容性，支持了低于Python3.13的Python环境
 
 ### v0.0.1.10
 - ✅ **领地生物保护系统** - 全新的生物保护机制
@@ -663,6 +680,25 @@ class MyPlugin(Plugin):
   - 添加安全日志记录机制，避免启动失败
   - 优化错误处理，提高插件稳定性
 
+### v0.0.1.12
+- ✅ **随机传送系统** - 全新的探险功能
+  - 可配置的随机传送中心点和半径
+  - 在指定范围内随机生成传送坐标
+  - 自动附加10秒羽落效果，防止玩家摔死
+  - 配置项：`ENABLE_RANDOM_TELEPORT`（开关）、`RANDOM_TELEPORT_CENTER_X/Z`（中心点）、`RANDOM_TELEPORT_RADIUS`（半径）
+
+- ✅ **传送付费系统** - 灵活的经济控制
+  - 支持所有传送类型独立收费配置
+  - 公共传送点收费 (`TELEPORT_COST_PUBLIC_WARP`)
+  - 私人传送点收费 (`TELEPORT_COST_HOME`)
+  - 领地传送收费 (`TELEPORT_COST_LAND`)
+  - 死亡地点传送收费 (`TELEPORT_COST_DEATH_LOCATION`)
+  - 随机传送收费 (`TELEPORT_COST_RANDOM`)
+  - 玩家互传收费 (`TELEPORT_COST_PLAYER`)
+  - 传送前自动检查余额，余额不足时阻止传送
+  - 传送按钮自动显示费用（仅当费用>0时）
+  - 设置为0表示免费传送
+
 ### v0.0.1.3
 - ✅ **跨维度传送系统重构** - 全面升级传送机制
   - 支持主世界 (overworld)、下界 (nether)、末地 (the_end) 之间的自由传送
@@ -678,7 +714,9 @@ class MyPlugin(Plugin):
 - ✅ 领地管理系统（圈地、保护、移交、授权管理）
 - ✅ **免费领地格子系统**（新玩家福利、自动费用减免）
 - ✅ **领地高级设置**（爆炸保护、方块互动开放设置、生物保护系统）
-- ✅ 传送系统（Home、Warp、TPA、死亡回归）
+- ✅ 传送系统（Home、Warp、TPA、死亡回归、随机传送）
+- ✅ **随机传送系统**（可配置中心点和半径、自动羽落效果）
+- ✅ **传送付费系统**（所有传送类型独立收费配置、余额检查）
 - ✅ **智能传送命令**（自动处理包含空格的玩家名）
 - ✅ 商店系统（ushop、arc_button_shop集成）
 - ✅ **股票系统**（up_and_down插件适配、股票市场入口）
