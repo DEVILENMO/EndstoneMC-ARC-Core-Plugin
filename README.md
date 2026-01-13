@@ -8,7 +8,7 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 
 - **作者**: DEVILENMO
 - **邮箱**: DEVILENMO@gmail.com
-- **版本**: 0.0.1.12
+- **版本**: 0.0.1.13
 - **API 版本**: 0.7+
 - **推荐 Python 版本**: 3.13
 
@@ -344,7 +344,7 @@ EndStone-ARC-CORE/
 
 ### API 兼容性
 - **EndStone API**: 0.7+
-- **Python**: 3.8+
+- **Python**: 3.10+
 - **数据库**: SQLite 3.x
 
 ## 📈 性能特性
@@ -475,7 +475,7 @@ class MyPlugin(Plugin):
 
 ### 📋 API 注意事项
 
-1. **插件依赖**: 确保您的插件在 `plugin.yml` 中声明了对 ARC Core 的依赖
+1. **插件依赖**: 确保您的插件在 `plugin.yml` 中声明了对本插件的依赖
 2. **错误处理**: 所有 API 调用都应该包含适当的错误处理
 3. **线程安全**: 所有 API 方法都是线程安全的，可以在任何线程中调用
 4. **性能考虑**: 频繁调用 `api_get_all_money_data()` 可能影响性能，建议缓存结果
@@ -500,7 +500,35 @@ class MyPlugin(Plugin):
 
 ## 📋 更新日志
 
-### v0.0.1.11 (当前版本)
+### v0.0.1.13 (当前版本)
+- ✅ **金钱管理 UI 重构** - 更安全便捷的管理方式
+  - 将 `addmoney` 和 `removemoney` 命令改为 UI 菜单形式
+  - 集成到 OP 面板，仅管理员可访问
+  - 三步式操作流程：选择操作类型 → 选择玩家 → 输入金额
+  - 选择玩家时显示当前余额，方便操作
+  - 完整的输入验证和错误提示
+  - 移除了命令形式，提升安全性
+
+### v0.0.1.12
+- ✅ **随机传送系统** - 全新的探险功能
+  - 可配置的随机传送中心点和半径
+  - 在指定范围内随机生成传送坐标
+  - 自动附加10秒羽落效果，防止玩家摔死
+  - 配置项：`ENABLE_RANDOM_TELEPORT`（开关）、`RANDOM_TELEPORT_CENTER_X/Z`（中心点）、`RANDOM_TELEPORT_RADIUS`（半径）
+
+- ✅ **传送付费系统** - 灵活的经济控制
+  - 支持所有传送类型独立收费配置
+  - 公共传送点收费 (`TELEPORT_COST_PUBLIC_WARP`)
+  - 私人传送点收费 (`TELEPORT_COST_HOME`)
+  - 领地传送收费 (`TELEPORT_COST_LAND`)
+  - 死亡地点传送收费 (`TELEPORT_COST_DEATH_LOCATION`)
+  - 随机传送收费 (`TELEPORT_COST_RANDOM`)
+  - 玩家互传收费 (`TELEPORT_COST_PLAYER`)
+  - 传送前自动检查余额，余额不足时阻止传送
+  - 传送按钮自动显示费用（仅当费用>0时）
+  - 设置为0表示免费传送
+
+### v0.0.1.11
 - ✅ **死亡消息系统升级** - 全新的Q群死亡通知机制
   - **幽默死亡原因翻译** - 为各种死亡原因添加了有趣的翻译
     - 摔落 → "验证了牛顿第一定律"
@@ -679,25 +707,6 @@ class MyPlugin(Plugin):
   - 修复插件初始化期间的日志记录问题
   - 添加安全日志记录机制，避免启动失败
   - 优化错误处理，提高插件稳定性
-
-### v0.0.1.12
-- ✅ **随机传送系统** - 全新的探险功能
-  - 可配置的随机传送中心点和半径
-  - 在指定范围内随机生成传送坐标
-  - 自动附加10秒羽落效果，防止玩家摔死
-  - 配置项：`ENABLE_RANDOM_TELEPORT`（开关）、`RANDOM_TELEPORT_CENTER_X/Z`（中心点）、`RANDOM_TELEPORT_RADIUS`（半径）
-
-- ✅ **传送付费系统** - 灵活的经济控制
-  - 支持所有传送类型独立收费配置
-  - 公共传送点收费 (`TELEPORT_COST_PUBLIC_WARP`)
-  - 私人传送点收费 (`TELEPORT_COST_HOME`)
-  - 领地传送收费 (`TELEPORT_COST_LAND`)
-  - 死亡地点传送收费 (`TELEPORT_COST_DEATH_LOCATION`)
-  - 随机传送收费 (`TELEPORT_COST_RANDOM`)
-  - 玩家互传收费 (`TELEPORT_COST_PLAYER`)
-  - 传送前自动检查余额，余额不足时阻止传送
-  - 传送按钮自动显示费用（仅当费用>0时）
-  - 设置为0表示免费传送
 
 ### v0.0.1.3
 - ✅ **跨维度传送系统重构** - 全面升级传送机制

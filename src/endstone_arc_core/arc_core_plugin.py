@@ -44,14 +44,6 @@ class ARCCorePlugin(Plugin):
             "usages": ["/spawn"],
             "permissions": ["arc_core.command.spawn"],
         },
-        "addmoney":{
-            "description": "Add money for player, op only.",
-            "usages": ["/addmoney [PlayerName: string] [Amount: int]"]
-        },
-        "removemoney":{
-            "description": "Remove money from player, op only.",
-            "usages": ["/removemoney [PlayerName: string] [Amount: int]"]
-        },
         "pos1": {
             "description": "Set new land corner 1.",
             "usages": ["/pos1"],
@@ -423,62 +415,6 @@ class ARCCorePlugin(Plugin):
                 sender.send_message(self.language_manager.GetText('PLAYER_TELEPORTED_TO_SPAWN_HINT'))
             else:
                 sender.send_message(self.language_manager.GetText('NO_SPAWN_POSITION_SET_MESSAGE'))
-            return True
-        if command.name == "addmoney":
-            # 检查参数数量
-            if len(args) != 2:
-                sender.send_message(self.language_manager.GetText('MONEY_SYSTEM_ADD_MONEY_COMMAND_USAGE_ERROR'))
-                return True
-            # 获取目标玩家
-            if args[0] == '@s':
-                player_name = sender.name
-            else:
-                player_name = args[0]
-            target_player = self.server.get_player(player_name)
-            if not target_player:
-                sender.send_message(self.language_manager.GetText('PLAYER_NOT_FOUND').format(player_name))
-                return True
-            # 检查金额是否合法
-            try:
-                amount = int(args[1])
-                if amount <= 0:
-                    raise ValueError
-            except ValueError:
-                sender.send_message(self.language_manager.GetText('MONEY_SYSTEM_INVALID_AMOUNT').format(args[1]))
-                return True
-            # 添加金钱
-            if self.increase_player_money(target_player, amount):
-                sender.send_message(self.language_manager.GetText('MONEY_SYSTEM_ADD_MONEY_SUCCESS').format(player_name, amount, self.get_player_money(target_player)))
-            else:
-                sender.send_message(self.language_manager.GetText('MONEY_SYSTEM_ADD_MONEY_FAILED'))
-            return True
-        if command.name == "removemoney":
-            # 检查参数数量
-            if len(args) != 2:
-                sender.send_message(self.language_manager.GetText('MONEY_SYSTEM_REMOVE_MONEY_COMMAND_USAGE_ERROR'))
-                return True
-            # 获取目标玩家
-            if args[0] == '@s':
-                player_name = sender.name
-            else:
-                player_name = args[0]
-            target_player = self.server.get_player(player_name)
-            if not target_player:
-                sender.send_message(self.language_manager.GetText('PLAYER_NOT_FOUND').format(player_name))
-                return True
-            # 检查金额是否合法
-            try:
-                amount = int(args[1])
-                if amount <= 0:
-                    raise ValueError
-            except ValueError:
-                sender.send_message(self.language_manager.GetText('MONEY_SYSTEM_INVALID_AMOUNT').format(args[1]))
-                return True
-            # 扣除金钱
-            if self.decrease_player_money(target_player, amount):
-                sender.send_message(self.language_manager.GetText('MONEY_SYSTEM_REMOVE_MONEY_SUCCESS').format(player_name, amount, self.get_player_money(target_player)))
-            else:
-                sender.send_message(self.language_manager.GetText('MONEY_SYSTEM_REMOVE_MONEY_FAILED'))
             return True
         if command.name == 'pos1':
             if not isinstance(sender, Player):
@@ -4481,6 +4417,8 @@ class ARCCorePlugin(Plugin):
                                  on_click=self.switch_player_game_mode)
         op_main_panel.add_button(self.language_manager.GetText('CLEAR_DROP_ITEM'),
                                  on_click=self.clear_drop_item)
+        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_MONEY_MANAGE'),
+                                 on_click=self.show_money_manage_menu)
         op_main_panel.add_button(self.language_manager.GetText('RECORD_COOR_1'),
                                  on_click=self.record_coordinate_1)
         op_main_panel.add_button(self.language_manager.GetText('RECORD_COOR_2'),
@@ -4551,6 +4489,100 @@ class ARCCorePlugin(Plugin):
             on_submit=try_execute_command
         )
         player.send_form(command_input_form)
+    
+    # Money Management UI
+    def show_money_manage_menu(self, player: Player):
+        """显示金钱管理菜单"""
+        money_menu = ActionForm(
+            title=self.language_manager.GetText('MONEY_MANAGE_MENU_TITLE'),
+            content=self.language_manager.GetText('MONEY_MANAGE_MENU_CONTENT'),
+            on_close=self.show_op_main_panel
+        )
+        money_menu.add_button(
+            self.language_manager.GetText('MONEY_MANAGE_ADD_BUTTON'),
+            on_click=lambda p=player, op_type='add': self.show_money_manage_select_player(p, op_type)
+        )
+        money_menu.add_button(
+            self.language_manager.GetText('MONEY_MANAGE_REMOVE_BUTTON'),
+            on_click=lambda p=player, op_type='remove': self.show_money_manage_select_player(p, op_type)
+        )
+        player.send_form(money_menu)
+    
+    def show_money_manage_select_player(self, player: Player, operation_type: str):
+        """显示选择玩家面板"""
+        online_players = [p for p in self.server.online_players]
+        if not online_players:
+            no_players_panel = ActionForm(
+                title=self.language_manager.GetText('MONEY_MANAGE_SELECT_PLAYER_TITLE'),
+                content=self.language_manager.GetText('NO_OTHER_PLAYERS_ONLINE'),
+                on_close=self.show_money_manage_menu
+            )
+            player.send_form(no_players_panel)
+            return
+        
+        select_player_menu = ActionForm(
+            title=self.language_manager.GetText('MONEY_MANAGE_SELECT_PLAYER_TITLE'),
+            content=self.language_manager.GetText('MONEY_MANAGE_SELECT_PLAYER_CONTENT'),
+            on_close=self.show_money_manage_menu
+        )
+        
+        for target_player in online_players:
+            # 显示玩家名称和当前余额
+            player_info = f"{target_player.name} (余额: {self.get_player_money(target_player)})"
+            select_player_menu.add_button(
+                player_info,
+                on_click=lambda p=player, t=target_player, op=operation_type: self.show_money_manage_input_amount(p, t, op)
+            )
+        
+        player.send_form(select_player_menu)
+    
+    def show_money_manage_input_amount(self, player: Player, target_player: Player, operation_type: str):
+        """显示输入金额面板"""
+        amount_input = TextInput(
+            label=self.language_manager.GetText('MONEY_MANAGE_INPUT_AMOUNT_LABEL'),
+            placeholder=self.language_manager.GetText('MONEY_MANAGE_INPUT_AMOUNT_PLACEHOLDER')
+        )
+        
+        def try_change_money(player: Player, json_str: str):
+            data = json.loads(json_str)
+            if not len(data) or not data[0]:
+                player.send_message(self.language_manager.GetText('MONEY_MANAGE_AMOUNT_EMPTY'))
+                return
+            
+            try:
+                amount = int(data[0])
+                if amount <= 0:
+                    raise ValueError
+            except ValueError:
+                player.send_message(self.language_manager.GetText('MONEY_MANAGE_INVALID_AMOUNT'))
+                return
+            
+            # 执行金钱操作
+            if operation_type == 'add':
+                if self.increase_player_money(target_player, amount):
+                    player.send_message(self.language_manager.GetText('MONEY_SYSTEM_ADD_MONEY_SUCCESS').format(
+                        target_player.name, amount, self.get_player_money(target_player)
+                    ))
+                else:
+                    player.send_message(self.language_manager.GetText('MONEY_SYSTEM_ADD_MONEY_FAILED'))
+            else:  # remove
+                if self.decrease_player_money(target_player, amount):
+                    player.send_message(self.language_manager.GetText('MONEY_SYSTEM_REMOVE_MONEY_SUCCESS').format(
+                        target_player.name, amount, self.get_player_money(target_player)
+                    ))
+                else:
+                    player.send_message(self.language_manager.GetText('MONEY_SYSTEM_REMOVE_MONEY_FAILED'))
+            
+            # 返回 OP 面板
+            self.show_op_main_panel(player)
+        
+        amount_input_form = ModalForm(
+            title=self.language_manager.GetText('MONEY_MANAGE_INPUT_AMOUNT_TITLE'),
+            controls=[amount_input],
+            on_close=lambda p=player: self.show_money_manage_select_player(p, operation_type),
+            on_submit=try_change_money
+        )
+        player.send_form(amount_input_form)
     
     # DTWT Plugin related functions
     def show_dtwt_panel(self, player: Player):
