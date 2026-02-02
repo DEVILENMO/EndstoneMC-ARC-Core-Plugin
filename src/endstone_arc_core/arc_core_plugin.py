@@ -670,16 +670,16 @@ class ARCCorePlugin(Plugin):
 
     def _check_land_permission(self, player: Player, land_info: dict) -> bool:
         """
-        检查玩家是否有领地权限（领地主人或授权用户）
+        检查玩家是否有领地权限（领地主人或授权用户）；公共领地仅 OP 有权限
         :param player: 玩家对象
         :param land_info: 领地信息字典
         :return: 是否有权限
         """
         try:
             owner_xuid = land_info['owner_xuid']
+            if owner_xuid == self.PUBLIC_LAND_OWNER_XUID:
+                return player.is_op
             shared_users = land_info.get('shared_users', [])
-            
-            # 检查是否是领地主人或授权用户
             return owner_xuid == str(player.xuid) or str(player.xuid) in shared_users
         except Exception as e:
             self.logger.error(f"Check land permission error: {str(e)}")
@@ -692,11 +692,13 @@ class ARCCorePlugin(Plugin):
             land_info = self.get_land_info(land_id)
             if not land_info:
                 return True
-                
             owner_xuid = land_info['owner_xuid']
+            if owner_xuid == self.PUBLIC_LAND_OWNER_XUID:
+                if not player.is_op:
+                    player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.language_manager.GetText('PUBLIC_LAND_NAME')))
+                    return False
+                return True
             shared_users = land_info['shared_users']
-            
-            # 检查是否是领地主人或授权用户
             if owner_xuid != str(player.xuid) and str(player.xuid) not in shared_users:
                 player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.get_player_name_by_xuid(owner_xuid)))
                 return False
@@ -710,15 +712,15 @@ class ARCCorePlugin(Plugin):
             land_info = self.get_land_info(land_id)
             if not land_info:
                 return True
-            
-            # 如果领地设置为对所有人开放方块互动，直接允许
             if land_info.get('allow_public_interact', False):
                 return True
-                
             owner_xuid = land_info['owner_xuid']
+            if owner_xuid == self.PUBLIC_LAND_OWNER_XUID:
+                if not player.is_op:
+                    player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.language_manager.GetText('PUBLIC_LAND_NAME')))
+                    return False
+                return True
             shared_users = land_info['shared_users']
-            
-            # 检查是否是领地主人或授权用户
             if owner_xuid != str(player.xuid) and str(player.xuid) not in shared_users:
                 player.send_message(self.language_manager.GetText('LAND_PROTECT_HINT').format(self.get_player_name_by_xuid(owner_xuid)))
                 return False
@@ -771,16 +773,20 @@ class ARCCorePlugin(Plugin):
                                 if land_id is not None:
                                     try:
                                         new_land_name = self.get_land_name(land_id)
-                                        land_owner = self.get_player_name_by_xuid(self.get_land_owner(land_id))
+                                        land_owner = self.get_land_display_owner_name(land_id)
                                         
                                         # 创建固定参数的闭包，避免循环变量捕获问题
                                         def create_land_message_sender(target_player, land_name, owner_name, land_id):
                                             def send_land_message():
                                                 try:
-                                                    # 发送领地信息字幕
+                                                    # 发送领地信息字幕（公共领地只显示「公共领地」，不显示「领主：公共领地」）
+                                                    if self.is_public_land(land_id):
+                                                        subtitle = self.language_manager.GetText('PUBLIC_LAND_NAME')
+                                                    else:
+                                                        subtitle = self.language_manager.GetText('STEP_IN_LAND_SUBTITLE').format(owner_name)
                                                     target_player.send_popup(
-                                                        f'{self.language_manager.GetText("STEP_IN_LAND_TITLE").format(land_name)}\n{self.language_manager.GetText("STEP_IN_LAND_SUBTITLE").format(owner_name)}'
-                                                        )
+                                                        f'{self.language_manager.GetText("STEP_IN_LAND_TITLE").format(land_name)}\n{subtitle}'
+                                                    )
                                                     # 显示领地边界粒子效果
                                                     land_info = self.get_land_info(land_id)
                                                     if land_info:
@@ -3340,6 +3346,39 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"Get player lands error: {str(e)}")
             return {}
 
+    def get_all_lands(self) -> Dict[int, dict]:
+        """
+        获取全服务器所有领地
+        :return: {land_id: land_info} 格式的字典，land_info 与 get_land_info 返回结构一致（含 owner_xuid）
+        """
+        try:
+            results = self.database_manager.query_all(
+                "SELECT * FROM lands ORDER BY land_id"
+            )
+            lands_info = {}
+            for land in results:
+                lands_info[land['land_id']] = {
+                    'land_name': land['land_name'],
+                    'dimension': land['dimension'],
+                    'min_x': land['min_x'],
+                    'max_x': land['max_x'],
+                    'min_z': land['min_z'],
+                    'max_z': land['max_z'],
+                    'tp_x': land['tp_x'],
+                    'tp_y': land['tp_y'],
+                    'tp_z': land['tp_z'],
+                    'shared_users': json.loads(land['shared_users']),
+                    'owner_xuid': land['owner_xuid'],
+                    'allow_explosion': bool(land.get('allow_explosion', 0)),
+                    'allow_public_interact': bool(land.get('allow_public_interact', 0)),
+                    'allow_actor_interaction': bool(land.get('allow_actor_interaction', 0)),
+                    'allow_actor_damage': bool(land.get('allow_actor_damage', 0))
+                }
+            return lands_info
+        except Exception as e:
+            self.logger.error(f"Get all lands error: {str(e)}")
+            return {}
+
     def get_land_info(self, land_id: int) -> dict:
         """
         根据领地ID获取领地信息
@@ -3388,6 +3427,19 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"Get land info error: {str(e)}")
             return {}
 
+    PUBLIC_LAND_OWNER_XUID = "0"  # 公共领地的 owner_xuid 固定为 "0"
+    
+    def is_public_land(self, land_id: int) -> bool:
+        """判断领地是否为公共领地"""
+        return self.get_land_owner(land_id) == self.PUBLIC_LAND_OWNER_XUID
+    
+    def get_land_display_owner_name(self, land_id: int) -> str:
+        """获取领地显示的所有者名称：公共领地显示翻译后的「公共领地」，否则显示玩家名"""
+        owner_xuid = self.get_land_owner(land_id)
+        if owner_xuid == self.PUBLIC_LAND_OWNER_XUID:
+            return self.language_manager.GetText('PUBLIC_LAND_NAME')
+        return self.get_player_name_by_xuid(owner_xuid) or owner_xuid or ''
+    
     def get_land_owner(self, land_id: int) -> str:
         """
         获取领地拥有者的XUID
@@ -3405,6 +3457,23 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"Get land owner error: {str(e)}")
             return ""
 
+    def set_land_as_public(self, land_id: int) -> bool:
+        """
+        将领地设为公共领地（owner_xuid 设为 "0"）
+        :param land_id: 领地ID
+        :return: 是否成功
+        """
+        try:
+            if not self.get_land_info(land_id):
+                return False
+            return self.database_manager.execute(
+                "UPDATE lands SET owner_xuid = ? WHERE land_id = ?",
+                (self.PUBLIC_LAND_OWNER_XUID, land_id)
+            )
+        except Exception as e:
+            self.logger.error(f"Set land as public error: {str(e)}")
+            return False
+    
     def rename_land(self, land_id: int, new_name: str) -> tuple[bool, str]:
         """
         修改领地名称
@@ -4215,8 +4284,8 @@ class ARCCorePlugin(Plugin):
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
                 return
             
-            # 获取领地拥有者名称
-            owner_name = self.get_player_name_by_xuid(land_info['owner_xuid']) or '未知玩家'
+            # 获取领地拥有者名称（公共领地显示「公共领地」）
+            owner_name = self.get_land_display_owner_name(land_id) or '未知'
             
             # 格式化爆炸保护状态
             explosion_status = (self.language_manager.GetText('LAND_CURRENT_POSITION_EXPLOSION_ENABLED') 
@@ -4419,6 +4488,8 @@ class ARCCorePlugin(Plugin):
                                  on_click=self.clear_drop_item)
         op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_MONEY_MANAGE'),
                                  on_click=self.show_money_manage_menu)
+        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_MANAGE_ALL_LANDS'),
+                                 on_click=self.show_op_all_lands_panel)
         op_main_panel.add_button(self.language_manager.GetText('RECORD_COOR_1'),
                                  on_click=self.record_coordinate_1)
         op_main_panel.add_button(self.language_manager.GetText('RECORD_COOR_2'),
@@ -4583,6 +4654,293 @@ class ARCCorePlugin(Plugin):
             on_submit=try_change_money
         )
         player.send_form(amount_input_form)
+    
+    # OP Manage All Lands
+    OP_ALL_LANDS_PAGE_SIZE = 15
+    
+    def show_op_all_lands_panel(self, player: Player, page: int = 0):
+        """显示全服领地列表（分页）"""
+        all_lands = self.get_all_lands()
+        if not all_lands:
+            empty_panel = ActionForm(
+                title=self.language_manager.GetText('OP_ALL_LANDS_MENU_TITLE'),
+                content=self.language_manager.GetText('OP_ALL_LANDS_EMPTY'),
+                on_close=self.show_op_main_panel
+            )
+            player.send_form(empty_panel)
+            return
+        
+        land_ids = sorted(all_lands.keys())
+        total_pages = max(1, (len(land_ids) + self.OP_ALL_LANDS_PAGE_SIZE - 1) // self.OP_ALL_LANDS_PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        start = page * self.OP_ALL_LANDS_PAGE_SIZE
+        end = min(start + self.OP_ALL_LANDS_PAGE_SIZE, len(land_ids))
+        page_land_ids = land_ids[start:end]
+        
+        menu = ActionForm(
+            title=self.language_manager.GetText('OP_ALL_LANDS_MENU_TITLE'),
+            content=self.language_manager.GetText('OP_ALL_LANDS_MENU_CONTENT').format(len(land_ids), page + 1),
+            on_close=self.show_op_main_panel
+        )
+        
+        for land_id in page_land_ids:
+            land_info = all_lands[land_id]
+            owner_name = self.get_land_display_owner_name(land_id)
+            btn_text = self.language_manager.GetText('OP_ALL_LANDS_BUTTON_TEXT').format(
+                land_id,
+                land_info['land_name'],
+                owner_name,
+                land_info['dimension']
+            )
+            menu.add_button(
+                btn_text,
+                on_click=lambda p=player, l_id=land_id, pg=page: self.show_op_land_detail_panel(p, l_id, pg)
+            )
+        
+        if page > 0:
+            menu.add_button(
+                self.language_manager.GetText('OP_ALL_LANDS_PREV_PAGE'),
+                on_click=lambda p=player, pg=page: self.show_op_all_lands_panel(p, pg - 1)
+            )
+        if page < total_pages - 1:
+            menu.add_button(
+                self.language_manager.GetText('OP_ALL_LANDS_NEXT_PAGE'),
+                on_click=lambda p=player, pg=page: self.show_op_all_lands_panel(p, pg + 1)
+            )
+        menu.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=self.show_op_main_panel
+        )
+        player.send_form(menu)
+    
+    def show_op_land_detail_panel(self, player: Player, land_id: int, from_page: int = 0):
+        """OP 查看单个领地详情（可传送前往）"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.show_op_all_lands_panel(player, from_page)
+            return
+        
+        if len(land_info['shared_users']):
+            shared_user_names = [self.get_player_name_by_xuid(uid) or uid for uid in land_info['shared_users']]
+            shared_user_name_str = '\n'.join(shared_user_names)
+        else:
+            shared_user_name_str = self.language_manager.GetText('LAND_DETAIL_NO_SHARED_USER_TEXT')
+        
+        owner_name = self.get_land_display_owner_name(land_id)
+        
+        content = self.language_manager.GetText('LAND_DETAIL_PANEL_CONTENT').format(
+            land_id,
+            land_info['land_name'],
+            land_info['dimension'],
+            (int(land_info['min_x']), int(land_info['min_z'])),
+            (int(land_info['max_x']), int(land_info['max_z'])),
+            (int(land_info['tp_x']), int(land_info['tp_y']), int(land_info['tp_z'])),
+            shared_user_name_str
+        )
+        content = f"所有者: {owner_name}\n\n" + content
+        
+        detail_panel = ActionForm(
+            title=self.language_manager.GetText('OP_LAND_DETAIL_TITLE').format(land_id),
+            content=content,
+            on_close=lambda p=player, pg=from_page: self.show_op_all_lands_panel(p, pg)
+        )
+        detail_panel.add_button(
+            self.language_manager.GetText('OP_LAND_TELEPORT_BUTTON'),
+            on_click=lambda p=player, l_id=land_id: self.op_teleport_to_land(p, l_id)
+        )
+        if self.is_public_land(land_id):
+            detail_panel.add_button(
+                self.language_manager.GetText('OP_PUBLIC_LAND_SETTINGS_BUTTON'),
+                on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_settings_panel(p, l_id, pg)
+            )
+            detail_panel.add_button(
+                self.language_manager.GetText('LAND_DETAIL_PANEL_RENAME_BUTTON_TEXT'),
+                on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_rename_land_panel(p, l_id, pg)
+            )
+        else:
+            detail_panel.add_button(
+                self.language_manager.GetText('OP_SET_LAND_PUBLIC_BUTTON'),
+                on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_confirm_set_land_public(p, l_id, pg)
+            )
+        detail_panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=lambda p=player, pg=from_page: self.show_op_all_lands_panel(p, pg)
+        )
+        player.send_form(detail_panel)
+    
+    def op_teleport_to_land(self, player: Player, land_id: int):
+        """OP 传送到领地（不扣费）"""
+        tp_target_pos = self.get_land_teleport_point(land_id)
+        if tp_target_pos is None:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+        self.server.scheduler.run_task(
+            self,
+            lambda: self.delay_teleport_to_land(player, land_id, tp_target_pos),
+            delay=45
+        )
+        player.send_message(self.language_manager.GetText('READY_TELEPORT_TO_LAND').format(land_id))
+    
+    def show_op_confirm_set_land_public(self, player: Player, land_id: int, from_page: int):
+        """OP 确认设为公共领地面板"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.show_op_all_lands_panel(player, from_page)
+            return
+        confirm_panel = ActionForm(
+            title=self.language_manager.GetText('OP_CONFIRM_SET_PUBLIC_TITLE'),
+            content=self.language_manager.GetText('OP_CONFIRM_SET_PUBLIC_CONTENT').format(land_id),
+            on_close=lambda p=player, pg=from_page: self.show_op_land_detail_panel(p, land_id, pg)
+        )
+        confirm_panel.add_button(
+            self.language_manager.GetText('OP_CONFIRM_SET_PUBLIC_BUTTON'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.op_do_set_land_public(p, l_id, pg)
+        )
+        confirm_panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_detail_panel(p, l_id, pg)
+        )
+        player.send_form(confirm_panel)
+    
+    def op_do_set_land_public(self, player: Player, land_id: int, from_page: int):
+        """OP 执行设为公共领地"""
+        if self.set_land_as_public(land_id):
+            player.send_message(self.language_manager.GetText('OP_SET_LAND_PUBLIC_SUCCESS').format(land_id))
+            self.show_op_land_detail_panel(player, land_id, from_page)
+        else:
+            player.send_message(self.language_manager.GetText('OP_SET_LAND_PUBLIC_FAILED'))
+            self.show_op_land_detail_panel(player, land_id, from_page)
+    
+    def show_op_rename_land_panel(self, player: Player, land_id: int, from_page: int):
+        """OP 修改领地名称面板（用于公共领地等）"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.show_op_all_lands_panel(player, from_page)
+            return
+        current_name = land_info['land_name']
+        new_name_input = TextInput(
+            label=self.language_manager.GetText('RENAME_OWN_LAND_PANEL_INPUT_LABEL').format(land_id),
+            placeholder=self.language_manager.GetText('RENAME_OWN_LAND_PANEL_INPUT_PLACEHOLDER').format(player.name),
+            default_value=current_name
+        )
+        
+        def try_change_name(player: Player, json_str: str):
+            data = json.loads(json_str)
+            if not data or not data[0]:
+                player.send_message(self.language_manager.GetText('CREATE_HOME_EMPTY_NAME_ERROR'))
+                return
+            success, msg = self.rename_land(land_id, data[0])
+            player.send_message(msg)
+            self.show_op_land_detail_panel(player, land_id, from_page)
+        
+        rename_panel = ModalForm(
+            title=self.language_manager.GetText('RENAME_OWN_LAND_PANEL_TITLE'),
+            controls=[new_name_input],
+            on_close=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_detail_panel(p, l_id, pg),
+            on_submit=try_change_name
+        )
+        player.send_form(rename_panel)
+    
+    def show_op_public_land_settings_panel(self, player: Player, land_id: int, from_page: int):
+        """OP 公共领地设置面板：开放互动/开放爆炸/开放生物互动/开放生物伤害"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.show_op_all_lands_panel(player, from_page)
+            return
+        status_lines = []
+        status_lines.append('开放方块互动: ' + (self.language_manager.GetText('LAND_PUBLIC_INTERACT_STATUS_ENABLED') if land_info.get('allow_public_interact') else self.language_manager.GetText('LAND_PUBLIC_INTERACT_STATUS_DISABLED')))
+        status_lines.append('开放爆炸: ' + (self.language_manager.GetText('LAND_EXPLOSION_STATUS_ENABLED') if land_info.get('allow_explosion') else self.language_manager.GetText('LAND_EXPLOSION_STATUS_DISABLED')))
+        status_lines.append('开放生物互动: ' + (self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_ENABLED') if land_info.get('allow_actor_interaction') else self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_DISABLED')))
+        status_lines.append('开放生物伤害: ' + (self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_ENABLED') if land_info.get('allow_actor_damage') else self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_DISABLED')))
+        content = '\n'.join(status_lines)
+        settings_panel = ActionForm(
+            title=self.language_manager.GetText('OP_PUBLIC_LAND_SETTINGS_BUTTON'),
+            content=content,
+            on_close=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_detail_panel(p, l_id, pg)
+        )
+        settings_panel.add_button(
+            self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_toggle_panel(p, l_id, 'allow_public_interact', pg)
+        )
+        settings_panel.add_button(
+            self.language_manager.GetText('LAND_EXPLOSION_SETTING_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_toggle_panel(p, l_id, 'allow_explosion', pg)
+        )
+        settings_panel.add_button(
+            self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_toggle_panel(p, l_id, 'allow_actor_interaction', pg)
+        )
+        settings_panel.add_button(
+            self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_toggle_panel(p, l_id, 'allow_actor_damage', pg)
+        )
+        settings_panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_detail_panel(p, l_id, pg)
+        )
+        player.send_form(settings_panel)
+    
+    def show_op_public_land_toggle_panel(self, player: Player, land_id: int, setting_key: str, from_page: int):
+        """OP 公共领地单项设置切换面板"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.show_op_all_lands_panel(player, from_page)
+            return
+        current = land_info.get(setting_key, False)
+        if setting_key == 'allow_public_interact':
+            status_text = self.language_manager.GetText('LAND_PUBLIC_INTERACT_STATUS_ENABLED') if current else self.language_manager.GetText('LAND_PUBLIC_INTERACT_STATUS_DISABLED')
+            title = self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_TITLE')
+        elif setting_key == 'allow_explosion':
+            status_text = self.language_manager.GetText('LAND_EXPLOSION_STATUS_ENABLED') if current else self.language_manager.GetText('LAND_EXPLOSION_STATUS_DISABLED')
+            title = self.language_manager.GetText('LAND_EXPLOSION_SETTING_TITLE')
+        elif setting_key == 'allow_actor_interaction':
+            status_text = self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_ENABLED') if current else self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_DISABLED')
+            title = self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_TITLE')
+        else:  # allow_actor_damage
+            status_text = self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_ENABLED') if current else self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_DISABLED')
+            title = self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_TITLE')
+        toggle_panel = ActionForm(
+            title=title,
+            content=status_text,
+            on_close=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_settings_panel(p, l_id, pg)
+        )
+        enable_key = {'allow_public_interact': ('LAND_PUBLIC_INTERACT_TOGGLE_ENABLE_BUTTON', 'LAND_PUBLIC_INTERACT_TOGGLE_DISABLE_BUTTON'), 'allow_explosion': ('LAND_EXPLOSION_TOGGLE_ENABLE_BUTTON', 'LAND_EXPLOSION_TOGGLE_DISABLE_BUTTON'), 'allow_actor_interaction': ('LAND_ACTOR_INTERACTION_TOGGLE_ENABLE_BUTTON', 'LAND_ACTOR_INTERACTION_TOGGLE_DISABLE_BUTTON'), 'allow_actor_damage': ('LAND_ACTOR_DAMAGE_TOGGLE_ENABLE_BUTTON', 'LAND_ACTOR_DAMAGE_TOGGLE_DISABLE_BUTTON')}[setting_key]
+        btn_text = self.language_manager.GetText(enable_key[0]) if not current else self.language_manager.GetText(enable_key[1])
+        toggle_panel.add_button(
+            btn_text,
+            on_click=lambda p=player, l_id=land_id, key=setting_key, enable=not current, pg=from_page: self.op_toggle_land_setting(p, l_id, key, enable, pg)
+        )
+        player.send_form(toggle_panel)
+    
+    def op_toggle_land_setting(self, player: Player, land_id: int, setting_key: str, enable: bool, from_page: int):
+        """OP 切换公共领地某项设置并返回设置面板"""
+        column_map = {
+            'allow_public_interact': ('allow_public_interact', 'LAND_PUBLIC_INTERACT_SETTING_UPDATED_ENABLE', 'LAND_PUBLIC_INTERACT_SETTING_UPDATED_DISABLE', 'LAND_PUBLIC_INTERACT_SETTING_FAILED'),
+            'allow_explosion': ('allow_explosion', 'LAND_EXPLOSION_SETTING_UPDATED_ENABLE', 'LAND_EXPLOSION_SETTING_UPDATED_DISABLE', 'LAND_EXPLOSION_SETTING_FAILED'),
+            'allow_actor_interaction': ('allow_actor_interaction', 'LAND_ACTOR_INTERACTION_SETTING_UPDATED_ENABLE', 'LAND_ACTOR_INTERACTION_SETTING_UPDATED_DISABLE', 'LAND_ACTOR_INTERACTION_SETTING_FAILED'),
+            'allow_actor_damage': ('allow_actor_damage', 'LAND_ACTOR_DAMAGE_SETTING_UPDATED_ENABLE', 'LAND_ACTOR_DAMAGE_SETTING_UPDATED_DISABLE', 'LAND_ACTOR_DAMAGE_SETTING_FAILED'),
+        }
+        col, msg_enable, msg_disable, msg_fail = column_map[setting_key]
+        try:
+            success = self.database_manager.execute(
+                f"UPDATE lands SET {col} = ? WHERE land_id = ?",
+                (1 if enable else 0, land_id)
+            )
+            if success:
+                msg_key = msg_enable if enable else msg_disable
+                player.send_message(self.language_manager.GetText(msg_key).format(land_id))
+            else:
+                player.send_message(self.language_manager.GetText(msg_fail))
+            self.show_op_public_land_settings_panel(player, land_id, from_page)
+        except Exception as e:
+            self.logger.error(f"OP toggle land setting error: {str(e)}")
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.show_op_public_land_settings_panel(player, land_id, from_page)
     
     # DTWT Plugin related functions
     def show_dtwt_panel(self, player: Player):
