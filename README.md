@@ -8,7 +8,7 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 
 - **作者**: DEVILENMO
 - **邮箱**: DEVILENMO@gmail.com
-- **版本**: 0.0.1.14
+- **版本**: 0.0.2.1
 - **API 版本**: 0.7+
 - **推荐 Python 版本**: 3.13
 
@@ -35,9 +35,9 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 - 玩家加入/离开消息提示
 
 ### 💰 银行经济系统
-- 完整的货币管理系统
+- 完整的货币管理系统，**金钱精确到分**（float 存储，两位小数）
 - 玩家余额存储和查询
-- **升级转账功能** - 两步式转账流程，先选择玩家再输入金额，提供更好的用户体验
+- **升级转账功能** - 两步式转账流程，先选择玩家再输入金额，支持小数金额
 - 富豪榜排行系统
 - 管理员金钱操作命令
 - 实时余额变动提醒
@@ -121,8 +121,12 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 ### ⚙️ OP 管理面板
 - 游戏模式切换
 - 手动触发掉落物清理
+- 金钱管理（选择玩家后加减款）
+- 管理所有领地（传送、强制改名、管理授权、公共领地设置）
+- 邀请奖励配置
+- **重载配置** - 立即重载配置文件、广播、语言文件等
 - 坐标记录功能
-- 命令执行面板
+- **命令执行面板** - 支持 @p1/@p2 占位符，留空可重复执行上一次命令
 
 ### 🔌 插件 API 系统
 - **经济系统 API** - 完整的金钱管理接口
@@ -139,8 +143,6 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 | `/updatespawnpos` | 更新当前维度的出生点位置 | OP | `/updatespawnpos` |
 | `/suicide` | 自杀命令 | 默认 | `/suicide` |
 | `/spawn` | 传送到出生点 | 默认 | `/spawn` |
-| `/addmoney` | 为玩家添加金钱 (仅OP) | OP | `/addmoney [玩家名] [数量]` |
-| `/removemoney` | 从玩家扣除金钱 (仅OP) | OP | `/removemoney [玩家名] [数量]` |
 | `/pos1` | 设置土地边界点1 | 默认 | `/pos1` |
 | `/pos2` | 设置土地边界点2 | 默认 | `/pos2` |
 
@@ -202,6 +204,9 @@ HIDE_OP_IN_MONEY_RANKING=True        # 金钱排行榜是否隐藏OP玩家
 
 # 领地系统
 DEFAULT_FREE_LAND_BLOCKS=100         # 新玩家默认免费领地格子数
+
+# 公共领地白名单保护生物 (v0.0.2.1，逗号分隔)
+PUBLIC_LAND_PROTECTED_ENTITIES=minecraft:villager,minecraft:iron_golem,minecraft:snow_golem
 ```
 
 ### broadcast.txt - 公告消息文件
@@ -294,7 +299,7 @@ give {player} krep:acp45 42
 ## 🗃️ 数据存储
 
 插件使用 SQLite 数据库存储以下数据：
-- **玩家信息**: 用户名、XUID、密码哈希、OP状态、剩余免费领地格子数、注册时间
+- **玩家信息**: 用户名、XUID、密码哈希、OP状态、剩余免费领地格子数、邀请人(inviter_xuid)、待领取邀请奖励次数、注册时间
 - **经济数据**: 玩家余额、交易记录
 - **领地信息**: 领地坐标、拥有者、传送点、共享用户、爆炸保护设置、方块互动开放设置、生物保护设置
 - **传送点**: 私人传送点、公共传送点坐标信息
@@ -384,11 +389,11 @@ money_data = arc_plugin.api_get_all_money_data()
 
 #### 2. 获取单个玩家金钱
 ```python
-def api_get_player_money(self, player_name: str) -> int
+def api_get_player_money(self, player_name: str) -> float
 ```
-- **功能**: 获取指定玩家的金钱数量
+- **功能**: 获取指定玩家的金钱数量（支持小数，精确到分）
 - **参数**: `player_name` (str) - 玩家名称
-- **返回值**: `int` - 玩家金钱数量，玩家不存在时返回 0
+- **返回值**: `float` - 玩家金钱数量，玩家不存在时返回 0.0
 - **示例**:
 ```python
 money = arc_plugin.api_get_player_money('PlayerName')
@@ -420,17 +425,16 @@ poorest = arc_plugin.api_get_poorest_player_money_data()
 
 #### 5. 修改玩家金钱
 ```python
-def api_change_player_money(self, player_name: str, money_to_change: int) -> None
+def api_change_player_money(self, player_name: str, money_to_change: float) -> bool
 ```
-- **功能**: 增加或减少指定玩家的金钱
+- **功能**: 增加或减少指定玩家的金钱（支持小数，精确到分）
 - **参数**: 
   - `player_name` (str) - 玩家名称
-  - `money_to_change` (int) - 要改变的金钱数量（正数为增加，负数为减少）
-- **返回值**: 无
+  - `money_to_change` (float) - 要改变的金钱数量（正数为增加，负数为减少）
+- **返回值**: `bool` - 是否操作成功
 - **注意事项**:
-  - 金钱范围限制在32位整数范围内 (-2,147,483,648 到 2,147,483,647)
   - 如果玩家在线，会自动发送金钱变动提示消息
-  - 不能传入 0 作为变动数量
+  - 变动数量经四舍五入到分后为 0 时视为无效，返回 False
 - **示例**:
 ```python
 # 给玩家增加 1000 金钱
@@ -500,7 +504,46 @@ class MyPlugin(Plugin):
 
 ## 📋 更新日志
 
-### v0.0.1.14 (当前版本)
+### v0.0.2.1 (当前版本) — 全新小版本
+
+- ✅ **我的信息 & 邀请系统**
+  - 主菜单新增「我的信息」按钮，展示：名字、XUID、存款、领地数、剩余免费领地格子、邀请人、待领取邀请奖励次数
+  - 数据库 `player_basic_info` 新增 `inviter_xuid`（邀请人）、`pending_invite_reward_times`（待领取邀请奖励次数）
+  - 未填写邀请人时可「填写邀请人」；填写后当场为双方发放奖励（被邀请人即时发放，邀请人累加待领取）
+  - 有待领取奖励时可「领取邀请奖励」；玩家上线时若有待领取会提示
+  - OP 面板新增「邀请奖励配置」：可设置物资（物品 ID + 数量）、金钱、免费领地格子数奖励
+
+- ✅ **经济系统升级：金钱精确到分**
+  - 金钱存储由整数改为 `REAL`（float），精确到分（两位小数）
+  - 旧数据库自动升级：`player_economy.money` 从 INTEGER 迁移为 REAL
+  - 新增 `_round_money()` / `_format_money_display()`，界面统一两位小数显示
+  - 转账、OP 加减款、初始金钱、邀请奖励等均支持小数；经济相关 API 返回/接受 `float`
+
+- ✅ **OP 领地管理增强**
+  - 在「管理所有领地」中打开任意领地后，提供完整管理入口：
+    - **传送前往**：传送到该领地传送点（不扣费）
+    - **强制修改领地名称**：任意领地均可修改名称（不限于公共领地）
+    - **管理授权**：添加/移除授权玩家，与领地主人的授权管理逻辑一致
+  - 公共领地仍保留「公共领地设置」「设为公共领地」等入口
+
+- ✅ **公共领地白名单保护生物**
+  - 配置项 `PUBLIC_LAND_PROTECTED_ENTITIES`：逗号分隔的生物类型 ID（如 `minecraft:villager,minecraft:iron_golem`）
+  - 公共领地内：若「禁止生物伤害」则一律拦截所有生物伤害；若「开放生物伤害」则仅保护白名单内生物，其他生物可被伤害
+  - 设为公共领地时默认开放：方块互动、生物互动、生物伤害
+
+- ✅ **OP 重载配置**
+  - OP 面板新增「重载配置」按钮，可立即重新载入：
+    - 配置文件（`core_setting.yml`）并重新应用缓存项（领地价格、传送费用、公告间隔等）
+    - 广播列表（`broadcast.txt`）
+    - 语言文件（当前语言）
+  - 迎新指令/迎新文案在下次新人进服时自动使用最新文件；公告与清道夫间隔变更需重启服务器后生效
+
+- ✅ **执行指令记住上次命令**
+  - 每位 OP 执行过的指令会记录为「上一次命令」
+  - 执行指令面板输入框默认显示上次命令；留空直接确定则使用当前记录点（@p1/@p2）重复执行上次命令
+  - 便于重复执行 fill 等命令：选点后直接点执行即可
+
+### v0.0.1.14
 - ✅ **OP 管理所有领地** - 全服领地一览与快捷管理
   - 在 OP 面板中新增「管理所有领地」入口
   - 分页展示全服所有领地（ID、名称、所有者、维度）

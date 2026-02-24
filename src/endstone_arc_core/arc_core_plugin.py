@@ -124,9 +124,10 @@ class ARCCorePlugin(Plugin):
             self.land_min_size = 5  # 默认最小尺寸为5
         self.player_new_land_creation_info = {}
 
-        # OP坐标记录
+        # OP坐标记录与上次执行指令（空输入时重复执行）
         self.op_coordinate1_dict = {}
         self.op_coordinate2_dict = {}
+        self.op_last_command_dict = {}
 
         # 玩家出入领地
         self.player_in_land_id_dict = {}
@@ -464,6 +465,25 @@ class ARCCorePlugin(Plugin):
         self.player_authentication_state[event.player.name] = False
         event.player.send_message(self.language_manager.GetText('PLAYER_JOIN_HINT'))
 
+        # 登录时提示可领取的邀请奖励次数
+        try:
+            player_xuid = str(event.player.xuid)
+            pending_info = self.database_manager.query_one(
+                "SELECT pending_invite_reward_times FROM player_basic_info WHERE xuid = ?",
+                (player_xuid,)
+            )
+            if pending_info is not None:
+                try:
+                    pending_times = int(pending_info.get('pending_invite_reward_times', 0) or 0)
+                except (ValueError, TypeError):
+                    pending_times = 0
+                if pending_times > 0:
+                    event.player.send_message(
+                        self.language_manager.GetText('INVITE_REWARD_PENDING_HINT').format(pending_times)
+                    )
+        except Exception as e:
+            self.logger.error(f"{ColorFormat.RED}[ARC Core]Check pending invite rewards on join error: {str(e)}")
+
     @event_handler
     def on_player_quit(self, event: PlayerQuitEvent):
         self.server.broadcast_message(self.language_manager.GetText('PLAYER_QUIT_MESSAGE').format(event.player.name))
@@ -649,21 +669,30 @@ class ARCCorePlugin(Plugin):
         land_id = self.get_land_at_pos(dimension, pos[0], pos[1])
         if land_id is not None:
             land_info = self.get_land_info(land_id)
-            if land_info and not land_info.get('allow_actor_damage', False):
-                # 检查攻击者是否有权限（领地主人或授权用户）
-                # 首先根据attacker.name获取玩家的xuid
-                attacker_xuid = self.get_player_xuid_by_name(attacker.name)
-                if attacker_xuid is None:
-                    # 如果无法获取攻击者的xuid，则拒绝攻击
+            if not land_info:
+                return
+            # 公共领地：禁止生物伤害时一律拦截；开放生物伤害时仅保护白名单生物
+            if self.is_public_land(land_id):
+                if not land_info.get('allow_actor_damage', False):
                     event.is_cancelled = True
                     attacker.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_DENIED'))
                     return
-                
-                # 然后根据xuid判断有没有领地的权限
+                protected = self._get_public_land_protected_entities()
+                # print("entity",event.actor.type, "public land protected entities", protected)
+                damaged_entity_type = event.actor.type
+                if damaged_entity_type and damaged_entity_type in protected:
+                    event.is_cancelled = True
+                    attacker.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_DENIED'))
+                return
+            # 非公共领地：未开放生物伤害时仅主人/授权用户可造成伤害
+            if not land_info.get('allow_actor_damage', False):
+                attacker_xuid = self.get_player_xuid_by_name(attacker.name)
+                if attacker_xuid is None:
+                    event.is_cancelled = True
+                    attacker.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_DENIED'))
+                    return
                 owner_xuid = land_info['owner_xuid']
                 shared_users = land_info.get('shared_users', [])
-                
-                # 检查是否是领地主人或授权用户
                 if owner_xuid != attacker_xuid and attacker_xuid not in shared_users:
                     event.is_cancelled = True
                     attacker.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_DENIED'))
@@ -874,6 +903,7 @@ class ARCCorePlugin(Plugin):
         self.init_player_basic_table()
         self.init_spawn_locations_table()
         self.init_economy_table()
+        self._upgrade_player_economy_table_to_float()
         self.init_land_tables()
         self.init_teleport_tables()
 
@@ -939,6 +969,14 @@ class ARCCorePlugin(Plugin):
             default_free_blocks = self.setting_manager.GetSetting('DEFAULT_FREE_LAND_BLOCKS') or '100'
             if not self._add_column_if_not_exists('player_basic_info', 'remaining_free_land_blocks', f'INTEGER DEFAULT {default_free_blocks}'):
                 success = False
+
+            # 检查并添加 inviter_xuid 列（邀请人 XUID，允许为空）
+            if not self._add_column_if_not_exists('player_basic_info', 'inviter_xuid', 'TEXT'):
+                success = False
+
+            # 检查并添加 pending_invite_reward_times 列（待领取邀请奖励次数，默认为 0）
+            if not self._add_column_if_not_exists('player_basic_info', 'pending_invite_reward_times', 'INTEGER DEFAULT 0'):
+                success = False
             
             return success
         except Exception as e:
@@ -957,7 +995,9 @@ class ARCCorePlugin(Plugin):
             'name': 'TEXT NOT NULL',  # 玩家名称
             'password': 'TEXT',  # 玩家密码(加密后的)，允许为NULL
             'is_op': 'INTEGER DEFAULT 0',  # 玩家是否为OP，默认为0(false)
-            'remaining_free_land_blocks': f'INTEGER DEFAULT {default_free_blocks}'  # 剩余免费领地格子数
+            'remaining_free_land_blocks': f'INTEGER DEFAULT {default_free_blocks}',  # 剩余免费领地格子数
+            'inviter_xuid': 'TEXT',  # 邀请人 XUID，允许为空
+            'pending_invite_reward_times': 'INTEGER DEFAULT 0'  # 待领取邀请奖励次数
         }
         result = self.database_manager.create_table('player_basic_info', fields)
         
@@ -992,7 +1032,9 @@ class ARCCorePlugin(Plugin):
                 'name': player.name,
                 'password': None,  # 初始密码为空
                 'is_op': 1 if player.is_op else 0,  # 根据玩家当前OP状态设置
-                'remaining_free_land_blocks': default_free_blocks  # 设置默认免费格子数
+                'remaining_free_land_blocks': default_free_blocks,  # 设置默认免费格子数
+                'inviter_xuid': None,  # 初始无邀请人
+                'pending_invite_reward_times': 0  # 初始无待领取邀请奖励
             }
             return self.database_manager.insert('player_basic_info', player_data)
         except Exception as e:
@@ -1015,12 +1057,12 @@ class ARCCorePlugin(Plugin):
             if existing_data:
                 return True  # 已存在，无需重复创建
 
-            # 获取初始金钱设置
+            # 获取初始金钱设置（支持小数，精确到分）
             player_init_money_num = self.setting_manager.GetSetting('PLAYER_INIT_MONEY_NUM')
             try:
-                init_money = int(player_init_money_num)
+                init_money = self._round_money(float(player_init_money_num))
             except (ValueError, TypeError):
-                init_money = 0
+                init_money = 0.0
 
             # 创建经济数据
             economy_data = {
@@ -1366,6 +1408,7 @@ class ARCCorePlugin(Plugin):
             arc_menu.add_button(self.language_manager.GetText('BANK_MENU_NAME'), on_click=self.show_bank_main_menu)
             arc_menu.add_button(self.language_manager.GetText('TELEPORT_MENU_NAME'), on_click=self.show_teleport_menu)
             arc_menu.add_button(self.language_manager.GetText('LAND_MENU_NAME'), on_click=self.show_land_main_menu)
+            arc_menu.add_button(self.language_manager.GetText('MAIN_MENU_MY_INFO_NAME'), on_click=self.show_my_info_panel)
             if self.server.plugin_manager.get_plugin('ushop'):
                 arc_menu.add_button(self.language_manager.GetText('SHOP_MENU_NAME'), on_click=self.show_shop_menu)
             if self.server.plugin_manager.get_plugin('arc_button_shop'):
@@ -1382,6 +1425,206 @@ class ARCCorePlugin(Plugin):
     
     def execute_suicide(self, player: Player):
         player.perform_command('suicide')
+
+    # Player info & invite system UI
+    def show_my_info_panel(self, player: Player):
+        """显示玩家自己的信息面板"""
+        player_basic_info = self.get_player_basic_info(player)
+        if player_basic_info is None:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        player_name = player.name
+        player_xuid = str(player.xuid)
+        player_money = self.get_player_money(player)
+        player_land_count = self.get_player_land_count(player_xuid)
+        remaining_free_blocks = self.get_player_free_land_blocks(player)
+
+        inviter_xuid = player_basic_info.get('inviter_xuid')
+        if inviter_xuid:
+            inviter_name = self.get_player_name_by_xuid(inviter_xuid) or inviter_xuid
+        else:
+            inviter_name = self.language_manager.GetText('INVITER_NONE_TEXT')
+
+        pending_info = self.database_manager.query_one(
+            "SELECT pending_invite_reward_times FROM player_basic_info WHERE xuid = ?",
+            (player_xuid,)
+        )
+        pending_times = 0
+        if pending_info is not None:
+            try:
+                pending_times = int(pending_info.get('pending_invite_reward_times', 0) or 0)
+            except (ValueError, TypeError):
+                pending_times = 0
+
+        info_content = self.language_manager.GetText('MY_INFO_PANEL_CONTENT').format(
+            player_name,
+            player_xuid,
+            self._format_money_display(player_money),
+            player_land_count,
+            remaining_free_blocks,
+            inviter_name,
+            pending_times
+        )
+
+        my_info_panel = ActionForm(
+            title=self.language_manager.GetText('MY_INFO_PANEL_TITLE'),
+            content=info_content,
+            on_close=self.show_main_menu
+        )
+
+        # 未填写邀请人时显示“填写邀请人”按钮
+        if not inviter_xuid:
+            my_info_panel.add_button(
+                self.language_manager.GetText('MY_INFO_FILL_INVITER_BUTTON'),
+                on_click=self.show_fill_inviter_panel
+            )
+
+        # 有待领取邀请奖励时显示“领取邀请奖励”按钮
+        if pending_times > 0:
+            my_info_panel.add_button(
+                self.language_manager.GetText('MY_INFO_CLAIM_INVITE_REWARD_BUTTON'),
+                on_click=self.claim_invite_rewards
+            )
+
+        # 返回主菜单
+        my_info_panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=self.show_main_menu
+        )
+
+        player.send_form(my_info_panel)
+
+    def show_fill_inviter_panel(self, player: Player, hint_message: Optional[str] = None):
+        """显示填写邀请人面板"""
+        panel_title = self.language_manager.GetText('FILL_INVITER_PANEL_TITLE') if hint_message is None else hint_message
+
+        inviter_input = TextInput(
+            label=self.language_manager.GetText('FILL_INVITER_INPUT_LABEL'),
+            placeholder=self.language_manager.GetText('FILL_INVITER_INPUT_PLACEHOLDER')
+        )
+
+        def try_set_inviter(player: Player, json_str: str):
+            try:
+                data = json.loads(json_str)
+            except Exception:
+                self.show_fill_inviter_panel(player, self.language_manager.GetText('FILL_INVITER_FAIL_SYSTEM_ERROR'))
+                return
+
+            if len(data) == 0 or not str(data[0]).strip():
+                self.show_fill_inviter_panel(player, self.language_manager.GetText('FILL_INVITER_FAIL_PLAYER_NOT_FOUND'))
+                return
+
+            inviter_name_input = str(data[0]).strip()
+            player_xuid = str(player.xuid)
+
+            # 再次检查自己是否已经填写过邀请人
+            basic_info = self.database_manager.query_one(
+                "SELECT inviter_xuid FROM player_basic_info WHERE xuid = ?",
+                (player_xuid,)
+            )
+            if basic_info is None:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.show_my_info_panel(player)
+                return
+
+            if basic_info.get('inviter_xuid'):
+                player.send_message(self.language_manager.GetText('FILL_INVITER_FAIL_ALREADY_HAS_INVITER'))
+                self.show_my_info_panel(player)
+                return
+
+            inviter_xuid = self.get_player_xuid_by_name(inviter_name_input)
+            if not inviter_xuid:
+                self.show_fill_inviter_panel(player, self.language_manager.GetText('FILL_INVITER_FAIL_PLAYER_NOT_FOUND'))
+                return
+
+            if inviter_xuid == player_xuid:
+                self.show_fill_inviter_panel(player, self.language_manager.GetText('FILL_INVITER_FAIL_CANNOT_INVITE_SELF'))
+                return
+
+            # 写入邀请人信息
+            try:
+                update_success = self.database_manager.update(
+                    table='player_basic_info',
+                    data={'inviter_xuid': inviter_xuid},
+                    where='xuid = ?',
+                    params=(player_xuid,)
+                )
+            except Exception:
+                update_success = False
+
+            if not update_success:
+                player.send_message(self.language_manager.GetText('FILL_INVITER_FAIL_SYSTEM_ERROR'))
+                self.show_my_info_panel(player)
+                return
+
+            # 给自己发放一次邀请奖励
+            self.grant_invite_reward_to_player(player, 1)
+
+            # 给邀请人累加一份待领取奖励
+            self.add_pending_invite_rewards(inviter_xuid, 1)
+
+            player.send_message(self.language_manager.GetText('FILL_INVITER_SUBMIT_SUCCESS').format(inviter_name_input))
+
+            inviter_player = self.server.get_player(inviter_name_input)
+            if inviter_player is not None:
+                inviter_player.send_message(self.language_manager.GetText('INVITE_REWARD_GIVE_INVITER_HINT').format(player.name))
+
+            self.show_my_info_panel(player)
+
+        fill_inviter_panel = ModalForm(
+            title=panel_title,
+            controls=[inviter_input],
+            on_close=self.show_my_info_panel,
+            on_submit=try_set_inviter
+        )
+        player.send_form(fill_inviter_panel)
+
+    def claim_invite_rewards(self, player: Player):
+        """领取玩家待领取的邀请奖励"""
+        player_xuid = str(player.xuid)
+        pending_info = self.database_manager.query_one(
+            "SELECT pending_invite_reward_times FROM player_basic_info WHERE xuid = ?",
+            (player_xuid,)
+        )
+
+        pending_times = 0
+        if pending_info is not None:
+            try:
+                pending_times = int(pending_info.get('pending_invite_reward_times', 0) or 0)
+            except (ValueError, TypeError):
+                pending_times = 0
+
+        if pending_times <= 0:
+            no_reward_panel = ActionForm(
+                title=self.language_manager.GetText('INVITE_REWARD_CLAIM_RESULT_TITLE'),
+                content=self.language_manager.GetText('INVITE_REWARD_CLAIM_NOTHING'),
+                on_close=self.show_my_info_panel
+            )
+            player.send_form(no_reward_panel)
+            return
+
+        # 发放奖励（按照累计次数一次性发放）
+        self.grant_invite_reward_to_player(player, pending_times)
+
+        # 清零数据库中的待领取次数
+        try:
+            self.database_manager.update(
+                table='player_basic_info',
+                data={'pending_invite_reward_times': 0},
+                where='xuid = ?',
+                params=(player_xuid,)
+            )
+        except Exception as e:
+            self.logger.error(f"{ColorFormat.RED}[ARC Core]Clear pending invite reward times error: {str(e)}")
+
+        result_content = self.language_manager.GetText('INVITE_REWARD_CLAIM_RESULT_CONTENT').format(pending_times)
+        result_panel = ActionForm(
+            title=self.language_manager.GetText('INVITE_REWARD_CLAIM_RESULT_TITLE'),
+            content=result_content,
+            on_close=self.show_my_info_panel
+        )
+        player.send_form(result_panel)
 
     # Register and login
     def login_successfully(self, player: Player):
@@ -1449,31 +1692,66 @@ class ARCCorePlugin(Plugin):
             self.player_authentication_state[player.name] = False
         return self.player_authentication_state[player.name]
 
-    # Economy system
+    # Economy system（金钱以 float 存储，精确到分，两位小数）
+    def _round_money(self, value: float) -> float:
+        """将金额四舍五入到分（两位小数）"""
+        return round(float(value), 2)
+
+    def _format_money_display(self, value: float) -> str:
+        """格式化金额用于界面显示（始终两位小数）"""
+        return "%.2f" % self._round_money(value)
+
     def init_economy_table(self) -> bool:
-        """初始化经济系统表格"""
+        """初始化经济系统表格（money 使用 REAL，支持小数到分）"""
         fields = {
             'xuid': 'TEXT PRIMARY KEY',  # 玩家XUID字符串作为主键
-            'money': 'INTEGER NOT NULL DEFAULT 0'  # 玩家金钱数量，默认值0
+            'money': 'REAL NOT NULL DEFAULT 0'  # 玩家金钱数量，支持小数，精确到分
         }
         return self.database_manager.create_table('player_economy', fields)
 
-    def _set_player_money_by_name(self, player_name: str, amount: int) -> bool:
+    def _upgrade_player_economy_table_to_float(self) -> bool:
+        """若 player_economy 表中 money 列为 INTEGER，则迁移为 REAL（仅执行一次）"""
+        try:
+            if not self.database_manager.table_exists('player_economy'):
+                return True
+            columns_info = self.database_manager.query_all("PRAGMA table_info(player_economy)")
+            money_type = None
+            for col in columns_info:
+                if col.get('name') == 'money':
+                    money_type = str(col.get('type', '')).upper()
+                    break
+            if money_type != 'INTEGER':
+                return True
+            # 创建新表（REAL），复制数据，替换旧表
+            self.database_manager.execute(
+                "CREATE TABLE player_economy_new (xuid TEXT PRIMARY KEY, money REAL NOT NULL DEFAULT 0)"
+            )
+            self.database_manager.execute(
+                "INSERT INTO player_economy_new (xuid, money) SELECT xuid, CAST(money AS REAL) FROM player_economy"
+            )
+            self.database_manager.execute("DROP TABLE player_economy")
+            self.database_manager.execute("ALTER TABLE player_economy_new RENAME TO player_economy")
+            print("[ARC Core]Upgraded player_economy money column to REAL (float).")
+            return True
+        except Exception as e:
+            print(f"[ARC Core]Upgrade player_economy to float error: {str(e)}")
+            return False
+
+    def _set_player_money_by_name(self, player_name: str, amount: float) -> bool:
         """
         设置玩家金钱（底层函数，基于玩家名称）
         :param player_name: 玩家名称
-        :param amount: 金钱数量
+        :param amount: 金钱数量（支持小数，精确到分）
         :return: 是否设置成功
         """
         try:
-            # 限制金钱范围在32位整数范围内
-            amount = max(-2147483648, min(2147483647, amount))
-            
+            amount = self._round_money(amount)
+
             player_xuid = self.get_player_xuid_by_name(player_name)
             if not player_xuid:
                 self.logger.error(f"{ColorFormat.RED}[ARC Core]Player {player_name} not found")
                 return False
-            
+
             return self.database_manager.update(
                 table='player_economy',
                 data={'money': amount},
@@ -1484,136 +1762,145 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Set player money error: {str(e)}")
             return False
 
-    def _set_player_money(self, player: Player, amount: int) -> bool:
+    def _set_player_money(self, player: Player, amount: float) -> bool:
         """
         设置玩家金钱（Player对象封装器）
         :param player: 玩家对象
-        :param amount: 金钱数量
+        :param amount: 金钱数量（支持小数，精确到分）
         :return: 是否设置成功
         """
         return self._set_player_money_by_name(player.name, amount)
 
-    def get_player_money_by_name(self, player_name: str) -> int:
+    def get_player_money_by_name(self, player_name: str) -> float:
         """
         获取玩家金钱（底层函数，基于玩家名称）
         :param player_name: 玩家名称
-        :return: 玩家金钱数量
+        :return: 玩家金钱数量（精确到分）
         """
         try:
             player_xuid = self.get_player_xuid_by_name(player_name)
             if not player_xuid:
-                return 0
-            
+                return 0.0
+
             result = self.database_manager.query_one(
                 "SELECT money FROM player_economy WHERE xuid = ?",
                 (player_xuid,)
             )
             if result is None:
-                # 玩家不存在，创建新记录
                 player_init_money_num = self.setting_manager.GetSetting('PLAYER_INIT_MONEY_NUM')
                 try:
-                    init_money = int(player_init_money_num)
+                    init_money = self._round_money(float(player_init_money_num))
                 except (ValueError, TypeError):
-                    init_money = 0
+                    init_money = 0.0
                 self.database_manager.insert(
                     'player_economy',
                     {'xuid': player_xuid, 'money': init_money}
                 )
                 return init_money
-            return result['money']
+            return self._round_money(result['money'])
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money error: {str(e)}")
-            return 0
+            return 0.0
 
-    def get_player_money(self, player: Player) -> int:
+    def get_player_money(self, player: Player) -> float:
         """
         获取玩家金钱（Player对象封装器）
         :param player: 玩家对象
-        :return: 玩家金钱数量
+        :return: 玩家金钱数量（精确到分）
         """
         return self.get_player_money_by_name(player.name)
 
-    def increase_player_money_by_name(self, player_name: str, amount: int, notify: bool = True) -> bool:
+    def increase_player_money_by_name(self, player_name: str, amount: float, notify: bool = True) -> bool:
         """
         增加玩家金钱（底层函数，基于玩家名称）
         :param player_name: 玩家名称
-        :param amount: 增加的金钱数量
+        :param amount: 增加的金钱数量（支持小数，精确到分）
         :param notify: 是否通知在线玩家
         :return: 是否操作成功
         """
         try:
-            if amount < 0:
-                amount *= -1
+            amount = abs(self._round_money(amount))
+            if amount <= 0:
+                return True
             current_money = self.get_player_money_by_name(player_name)
-            success = self._set_player_money_by_name(player_name, current_money + amount)
-            
-            # 通知在线玩家
+            new_money = self._round_money(current_money + amount)
+            success = self._set_player_money_by_name(player_name, new_money)
+
             if success and notify:
                 online_player = self.server.get_player(player_name)
                 if online_player is not None:
-                    new_money = current_money + amount
-                    online_player.send_message(self.language_manager.GetText('MONEY_ADD_HINT').format(amount, new_money))
-            
+                    online_player.send_message(
+                        self.language_manager.GetText('MONEY_ADD_HINT').format(
+                            self._format_money_display(amount),
+                            self._format_money_display(new_money)
+                        )
+                    )
+
             return success
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Add player money error: {str(e)}")
             return False
 
-    def decrease_player_money_by_name(self, player_name: str, amount: int, notify: bool = True) -> bool:
+    def decrease_player_money_by_name(self, player_name: str, amount: float, notify: bool = True) -> bool:
         """
         减少玩家金钱（底层函数，基于玩家名称）
         :param player_name: 玩家名称
-        :param amount: 减少的金钱数量
+        :param amount: 减少的金钱数量（支持小数，精确到分）
         :param notify: 是否通知在线玩家
         :return: 是否操作成功
         """
         try:
-            if amount < 0:
-                amount *= -1
+            amount = abs(self._round_money(amount))
+            if amount <= 0:
+                return True
             current_money = self.get_player_money_by_name(player_name)
-            success = self._set_player_money_by_name(player_name, current_money - amount)
-            
-            # 通知在线玩家
+            new_money = self._round_money(current_money - amount)
+            success = self._set_player_money_by_name(player_name, new_money)
+
             if success and notify:
                 online_player = self.server.get_player(player_name)
                 if online_player is not None:
-                    new_money = current_money - amount
-                    online_player.send_message(self.language_manager.GetText('MONEY_REDUCE_HINT').format(amount, new_money))
-            
+                    online_player.send_message(
+                        self.language_manager.GetText('MONEY_REDUCE_HINT').format(
+                            self._format_money_display(amount),
+                            self._format_money_display(new_money)
+                        )
+                    )
+
             return success
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Remove player money error: {str(e)}")
             return False
 
-    def change_player_money_by_name(self, player_name: str, money_to_change: int, notify: bool = True) -> bool:
+    def change_player_money_by_name(self, player_name: str, money_to_change: float, notify: bool = True) -> bool:
         """
         改变玩家金钱（底层函数，基于玩家名称）
         :param player_name: 玩家名称
-        :param money_to_change: 要改变的金钱数量（正数为增加，负数为减少）
+        :param money_to_change: 要改变的金钱数量（正数为增加，负数为减少），支持小数
         :param notify: 是否通知在线玩家
         :return: 是否操作成功
         """
-        if money_to_change == 0:
+        m = self._round_money(money_to_change)
+        if m == 0:
             return True
-        elif money_to_change > 0:
-            return self.increase_player_money_by_name(player_name, money_to_change, notify)
-        else:
-            return self.decrease_player_money_by_name(player_name, abs(money_to_change), notify)
+        if m > 0:
+            return self.increase_player_money_by_name(player_name, m, notify)
+        return self.decrease_player_money_by_name(player_name, abs(m), notify)
 
-    def increase_player_money(self, player: Player, amount: int) -> bool:
+    def increase_player_money(self, player: Player, amount: float) -> bool:
         """
         增加玩家金钱（Player对象封装器）
         :param player: 玩家对象
-        :param amount: 增加的金钱数量
+        :param amount: 增加的金钱数量（支持小数，精确到分）
         :return: 是否操作成功
         """
         return self.increase_player_money_by_name(player.name, amount)
 
-    def decrease_player_money(self, player: Player, amount: int) -> bool:
+    def decrease_player_money(self, player: Player, amount: float) -> bool:
         """
         减少玩家金钱（Player对象封装器）
         :param player: 玩家对象
-        :param amount: 减少的金钱数量
+        :param amount: 减少的金钱数量（支持小数，精确到分）
         :return: 是否操作成功
         """
         return self.decrease_player_money_by_name(player.name, amount)
@@ -1648,7 +1935,103 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Set player free land blocks error: {str(e)}")
             return False
 
-    def get_top_richest_players(self, top_count: int) -> Dict[str, int]:
+    def get_invite_reward_config(self) -> Dict[str, Any]:
+        """获取邀请奖励配置"""
+        item_name_setting = self.setting_manager.GetSetting('INVITE_REWARD_ITEM_NAME')
+        item_name = item_name_setting if item_name_setting is not None else ''
+
+        item_count_setting = self.setting_manager.GetSetting('INVITE_REWARD_ITEM_COUNT')
+        money_setting = self.setting_manager.GetSetting('INVITE_REWARD_MONEY')
+        free_blocks_setting = self.setting_manager.GetSetting('INVITE_REWARD_FREE_LAND_BLOCKS')
+
+        def parse_int_setting(raw_value: Optional[str]) -> int:
+            if raw_value is None:
+                return 0
+            try:
+                value = int(raw_value)
+                if value < 0:
+                    value = 0
+                return value
+            except (ValueError, TypeError):
+                return 0
+
+        def parse_float_money_setting(raw_value: Optional[str]) -> float:
+            if raw_value is None:
+                return 0.0
+            try:
+                value = float(raw_value)
+                if value < 0:
+                    value = 0.0
+                return self._round_money(value)
+            except (ValueError, TypeError):
+                return 0.0
+
+        item_count = parse_int_setting(item_count_setting)
+        money_amount = parse_float_money_setting(money_setting)
+        free_blocks = parse_int_setting(free_blocks_setting)
+
+        return {
+            'item_name': item_name,
+            'item_count': item_count,
+            'money': money_amount,
+            'free_blocks': free_blocks
+        }
+
+    def grant_invite_reward_to_player(self, player: Player, times: int = 1):
+        """给玩家发放邀请奖励（可一次性发放多份）"""
+        if times <= 0:
+            return
+
+        reward_config = self.get_invite_reward_config()
+
+        total_item_count = reward_config['item_count'] * times
+        total_money = reward_config['money'] * times
+        total_free_blocks = reward_config['free_blocks'] * times
+
+        # 物资奖励通过服务器指令发放
+        item_name = reward_config['item_name']
+        if item_name and total_item_count > 0:
+            try:
+                self.server.dispatch_command(
+                    self.server.command_sender,
+                    f"give {player.name} {item_name} {total_item_count}"
+                )
+            except Exception as e:
+                self.logger.error(f"{ColorFormat.RED}[ARC Core]Give invite reward item error: {str(e)}")
+
+        # 金钱奖励
+        if total_money > 0:
+            self.increase_player_money(player, total_money)
+
+        # 免费领地格子奖励
+        if total_free_blocks > 0:
+            current_free_blocks = self.get_player_free_land_blocks(player)
+            new_free_blocks = current_free_blocks + total_free_blocks
+            self.set_player_free_land_blocks(player, new_free_blocks)
+
+        player.send_message(
+            self.language_manager.GetText('INVITE_REWARD_GIVE_SELF_HINT').format(
+                total_item_count,
+                self._format_money_display(total_money),
+                total_free_blocks
+            )
+        )
+
+    def add_pending_invite_rewards(self, inviter_xuid: str, times: int = 1):
+        """为邀请人累加待领取邀请奖励次数"""
+        if times <= 0:
+            return
+        try:
+            self.database_manager.execute(
+                "UPDATE player_basic_info "
+                "SET pending_invite_reward_times = COALESCE(pending_invite_reward_times, 0) + ? "
+                "WHERE xuid = ?",
+                (times, inviter_xuid)
+            )
+        except Exception as e:
+            self.logger.error(f"{ColorFormat.RED}[ARC Core]Add pending invite rewards error: {str(e)}")
+
+    def get_top_richest_players(self, top_count: int) -> Dict[str, float]:
         try:
             results = self.database_manager.query_all(
                 "SELECT * FROM player_economy ORDER BY money DESC LIMIT ?",
@@ -1661,7 +2044,7 @@ class ARCCorePlugin(Plugin):
                     xuid_str = entry['xuid']
                     player_name = self.get_player_name_by_xuid(xuid_str)
                     if player_name:
-                        rich_list[player_name] = entry['money']
+                        rich_list[player_name] = self._round_money(entry['money'])
                 except Exception:
                     continue
 
@@ -1694,20 +2077,20 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money rank error: {str(e)}")
             return None
 
-    def judge_if_player_has_enough_money_by_name(self, player_name: str, amount: int) -> bool:
+    def judge_if_player_has_enough_money_by_name(self, player_name: str, amount: float) -> bool:
         """
         判断玩家是否有足够金钱（底层函数，基于玩家名称）
         :param player_name: 玩家名称
-        :param amount: 需要的金钱数量
+        :param amount: 需要的金钱数量（支持小数）
         :return: 是否有足够金钱
         """
-        return self.get_player_money_by_name(player_name) >= abs(amount)
+        return self.get_player_money_by_name(player_name) >= abs(self._round_money(amount))
 
-    def judge_if_player_has_enough_money(self, player: Player, amount: int) -> bool:
+    def judge_if_player_has_enough_money(self, player: Player, amount: float) -> bool:
         """
         判断玩家是否有足够金钱（Player对象封装器）
         :param player: 玩家对象
-        :param amount: 需要的金钱数量
+        :param amount: 需要的金钱数量（支持小数）
         :return: 是否有足够金钱
         """
         return self.judge_if_player_has_enough_money_by_name(player.name, amount)
@@ -1716,7 +2099,9 @@ class ARCCorePlugin(Plugin):
     def show_bank_main_menu(self, player: Player):
         bank_main_menu = ActionForm(
             title=self.language_manager.GetText('BANK_MAIN_MENU_TITLE'),
-            content=self.language_manager.GetText('BANK_MAIN_MENU_BALANCE_CONTENT').format(self.get_player_money(player))
+            content=self.language_manager.GetText('BANK_MAIN_MENU_BALANCE_CONTENT').format(
+                self._format_money_display(self.get_player_money(player))
+            )
         )
         bank_main_menu.add_button(self.language_manager.GetText('BANK_MAIN_MENU_TRANSFER_BUTTON_TEXT'), on_click=self.show_transfer_panel)
         bank_main_menu.add_button(self.language_manager.GetText('BANK_MAIN_MENU_MONEY_RANK_BUTTON_TEXT'),on_click=self.show_money_rank_panel)
@@ -1744,7 +2129,9 @@ class ARCCorePlugin(Plugin):
         # 创建玩家选择面板
         player_select_panel = ActionForm(
             title=self.language_manager.GetText('TRANSFER_PANEL_TITLE'),
-            content=self.language_manager.GetText('TRANSFER_SELECT_PLAYER_CONTENT').format(self.get_player_money(player))
+            content=self.language_manager.GetText('TRANSFER_SELECT_PLAYER_CONTENT').format(
+                self._format_money_display(self.get_player_money(player))
+            )
         )
         
         # 为每个在线玩家添加按钮
@@ -1766,7 +2153,10 @@ class ARCCorePlugin(Plugin):
         """显示转账金额输入面板"""
         # 添加信息标签来显示转账信息
         info_label = Label(
-            text=self.language_manager.GetText('TRANSFER_PANEL_INFO_LABEL').format(target_player.name, self.get_player_money(player))
+            text=self.language_manager.GetText('TRANSFER_PANEL_INFO_LABEL').format(
+                target_player.name,
+                self._format_money_display(self.get_player_money(player))
+            )
         )
         
         money_amount_input = TextInput(
@@ -1784,12 +2174,12 @@ class ARCCorePlugin(Plugin):
                 self.increase_player_money(receive_player, amount)
                 receive_player.send_message(self.language_manager.GetText('RECEIVE_PLAYER_TRANSFER_MESSAGE').format(
                     sender.name,
-                    amount,
-                    self.get_player_money(receive_player)))
+                    self._format_money_display(amount),
+                    self._format_money_display(self.get_player_money(receive_player))))
                 result_str = self.language_manager.GetText('TRANSFER_COMPLETED_HINT_TEXT').format(
                     receive_player.name,
-                    amount,
-                    self.get_player_money(sender)
+                    self._format_money_display(amount),
+                    self._format_money_display(self.get_player_money(sender))
                 )
             else:
                 result_str = self.language_manager.GetText(f'TRANSFER_ERROR_{error_code}_TEXT')
@@ -1851,37 +2241,31 @@ class ARCCorePlugin(Plugin):
 
         return error_code, receive_player, amount
 
-    def _validate_transfer_data_new(self, player: Player, target_player: Player, amount_str: str) -> tuple[int, Optional[Player], Optional[int]]:
+    def _validate_transfer_data_new(self, player: Player, target_player: Player, amount_str: str) -> tuple[int, Optional[Player], Optional[float]]:
         """
         验证新转账流程的数据
         :param player: 发起转账的玩家
         :param target_player: 目标玩家对象
-        :param amount_str: 转账金额字符串
+        :param amount_str: 转账金额字符串（支持小数，精确到分）
         :return: (错误码, 接收玩家对象, 转账金额)
         """
-        # 初始化返回值
         error_code = 0
         amount = None
 
-        # 检查目标玩家是否仍在线
         if target_player not in self.server.online_players:
             return 2, target_player, None
 
-        # 检查是否自己给自己转账（理论上不会发生，但保险起见）
         if target_player.name == player.name:
             return 6, target_player, None
 
-        # 检查并转换金额
         try:
-            amount = int(amount_str)
+            amount = self._round_money(float(amount_str))
         except (ValueError, TypeError):
             return 3, target_player, None
 
-        # 检查金额是否大于0
         if amount <= 0:
             return 5, target_player, amount
 
-        # 检查玩家余额是否足够
         if not self.judge_if_player_has_enough_money(player, amount):
             return 4, target_player, amount
 
@@ -1908,11 +2292,13 @@ class ARCCorePlugin(Plugin):
         rank_list = []
         for i, (player_name, player_money) in enumerate(filtered_rank_dict.items()):
             rank_list.append(
-                self.language_manager.GetText('MONEY_RANK_INFO_TEXT').format(i + 1, player_name, player_money))
+                self.language_manager.GetText('MONEY_RANK_INFO_TEXT').format(
+                    i + 1, player_name, self._format_money_display(player_money)))
         
         rank_panel = ActionForm(
             title=self.language_manager.GetText('MONEY_RANK_PANEL_TITLE'),
-            content='\n'.join(rank_list) + '\n' + self.language_manager.GetText('MONEY_RANK_PLYAER_RANK_INFO_TEXT').format(self.get_player_money(player), self.get_player_money_rank(player)),
+            content='\n'.join(rank_list) + '\n' + self.language_manager.GetText('MONEY_RANK_PLYAER_RANK_INFO_TEXT').format(
+                self._format_money_display(self.get_player_money(player)), self.get_player_money_rank(player)),
             on_close=self.show_bank_main_menu
         )
         player.send_form(rank_panel)
@@ -2291,14 +2677,16 @@ class ARCCorePlugin(Plugin):
             player_money = self.get_player_money(player)
             if player_money < self.teleport_cost_public_warp:
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self.teleport_cost_public_warp, player_money
+                    self._format_money_display(self.teleport_cost_public_warp),
+                    self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
             if self.decrease_player_money(player, self.teleport_cost_public_warp):
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self.teleport_cost_public_warp, self.get_player_money(player)
+                    self._format_money_display(self.teleport_cost_public_warp),
+                    self._format_money_display(self.get_player_money(player))
                 ))
             else:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
@@ -2313,14 +2701,16 @@ class ARCCorePlugin(Plugin):
             player_money = self.get_player_money(player)
             if player_money < self.teleport_cost_home:
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self.teleport_cost_home, player_money
+                    self._format_money_display(self.teleport_cost_home),
+                    self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
             if self.decrease_player_money(player, self.teleport_cost_home):
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self.teleport_cost_home, self.get_player_money(player)
+                    self._format_money_display(self.teleport_cost_home),
+                    self._format_money_display(self.get_player_money(player))
                 ))
             else:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
@@ -2435,14 +2825,16 @@ class ARCCorePlugin(Plugin):
             player_money = self.get_player_money(player)
             if player_money < self.teleport_cost_death_location:
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self.teleport_cost_death_location, player_money
+                    self._format_money_display(self.teleport_cost_death_location),
+                    self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
             if self.decrease_player_money(player, self.teleport_cost_death_location):
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self.teleport_cost_death_location, self.get_player_money(player)
+                    self._format_money_display(self.teleport_cost_death_location),
+                    self._format_money_display(self.get_player_money(player))
                 ))
             else:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
@@ -2489,14 +2881,16 @@ class ARCCorePlugin(Plugin):
             player_money = self.get_player_money(player)
             if player_money < self.teleport_cost_random:
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self.teleport_cost_random, player_money
+                    self._format_money_display(self.teleport_cost_random),
+                    self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
             if self.decrease_player_money(player, self.teleport_cost_random):
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self.teleport_cost_random, self.get_player_money(player)
+                    self._format_money_display(self.teleport_cost_random),
+                    self._format_money_display(self.get_player_money(player))
                 ))
             else:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
@@ -2640,14 +3034,16 @@ class ARCCorePlugin(Plugin):
             player_money = self.get_player_money(sender)
             if player_money < self.teleport_cost_player:
                 sender.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self.teleport_cost_player, player_money
+                    self._format_money_display(self.teleport_cost_player),
+                    self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
             if self.decrease_player_money(sender, self.teleport_cost_player):
                 sender.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self.teleport_cost_player, self.get_player_money(sender)
+                    self._format_money_display(self.teleport_cost_player),
+                    self._format_money_display(self.get_player_money(sender))
                 ))
             else:
                 sender.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
@@ -2678,14 +3074,16 @@ class ARCCorePlugin(Plugin):
             player_money = self.get_player_money(sender)
             if player_money < self.teleport_cost_player:
                 sender.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self.teleport_cost_player, player_money
+                    self._format_money_display(self.teleport_cost_player),
+                    self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
             if self.decrease_player_money(sender, self.teleport_cost_player):
                 sender.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self.teleport_cost_player, self.get_player_money(sender)
+                    self._format_money_display(self.teleport_cost_player),
+                    self._format_money_display(self.get_player_money(sender))
                 ))
             else:
                 sender.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
@@ -2955,7 +3353,8 @@ class ARCCorePlugin(Plugin):
                 'allow_explosion': 'INTEGER DEFAULT 0',  # 是否允许爆炸 (0=不允许, 1=允许)
                 'allow_public_interact': 'INTEGER DEFAULT 0',  # 是否对所有人开放方块互动 (0=不开放, 1=开放)
                 'allow_actor_interaction': 'INTEGER DEFAULT 0',  # 是否允许生物互动 (0=不允许, 1=允许)
-                'allow_actor_damage': 'INTEGER DEFAULT 0'  # 是否允许攻击生物 (0=不允许, 1=允许)
+                'allow_actor_damage': 'INTEGER DEFAULT 0',  # 是否允许攻击生物 (0=不允许, 1=允许)
+                'owner_paid_money': 'REAL DEFAULT 0'  # 购买时玩家实际支付的金钱，用于出售时按实付退款
             }
 
             # 检查表是否已经存在
@@ -3021,6 +3420,27 @@ class ARCCorePlugin(Plugin):
                     print("[ARC Core]Land table already has allow_actor_damage column")
                 else:
                     print(f"[ARC Core]Could not add allow_actor_damage column: {str(alter_error)}")
+            
+            # 尝试添加 owner_paid_money 字段（购买时实付金额，出售时按此退款）
+            try:
+                self.database_manager.execute("ALTER TABLE lands ADD COLUMN owner_paid_money REAL DEFAULT 0")
+                print("[ARC Core]Upgraded land table: added owner_paid_money column")
+                # 注意：此时 self.land_price 尚未从配置加载，需从 setting_manager 读取
+                land_price_raw = self.setting_manager.GetSetting('LAND_PRICE')
+                try:
+                    upgrade_land_price = float(int(land_price_raw)) if land_price_raw is not None else 1000.0
+                except (ValueError, TypeError):
+                    upgrade_land_price = 1000.0
+                self.database_manager.execute(
+                    "UPDATE lands SET owner_paid_money = (max_x - min_x + 1) * (max_z - min_z + 1) * ?",
+                    (upgrade_land_price,)
+                )
+                print("[ARC Core]Initialized owner_paid_money for existing lands (area * current land_price)")
+            except Exception as alter_error:
+                if "duplicate column name" in str(alter_error).lower() or "already exists" in str(alter_error).lower():
+                    print("[ARC Core]Land table already has owner_paid_money column")
+                else:
+                    print(f"[ARC Core]Could not add owner_paid_money column: {str(alter_error)}")
             
             return True
         except Exception as e:
@@ -3093,8 +3513,8 @@ class ARCCorePlugin(Plugin):
 
     def create_land(self, owner_xuid: str, land_name: str, dimension: str,
                     min_x: int, max_x: int, min_z: int, max_z: int,
-                    tp_x: float, tp_y: float, tp_z: float) -> Optional[int]:
-        """创建新领地"""
+                    tp_x: float, tp_y: float, tp_z: float, owner_paid_money: float = 0.0) -> Optional[int]:
+        """创建新领地。owner_paid_money 为购买时玩家实际支付的金钱，出售时按此退款。"""
         try:
             # 确保维度表存在
             if not self._ensure_dimension_table(dimension):
@@ -3102,9 +3522,9 @@ class ARCCorePlugin(Plugin):
 
             # 插入领地基本信息
             self.database_manager.execute(
-                "INSERT INTO lands (owner_xuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, shared_users, allow_explosion, allow_public_interact) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (owner_xuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, '[]', 0, 0)
+                "INSERT INTO lands (owner_xuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, shared_users, allow_explosion, allow_public_interact, owner_paid_money) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (owner_xuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, '[]', 0, 0, float(owner_paid_money))
             )
             result = self.database_manager.query_one("SELECT last_insert_rowid() as land_id")
             land_id = result['land_id']
@@ -3432,6 +3852,13 @@ class ARCCorePlugin(Plugin):
     def is_public_land(self, land_id: int) -> bool:
         """判断领地是否为公共领地"""
         return self.get_land_owner(land_id) == self.PUBLIC_LAND_OWNER_XUID
+
+    def _get_public_land_protected_entities(self) -> Set[str]:
+        """获取公共领地白名单保护生物类型集合（配置 PUBLIC_LAND_PROTECTED_ENTITIES，逗号分隔）"""
+        raw = self.setting_manager.GetSetting('PUBLIC_LAND_PROTECTED_ENTITIES')
+        if not raw or not str(raw).strip():
+            return set()
+        return {s.strip() for s in str(raw).split(',') if s.strip()}
     
     def get_land_display_owner_name(self, land_id: int) -> str:
         """获取领地显示的所有者名称：公共领地显示翻译后的「公共领地」，否则显示玩家名"""
@@ -3459,7 +3886,7 @@ class ARCCorePlugin(Plugin):
 
     def set_land_as_public(self, land_id: int) -> bool:
         """
-        将领地设为公共领地（owner_xuid 设为 "0"）
+        将领地设为公共领地（owner_xuid 设为 "0"），并默认开放方块互动、生物互动、生物伤害
         :param land_id: 领地ID
         :return: 是否成功
         """
@@ -3467,7 +3894,7 @@ class ARCCorePlugin(Plugin):
             if not self.get_land_info(land_id):
                 return False
             return self.database_manager.execute(
-                "UPDATE lands SET owner_xuid = ? WHERE land_id = ?",
+                "UPDATE lands SET owner_xuid = ?, allow_public_interact = 1, allow_actor_interaction = 1, allow_actor_damage = 1 WHERE land_id = ?",
                 (self.PUBLIC_LAND_OWNER_XUID, land_id)
             )
         except Exception as e:
@@ -3727,14 +4154,16 @@ class ARCCorePlugin(Plugin):
             player_money = self.get_player_money(player)
             if player_money < self.teleport_cost_land:
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self.teleport_cost_land, player_money
+                    self._format_money_display(self.teleport_cost_land),
+                    self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
             if self.decrease_player_money(player, self.teleport_cost_land):
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self.teleport_cost_land, self.get_player_money(player)
+                    self._format_money_display(self.teleport_cost_land),
+                    self._format_money_display(self.get_player_money(player))
                 ))
             else:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
@@ -3751,11 +4180,17 @@ class ARCCorePlugin(Plugin):
 
     def confirm_delete_land(self, player: Player, land_id: int):
         deleta_land_info = self.get_land_info(land_id)
-        land_area = (deleta_land_info['max_x'] - deleta_land_info['min_x']) * (deleta_land_info['max_z'] - deleta_land_info['min_z'])
-        return_money = int(land_area * self.land_price * self.land_sell_refund_coefficient)
+        owner_paid = deleta_land_info.get('owner_paid_money')
+        if owner_paid is not None:
+            return_money = round(float(owner_paid) * self.land_sell_refund_coefficient, 2)
+        else:
+            land_area = (deleta_land_info['max_x'] - deleta_land_info['min_x'] + 1) * (deleta_land_info['max_z'] - deleta_land_info['min_z'] + 1)
+            return_money = round(land_area * self.land_price * self.land_sell_refund_coefficient, 2)
         confirm_panel = ActionForm(
             title=self.language_manager.GetText('CONFIRM_DELETE_LAND_TITLE').format(land_id),
-            content=self.language_manager.GetText('CONFIRM_DELETE_LAND_CONTENT').format(land_id, deleta_land_info['land_name'], self.land_sell_refund_coefficient, return_money),
+            content=self.language_manager.GetText('CONFIRM_DELETE_LAND_CONTENT').format(
+            land_id, deleta_land_info['land_name'], self.land_sell_refund_coefficient,
+            self._format_money_display(return_money)),
             on_close=self.show_own_land_detail_panel(player, land_id, deleta_land_info)
         )
         confirm_panel.add_button(self.language_manager.GetText('CONFIRM_DELETE_LAND_BUTTON').format(land_id),
@@ -3767,7 +4202,10 @@ class ARCCorePlugin(Plugin):
         r = self.delete_land(land_id)
         if r:
             self.increase_player_money(player, return_money)
-            player.send_message(self.language_manager.GetText('DELETE_LAND_SUCCESS').format(land_id, return_money, self.get_player_money(player)))
+            player.send_message(self.language_manager.GetText('DELETE_LAND_SUCCESS').format(
+            land_id,
+            self._format_money_display(return_money),
+            self._format_money_display(self.get_player_money(player))))
         else:
             player.send_message(self.language_manager.GetText('DELETE_LAND_FAILED').format(land_id))
         self.show_own_land_menu(player)
@@ -4455,13 +4893,16 @@ class ARCCorePlugin(Plugin):
 
     def player_buy_new_land(self, player: Player, dimension: str, start_pos: tuple, end_pos: tuple, area: int, money_cost: int, used_free_blocks: int = 0):
         if self.judge_if_player_has_enough_money(player, money_cost) or player.is_op:
-            land_id = self.create_land(str(player.xuid), self.language_manager.GetText('DEFAULT_LAND_NAME').format(player.name, self.get_player_land_count(str(player.xuid)) + 1), dimension, start_pos[0], end_pos[0], start_pos[1], end_pos[1], player.location.x, player.location.y, player.location.z)
+            paid_money = float(money_cost) if not player.is_op else 0.0
+            land_id = self.create_land(str(player.xuid), self.language_manager.GetText('DEFAULT_LAND_NAME').format(player.name, self.get_player_land_count(str(player.xuid)) + 1), dimension, start_pos[0], end_pos[0], start_pos[1], end_pos[1], player.location.x, player.location.y, player.location.z, owner_paid_money=paid_money)
             if land_id is not None:
                 if not player.is_op:
                     # 扣除金钱
                     if money_cost > 0:
                         self.decrease_player_money(player, money_cost)
-                        player.send_message(self.language_manager.GetText('PAY_SUCCESS_HINT').format(money_cost, self.get_player_money(player)))
+                        player.send_message(self.language_manager.GetText('PAY_SUCCESS_HINT').format(
+                        self._format_money_display(money_cost),
+                        self._format_money_display(self.get_player_money(player))))
                     
                     # 扣除免费格子数
                     if used_free_blocks > 0:
@@ -4475,7 +4916,9 @@ class ARCCorePlugin(Plugin):
             else:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
         else:
-            player.send_message(self.language_manager.GetText('PAY_FAIL_NO_ENOUGH_MONEY').format(money_cost, self.get_player_money(player)))
+            player.send_message(self.language_manager.GetText('PAY_FAIL_NO_ENOUGH_MONEY').format(
+            self._format_money_display(money_cost),
+            self._format_money_display(self.get_player_money(player))))
 
     # OP Panel
     def show_op_main_panel(self, player: Player):
@@ -4490,6 +4933,10 @@ class ARCCorePlugin(Plugin):
                                  on_click=self.show_money_manage_menu)
         op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_MANAGE_ALL_LANDS'),
                                  on_click=self.show_op_all_lands_panel)
+        op_main_panel.add_button(self.language_manager.GetText('INVITE_REWARD_CONFIG_BUTTON'),
+                                 on_click=self.show_invite_reward_config_panel)
+        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_RELOAD_CONFIG_BUTTON'),
+                                 on_click=self.op_reload_config)
         op_main_panel.add_button(self.language_manager.GetText('RECORD_COOR_1'),
                                  on_click=self.record_coordinate_1)
         op_main_panel.add_button(self.language_manager.GetText('RECORD_COOR_2'),
@@ -4500,6 +4947,185 @@ class ARCCorePlugin(Plugin):
         op_main_panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
                                   on_click=self.show_main_menu)
         player.send_form(op_main_panel)
+
+    def op_reload_config(self, player: Player):
+        """OP 重载配置文件：设置、广播、迎新指令/文案、语言文件"""
+        try:
+            self.setting_manager.Reload()
+            self._reapply_cached_settings()
+            self._load_broadcast_messages()
+            self.language_manager.ReloadCurrentLanguage()
+            player.send_message(self.language_manager.GetText('OP_RELOAD_CONFIG_SUCCESS'))
+            self.show_op_main_panel(player)
+        except Exception as e:
+            self.logger.error(f"{ColorFormat.RED}[ARC Core]Reload config error: {str(e)}")
+            player.send_message(self.language_manager.GetText('OP_RELOAD_CONFIG_FAILED'))
+            self.show_op_main_panel(player)
+
+    def _reapply_cached_settings(self):
+        """重载配置后重新应用从 core_setting 读取的缓存项"""
+        try:
+            self.broadcast_interval = self.setting_manager.GetSetting('BROADCAST_INTERVAL')
+            try:
+                self.broadcast_interval = int(self.broadcast_interval)
+            except (ValueError, TypeError):
+                self.broadcast_interval = 300
+            self.spawn_protect_range = self.setting_manager.GetSetting('SPAWN_PROTECT_RANGE')
+            if self.spawn_protect_range is None:
+                self.spawn_protect_range = 8
+            else:
+                try:
+                    self.spawn_protect_range = int(self.spawn_protect_range)
+                except ValueError:
+                    self.spawn_protect_range = 8
+            self.if_protect_spawn = self.setting_manager.GetSetting('IF_PROTECT_SPAWN')
+            if self.if_protect_spawn is None:
+                self.if_protect_spawn = False
+            else:
+                try:
+                    self.if_protect_spawn = str(self.if_protect_spawn).lower() in ['true', '1', 'yes']
+                except (ValueError, AttributeError):
+                    self.if_protect_spawn = False
+            land_price_raw = self.setting_manager.GetSetting('LAND_PRICE')
+            try:
+                self.land_price = int(land_price_raw)
+            except (ValueError, TypeError):
+                self.land_price = 1000
+            try:
+                self.land_sell_refund_coefficient = float(self.setting_manager.GetSetting('LAND_SELL_REFUND_COEFFICIENT'))
+            except (ValueError, TypeError):
+                self.land_sell_refund_coefficient = 0.9
+            try:
+                self.land_min_size = int(self.setting_manager.GetSetting('LAND_MIN_SIZE'))
+            except (ValueError, TypeError):
+                self.land_min_size = 5
+            try:
+                self.land_min_distance = int(self.setting_manager.GetSetting('MIN_LAND_DISTANCE'))
+            except (ValueError, TypeError):
+                self.land_min_distance = 0
+            self.max_player_home_num = self.setting_manager.GetSetting('MAX_PLAYER_HOME_NUM')
+            try:
+                self.max_player_home_num = int(self.max_player_home_num)
+            except (ValueError, TypeError):
+                self.max_player_home_num = 3
+            self.enable_random_teleport = self.setting_manager.GetSetting('ENABLE_RANDOM_TELEPORT')
+            if self.enable_random_teleport is None:
+                self.enable_random_teleport = True
+            else:
+                try:
+                    self.enable_random_teleport = str(self.enable_random_teleport).lower() in ['true', '1', 'yes']
+                except (ValueError, AttributeError):
+                    self.enable_random_teleport = True
+            try:
+                self.random_teleport_center_x = int(self.setting_manager.GetSetting('RANDOM_TELEPORT_CENTER_X'))
+            except (ValueError, TypeError):
+                self.random_teleport_center_x = 0
+            try:
+                self.random_teleport_center_z = int(self.setting_manager.GetSetting('RANDOM_TELEPORT_CENTER_Z'))
+            except (ValueError, TypeError):
+                self.random_teleport_center_z = 0
+            try:
+                self.random_teleport_radius = int(self.setting_manager.GetSetting('RANDOM_TELEPORT_RADIUS'))
+            except (ValueError, TypeError):
+                self.random_teleport_radius = 5000
+            def _int_setting(key: str, default: int) -> int:
+                raw = self.setting_manager.GetSetting(key)
+                try:
+                    return int(raw) if raw is not None else default
+                except (ValueError, TypeError):
+                    return default
+            self.teleport_cost_public_warp = _int_setting('TELEPORT_COST_PUBLIC_WARP', 0)
+            self.teleport_cost_home = _int_setting('TELEPORT_COST_HOME', 0)
+            self.teleport_cost_land = _int_setting('TELEPORT_COST_LAND', 0)
+            self.teleport_cost_death_location = _int_setting('TELEPORT_COST_DEATH_LOCATION', 0)
+            self.teleport_cost_random = _int_setting('TELEPORT_COST_RANDOM', 100)
+            self.teleport_cost_player = _int_setting('TELEPORT_COST_PLAYER', 50)
+            self.hide_op_in_money_ranking = self.setting_manager.GetSetting('HIDE_OP_IN_MONEY_RANKING')
+            if self.hide_op_in_money_ranking is None:
+                self.hide_op_in_money_ranking = True
+            else:
+                try:
+                    self.hide_op_in_money_ranking = str(self.hide_op_in_money_ranking).lower() in ['true', '1', 'yes']
+                except (ValueError, AttributeError):
+                    self.hide_op_in_money_ranking = True
+            self._init_cleaner_system()
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Reapply cached settings error: {str(e)}")
+
+    def show_invite_reward_config_panel(self, player: Player):
+        """OP 配置邀请奖励"""
+        reward_config = self.get_invite_reward_config()
+
+        item_name_input = TextInput(
+            label=self.language_manager.GetText('INVITE_REWARD_ITEM_NAME_LABEL'),
+            placeholder=self.language_manager.GetText('INVITE_REWARD_ITEM_NAME_PLACEHOLDER'),
+            default_value=str(reward_config.get('item_name', ''))
+        )
+        item_count_input = TextInput(
+            label=self.language_manager.GetText('INVITE_REWARD_ITEM_COUNT_LABEL'),
+            placeholder=self.language_manager.GetText('INVITE_REWARD_ITEM_COUNT_PLACEHOLDER'),
+            default_value=str(reward_config.get('item_count', 0))
+        )
+        money_input = TextInput(
+            label=self.language_manager.GetText('INVITE_REWARD_MONEY_LABEL'),
+            placeholder=self.language_manager.GetText('INVITE_REWARD_MONEY_PLACEHOLDER'),
+            default_value=str(reward_config.get('money', 0))
+        )
+        free_blocks_input = TextInput(
+            label=self.language_manager.GetText('INVITE_REWARD_FREE_BLOCKS_LABEL'),
+            placeholder=self.language_manager.GetText('INVITE_REWARD_FREE_BLOCKS_PLACEHOLDER'),
+            default_value=str(reward_config.get('free_blocks', 0))
+        )
+
+        def try_save_reward_config(p: Player, json_str: str):
+            try:
+                data = json.loads(json_str)
+            except Exception:
+                result_panel = ActionForm(
+                    title=self.language_manager.GetText('INVITE_REWARD_CONFIG_TITLE'),
+                    content=self.language_manager.GetText('FILL_INVITER_FAIL_SYSTEM_ERROR'),
+                    on_close=self.show_op_main_panel
+                )
+                p.send_form(result_panel)
+                return
+
+            item_name_value = str(data[0]).strip() if len(data) > 0 else ''
+            item_count_raw = str(data[1]).strip() if len(data) > 1 else '0'
+            money_raw = str(data[2]).strip() if len(data) > 2 else '0'
+            free_blocks_raw = str(data[3]).strip() if len(data) > 3 else '0'
+
+            def parse_int_non_negative(raw_value: str) -> int:
+                try:
+                    value = int(raw_value)
+                    if value < 0:
+                        value = 0
+                    return value
+                except (ValueError, TypeError):
+                    return 0
+
+            item_count_value = parse_int_non_negative(item_count_raw)
+            money_value = parse_int_non_negative(money_raw)
+            free_blocks_value = parse_int_non_negative(free_blocks_raw)
+
+            self.setting_manager.SetSetting('INVITE_REWARD_ITEM_NAME', item_name_value)
+            self.setting_manager.SetSetting('INVITE_REWARD_ITEM_COUNT', item_count_value)
+            self.setting_manager.SetSetting('INVITE_REWARD_MONEY', money_value)
+            self.setting_manager.SetSetting('INVITE_REWARD_FREE_LAND_BLOCKS', free_blocks_value)
+
+            result_panel = ActionForm(
+                title=self.language_manager.GetText('INVITE_REWARD_CONFIG_TITLE'),
+                content=self.language_manager.GetText('INVITE_REWARD_CONFIG_SAVED'),
+                on_close=self.show_op_main_panel
+            )
+            p.send_form(result_panel)
+
+        config_panel = ModalForm(
+            title=self.language_manager.GetText('INVITE_REWARD_CONFIG_TITLE'),
+            controls=[item_name_input, item_count_input, money_input, free_blocks_input],
+            on_close=self.show_op_main_panel,
+            on_submit=try_save_reward_config
+        )
+        player.send_form(config_panel)
 
     def switch_player_game_mode(self, player: Player):
         if player.game_mode == GameMode.CREATIVE:
@@ -4538,15 +5164,22 @@ class ARCCorePlugin(Plugin):
             return self.op_coordinate2_dict[player.name]
 
     def run_command_as_self(self, player: Player):
+        last_cmd = self.op_last_command_dict.get(player.name, '')
         command_input = TextInput(
             label=self.language_manager.GetText('RUN_COMMAND_PANEL_COMMAND_INPUT_LABEL'),
-            placeholder=self.language_manager.GetText('RUN_COMMAND_PANEL_COMMAND_INPUT_PLACEHOLDER').format(player.name)
+            placeholder=self.language_manager.GetText('RUN_COMMAND_PANEL_COMMAND_INPUT_PLACEHOLDER').format(player.name),
+            default_value=last_cmd
         )
+
         def try_execute_command(player: Player, json_str: str):
             data = json.loads(json_str)
-            if not len(data):
+            command_str = (data[0].strip() if len(data) and data[0] is not None else '')
+            if not command_str:
+                command_str = self.op_last_command_dict.get(player.name, '')
+            if not command_str:
+                player.send_message(self.language_manager.GetText('RUN_COMMAND_PANEL_NO_LAST_COMMAND'))
                 return
-            command_str = data[0]
+            self.op_last_command_dict[player.name] = command_str
             if '@p1' in command_str:
                 command_str = command_str.replace('@p1', ' '.join([str(_) for _ in self.get_op_record_coor1(player)]))
             if '@p2' in command_str:
@@ -4599,7 +5232,7 @@ class ARCCorePlugin(Plugin):
         
         for target_player in online_players:
             # 显示玩家名称和当前余额
-            player_info = f"{target_player.name} (余额: {self.get_player_money(target_player)})"
+            player_info = f"{target_player.name} (余额: {self._format_money_display(self.get_player_money(target_player))})"
             select_player_menu.add_button(
                 player_info,
                 on_click=lambda p=player, t=target_player, op=operation_type: self.show_money_manage_input_amount(p, t, op)
@@ -4621,10 +5254,10 @@ class ARCCorePlugin(Plugin):
                 return
             
             try:
-                amount = int(data[0])
+                amount = self._round_money(float(data[0]))
                 if amount <= 0:
                     raise ValueError
-            except ValueError:
+            except (ValueError, TypeError):
                 player.send_message(self.language_manager.GetText('MONEY_MANAGE_INVALID_AMOUNT'))
                 return
             
@@ -4632,14 +5265,18 @@ class ARCCorePlugin(Plugin):
             if operation_type == 'add':
                 if self.increase_player_money(target_player, amount):
                     player.send_message(self.language_manager.GetText('MONEY_SYSTEM_ADD_MONEY_SUCCESS').format(
-                        target_player.name, amount, self.get_player_money(target_player)
+                        target_player.name,
+                        self._format_money_display(amount),
+                        self._format_money_display(self.get_player_money(target_player))
                     ))
                 else:
                     player.send_message(self.language_manager.GetText('MONEY_SYSTEM_ADD_MONEY_FAILED'))
             else:  # remove
                 if self.decrease_player_money(target_player, amount):
                     player.send_message(self.language_manager.GetText('MONEY_SYSTEM_REMOVE_MONEY_SUCCESS').format(
-                        target_player.name, amount, self.get_player_money(target_player)
+                        target_player.name,
+                        self._format_money_display(amount),
+                        self._format_money_display(self.get_player_money(target_player))
                     ))
                 else:
                     player.send_message(self.language_manager.GetText('MONEY_SYSTEM_REMOVE_MONEY_FAILED'))
@@ -4745,18 +5382,25 @@ class ARCCorePlugin(Plugin):
             content=content,
             on_close=lambda p=player, pg=from_page: self.show_op_all_lands_panel(p, pg)
         )
+        # 传送前往
         detail_panel.add_button(
             self.language_manager.GetText('OP_LAND_TELEPORT_BUTTON'),
             on_click=lambda p=player, l_id=land_id: self.op_teleport_to_land(p, l_id)
+        )
+        # 强制修改领地名称（所有领地均可用）
+        detail_panel.add_button(
+            self.language_manager.GetText('OP_LAND_RENAME_BUTTON'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_rename_land_panel(p, l_id, pg)
+        )
+        # 管理授权（添加/移除授权玩家）
+        detail_panel.add_button(
+            self.language_manager.GetText('OP_LAND_MANAGE_AUTH_BUTTON'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_auth_manage_panel(p, l_id, pg)
         )
         if self.is_public_land(land_id):
             detail_panel.add_button(
                 self.language_manager.GetText('OP_PUBLIC_LAND_SETTINGS_BUTTON'),
                 on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_settings_panel(p, l_id, pg)
-            )
-            detail_panel.add_button(
-                self.language_manager.GetText('LAND_DETAIL_PANEL_RENAME_BUTTON_TEXT'),
-                on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_rename_land_panel(p, l_id, pg)
             )
         else:
             detail_panel.add_button(
@@ -4843,7 +5487,145 @@ class ARCCorePlugin(Plugin):
             on_submit=try_change_name
         )
         player.send_form(rename_panel)
-    
+
+    def show_op_land_auth_manage_panel(self, player: Player, land_id: int, from_page: int):
+        """OP 领地授权管理面板（添加/移除授权玩家）"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.show_op_all_lands_panel(player, from_page)
+            return
+        auth_panel = ActionForm(
+            title=self.language_manager.GetText('OP_LAND_MANAGE_AUTH_BUTTON'),
+            content=self.language_manager.GetText('LAND_AUTH_MANAGE_TITLE'),
+            on_close=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_detail_panel(p, l_id, pg)
+        )
+        auth_panel.add_button(
+            self.language_manager.GetText('LAND_AUTH_ADD_BUTTON'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_add_land_auth_panel(p, l_id, pg)
+        )
+        if land_info['shared_users']:
+            auth_panel.add_button(
+                self.language_manager.GetText('LAND_AUTH_REMOVE_BUTTON'),
+                on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_remove_land_auth_panel(p, l_id, pg)
+            )
+        auth_panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_detail_panel(p, l_id, pg)
+        )
+        player.send_form(auth_panel)
+
+    def show_op_add_land_auth_panel(self, player: Player, land_id: int, from_page: int):
+        """OP 添加领地授权：选择在线玩家"""
+        online_players = [p for p in self.server.online_players]
+        if not online_players:
+            no_players_panel = ActionForm(
+                title=self.language_manager.GetText('LAND_AUTH_ADD_PANEL_TITLE'),
+                content=self.language_manager.GetText('NO_OTHER_PLAYERS_ONLINE'),
+                on_close=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_auth_manage_panel(p, l_id, pg)
+            )
+            player.send_form(no_players_panel)
+            return
+        add_panel = ActionForm(
+            title=self.language_manager.GetText('LAND_AUTH_ADD_PANEL_TITLE'),
+            content=self.language_manager.GetText('LAND_AUTH_SELECT_PLAYER_CONTENT'),
+            on_close=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_auth_manage_panel(p, l_id, pg)
+        )
+        for target_player in online_players:
+            add_panel.add_button(
+                self.language_manager.GetText('LAND_AUTH_ADD_TARGET_BUTTON').format(target_player.name),
+                on_click=lambda p=player, l_id=land_id, t=target_player, pg=from_page: self.op_add_land_auth(p, l_id, t, pg)
+            )
+        player.send_form(add_panel)
+
+    def show_op_remove_land_auth_panel(self, player: Player, land_id: int, from_page: int):
+        """OP 移除领地授权：选择要移除的授权玩家"""
+        land_info = self.get_land_info(land_id)
+        if not land_info or not land_info['shared_users']:
+            no_auth_panel = ActionForm(
+                title=self.language_manager.GetText('LAND_AUTH_REMOVE_PANEL_TITLE'),
+                content=self.language_manager.GetText('LAND_AUTH_NO_SHARED_USERS'),
+                on_close=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_auth_manage_panel(p, l_id, pg)
+            )
+            player.send_form(no_auth_panel)
+            return
+        remove_panel = ActionForm(
+            title=self.language_manager.GetText('LAND_AUTH_REMOVE_PANEL_TITLE'),
+            content=self.language_manager.GetText('LAND_AUTH_SELECT_REMOVE_CONTENT'),
+            on_close=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_auth_manage_panel(p, l_id, pg)
+        )
+        for shared_xuid in land_info['shared_users']:
+            user_name = self.get_player_name_by_xuid(shared_xuid)
+            if user_name:
+                remove_panel.add_button(
+                    self.language_manager.GetText('LAND_AUTH_REMOVE_TARGET_BUTTON').format(user_name),
+                    on_click=lambda p=player, l_id=land_id, uid=shared_xuid, name=user_name, pg=from_page: self.op_remove_land_auth(p, l_id, uid, name, pg)
+                )
+        player.send_form(remove_panel)
+
+    def op_add_land_auth(self, player: Player, land_id: int, target_player: Player, from_page: int):
+        """OP 执行添加领地授权"""
+        try:
+            land_info = self.get_land_info(land_id)
+            if not land_info:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.show_op_land_auth_manage_panel(player, land_id, from_page)
+                return
+            target_xuid = str(target_player.xuid)
+            if target_xuid in land_info['shared_users']:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_ALREADY_EXISTS').format(target_player.name))
+                self.show_op_land_auth_manage_panel(player, land_id, from_page)
+                return
+            shared_users = list(land_info['shared_users'])
+            shared_users.append(target_xuid)
+            success = self.database_manager.execute(
+                "UPDATE lands SET shared_users = ? WHERE land_id = ?",
+                (json.dumps(shared_users), land_id)
+            )
+            if success:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_SUCCESS_ADD').format(land_id, target_player.name))
+                target_player.send_message(self.language_manager.GetText('LAND_AUTH_NOTIFICATION').format(
+                    player.name, land_id, land_info['land_name']
+                ))
+            else:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_ADD'))
+        except Exception as e:
+            self.logger.error(f"OP add land auth error: {str(e)}")
+            player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_ADD'))
+        self.show_op_land_auth_manage_panel(player, land_id, from_page)
+
+    def op_remove_land_auth(self, player: Player, land_id: int, target_xuid: str, target_name: str, from_page: int):
+        """OP 执行移除领地授权"""
+        try:
+            land_info = self.get_land_info(land_id)
+            if not land_info:
+                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.show_op_land_auth_manage_panel(player, land_id, from_page)
+                return
+            if target_xuid not in land_info['shared_users']:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_NOT_EXISTS').format(target_name))
+                self.show_op_land_auth_manage_panel(player, land_id, from_page)
+                return
+            shared_users = list(land_info['shared_users'])
+            shared_users.remove(target_xuid)
+            success = self.database_manager.execute(
+                "UPDATE lands SET shared_users = ? WHERE land_id = ?",
+                (json.dumps(shared_users), land_id)
+            )
+            if success:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_SUCCESS_REMOVE').format(target_name, land_id))
+                target_player = self.server.get_player(target_name)
+                if target_player:
+                    target_player.send_message(self.language_manager.GetText('LAND_AUTH_REMOVE_NOTIFICATION').format(
+                        player.name, land_id, land_info['land_name']
+                    ))
+            else:
+                player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_REMOVE'))
+        except Exception as e:
+            self.logger.error(f"OP remove land auth error: {str(e)}")
+            player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_REMOVE'))
+        self.show_op_land_auth_manage_panel(player, land_id, from_page)
+
     def show_op_public_land_settings_panel(self, player: Player, land_id: int, from_page: int):
         """OP 公共领地设置面板：开放互动/开放爆炸/开放生物互动/开放生物伤害"""
         land_info = self.get_land_info(land_id)
@@ -4983,11 +5765,11 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Get money data error: {str(e)}")
             return {}
 
-    def api_get_player_money(self, player_name: str) -> int:
+    def api_get_player_money(self, player_name: str) -> float:
         """
         获取目标玩家的金钱（API封装器）
         :param player_name: 玩家名称
-        :return: 玩家金钱数量
+        :return: 玩家金钱数量（支持小数，精确到分）
         """
         return self.get_player_money_by_name(player_name)
 
@@ -5003,11 +5785,11 @@ class ARCCorePlugin(Plugin):
             if result:
                 player_name = self.get_player_name_by_xuid(result['xuid'])
                 if player_name:
-                    return [player_name, result['money']]
-            return ["", 0]
+                    return [player_name, self._round_money(result['money'])]
+            return ["", 0.0]
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money top error: {str(e)}")
-            return ["", 0]
+            return ["", 0.0]
 
     def api_get_poorest_player_money_data(self) -> list:
         """
@@ -5021,20 +5803,20 @@ class ARCCorePlugin(Plugin):
             if result:
                 player_name = self.get_player_name_by_xuid(result['xuid'])
                 if player_name:
-                    return [player_name, result['money']]
-            return ["", 0]
+                    return [player_name, self._round_money(result['money'])]
+            return ["", 0.0]
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money bottom error: {str(e)}")
-            return ["", 0]
+            return ["", 0.0]
 
-    def api_change_player_money(self, player_name: str, money_to_change: int) -> bool:
+    def api_change_player_money(self, player_name: str, money_to_change: float) -> bool:
         """
         改变目标玩家的金钱（API封装器）
         :param player_name: 玩家名称
-        :param money_to_change: 要改变的金钱数量（正数为增加，负数为减少）
+        :param money_to_change: 要改变的金钱数量（正数为增加，负数为减少），支持小数精确到分
         :return: 是否操作成功
         """
-        if money_to_change == 0:
+        if self._round_money(money_to_change) == 0:
             self.logger.error(f'{ColorFormat.RED}[ARC Core]Money change cannot be zero...')
             return False
         

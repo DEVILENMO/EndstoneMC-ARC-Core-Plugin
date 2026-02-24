@@ -51,3 +51,9 @@ class LanguageManager:
             return ''
         else:
             return LanguageManager.language_dict[target_lang][key].replace('\\n', '\n')
+
+    def ReloadCurrentLanguage(self):
+        """重新从文件加载当前语言（实例对应的 language_code）"""
+        if self.language_code in LanguageManager.language_dict:
+            LanguageManager.language_dict[self.language_code].clear()
+        self._load_language_file()

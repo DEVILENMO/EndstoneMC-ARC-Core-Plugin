@@ -43,3 +43,8 @@ class SettingManager:
         with self.setting_file_path.open("w", encoding="utf-8") as f:
             for k, v in SettingManager.setting_dict.items():
                 f.write(f"{k}={v}\n")
+
+    def Reload(self):
+        """重新从文件加载配置（清空内存后重新读取 core_setting.yml）"""
+        SettingManager.setting_dict.clear()
+        self._load_setting_file()
