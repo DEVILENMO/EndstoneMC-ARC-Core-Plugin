@@ -44,14 +44,19 @@ class ARCCorePlugin(Plugin):
             "usages": ["/spawn"],
             "permissions": ["arc_core.command.spawn"],
         },
-        "pos1": {
+        "landpos1": {
             "description": "Set new land corner 1.",
-            "usages": ["/pos1"],
+            "usages": ["/landpos1"],
             "permissions": ["arc_core.command.set_land_corner"],
         },
-        "pos2": {
+        "landpos2": {
             "description": "Set new land corner 2.",
-            "usages": ["/pos2"],
+            "usages": ["/landpos2"],
+            "permissions": ["arc_core.command.set_land_corner"],
+        },
+        "landbuy": {
+            "description": "Buy the pending new land.",
+            "usages": ["/landbuy"],
             "permissions": ["arc_core.command.set_land_corner"],
         }
     }
@@ -111,7 +116,7 @@ class ARCCorePlugin(Plugin):
         try:
             self.land_price = int(self.land_price)
         except (ValueError, TypeError):
-            self.land_price = 1000
+            self.land_price = 100
         self.land_sell_refund_coefficient = self.setting_manager.GetSetting('LAND_SELL_REFUND_COEFFICIENT')
         try:
             self.land_sell_refund_coefficient = float(self.land_sell_refund_coefficient)
@@ -122,7 +127,8 @@ class ARCCorePlugin(Plugin):
             self.land_min_size = int(self.land_min_size)
         except (ValueError, TypeError):
             self.land_min_size = 5  # 默认最小尺寸为5
-        self.player_new_land_creation_info = {}
+        self.player_new_land_creation_info = {}  # {name: {'dimension': str, 'min_x': int, 'max_x': int, 'min_y': int, 'max_y': int, 'min_z': int, 'max_z': int}}
+        self.player_land_pos1 = {}  # {name: {'dimension': str, 'x': int, 'y': int, 'z': int}} 暂存/landpos1
 
         # OP坐标记录与上次执行指令（空输入时重复执行）
         self.op_coordinate1_dict = {}
@@ -417,34 +423,66 @@ class ARCCorePlugin(Plugin):
             else:
                 sender.send_message(self.language_manager.GetText('NO_SPAWN_POSITION_SET_MESSAGE'))
             return True
-        if command.name == 'pos1':
+        if command.name == 'landpos1':
             if not isinstance(sender, Player):
                 sender.send_message(f'[ARC Core]This command only works for players.')
                 return True
             if not self.if_player_logined(sender):
                 self.show_main_menu(sender)
                 return True
-            self.player_new_land_creation_info[sender.name] = [sender.location.dimension.name, (math.floor(sender.location.x), math.floor(sender.location.z))]
+            self.player_land_pos1[sender.name] = {
+                'dimension': sender.location.dimension.name,
+                'x': math.floor(sender.location.x),
+                'y': math.floor(sender.location.y),
+                'z': math.floor(sender.location.z)
+            }
             sender.send_message(self.language_manager.GetText('CREATE_NEW_LAND_POS1_SET').format(
-                self.player_new_land_creation_info[sender.name][0],
-                self.player_new_land_creation_info[sender.name][1])
+                self.player_land_pos1[sender.name]['dimension'],
+                (self.player_land_pos1[sender.name]['x'],
+                 self.player_land_pos1[sender.name]['y'],
+                 self.player_land_pos1[sender.name]['z']))
             )
             return True
-        if command.name == 'pos2':
+        if command.name == 'landpos2':
             if not isinstance(sender, Player):
                 sender.send_message(f'[ARC Core]This command only works for players.')
                 return True
             if not self.if_player_logined(sender):
                 self.show_main_menu(sender)
                 return True
-            if not sender.name in self.player_new_land_creation_info or len(self.player_new_land_creation_info[sender.name]) != 2:
+            if sender.name not in self.player_land_pos1:
                 sender.send_message(self.language_manager.GetText('CREATE_NEW_LAND_POS2_SET_FAIL_POS1_NOT_SET'))
                 return True
-            if sender.location.dimension.name != self.player_new_land_creation_info[sender.name][0]:
+            pos1 = self.player_land_pos1[sender.name]
+            if sender.location.dimension.name != pos1['dimension']:
                 sender.send_message(self.language_manager.GetText('CREATE_NEW_LAND_POS2_SET_FAIL_DIMENSION_CHANGED'))
                 return True
-            self.player_new_land_creation_info[sender.name].append((math.floor(sender.location.x), math.floor(sender.location.z)))
+            x2 = math.floor(sender.location.x)
+            y2 = math.floor(sender.location.y)
+            z2 = math.floor(sender.location.z)
+            self.player_new_land_creation_info[sender.name] = {
+                'dimension': pos1['dimension'],
+                'min_x': min(pos1['x'], x2),
+                'max_x': max(pos1['x'], x2),
+                'min_y': min(pos1['y'], y2),
+                'max_y': max(pos1['y'], y2),
+                'min_z': min(pos1['z'], z2),
+                'max_z': max(pos1['z'], z2)
+            }
+            del self.player_land_pos1[sender.name]
+            sender.send_message(self.language_manager.GetText('CREATE_NEW_LAND_POS2_SET').format(
+                (x2, y2, z2)))
             self.show_new_land_info(sender)
+            self._visualize_pending_land(sender)
+            return True
+        if command.name == 'landbuy':
+            if not isinstance(sender, Player):
+                sender.send_message(f'[ARC Core]This command only works for players.')
+                return True
+            if not self.if_player_logined(sender):
+                self.show_main_menu(sender)
+                return True
+            self._execute_land_buy(sender)
             return True
         return False
 
@@ -636,11 +674,19 @@ class ARCCorePlugin(Plugin):
         # 获取生物位置
         actor_location = event.actor.location
         dimension = actor_location.dimension.name
-        pos = (math.floor(actor_location.x), math.floor(actor_location.z))
-        
+        ax = math.floor(actor_location.x)
+        ay = math.floor(actor_location.y)
+        az = math.floor(actor_location.z)
+
         # 检查生物是否在领地内
-        land_id = self.get_land_at_pos(dimension, pos[0], pos[1])
+        land_id = self.get_land_at_pos(dimension, ax, az, ay)
         if land_id is not None:
+            # 先检查子领地权限
+            sub_land_id = self.get_sub_land_at_pos(land_id, ax, ay, az)
+            if sub_land_id is not None:
+                sub_info = self.get_sub_land_info(sub_land_id)
+                if sub_info and self._check_sub_land_permission(event.player, sub_info):
+                    return
             land_info = self.get_land_info(land_id)
             if land_info and not land_info.get('allow_actor_interaction', False):
                 # 检查玩家是否有权限（领地主人或授权用户）
@@ -663,11 +709,19 @@ class ARCCorePlugin(Plugin):
         # 获取被攻击生物位置
         actor_location = event.actor.location
         dimension = actor_location.dimension.name
-        pos = (math.floor(actor_location.x), math.floor(actor_location.z))
-        
+        ax = math.floor(actor_location.x)
+        ay = math.floor(actor_location.y)
+        az = math.floor(actor_location.z)
+
         # 检查生物是否在领地内
-        land_id = self.get_land_at_pos(dimension, pos[0], pos[1])
+        land_id = self.get_land_at_pos(dimension, ax, az, ay)
         if land_id is not None:
+            # 先检查子领地权限：有子领地权限则直接放行
+            sub_land_id = self.get_sub_land_at_pos(land_id, ax, ay, az)
+            if sub_land_id is not None:
+                sub_info = self.get_sub_land_info(sub_land_id)
+                if sub_info and self._check_sub_land_permission(attacker, sub_info):
+                    return
             land_info = self.get_land_info(land_id)
             if not land_info:
                 return
@@ -697,6 +751,16 @@ class ARCCorePlugin(Plugin):
                     event.is_cancelled = True
                     attacker.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_DENIED'))
 
+    def _check_sub_land_permission(self, player: Player, sub_land_info: dict) -> bool:
+        """检查玩家是否拥有子领地权限（主人或授权用户）"""
+        try:
+            owner_xuid = sub_land_info.get('owner_xuid', '')
+            shared_users = sub_land_info.get('shared_users', [])
+            return owner_xuid == str(player.xuid) or str(player.xuid) in shared_users
+        except Exception as e:
+            self.logger.error(f"Check sub land permission error: {str(e)}")
+            return False
+
     def _check_land_permission(self, player: Player, land_info: dict) -> bool:
         """
         检查玩家是否有领地权限（领地主人或授权用户）；公共领地仅 OP 有权限
@@ -715,9 +779,17 @@ class ARCCorePlugin(Plugin):
             return False
 
     def land_operation_check(self, player: Player, dimension: str, pos: tuple):
-        # print("land_operation_check", player.name, dimension, pos)
-        land_id = self.get_land_at_pos(dimension, pos[0], pos[2])
+        x, y, z = pos[0], (pos[1] if len(pos) > 1 else None), pos[2]
+        land_id = self.get_land_at_pos(dimension, x, z, y)
         if land_id is not None:
+            # 先检查子领地权限
+            if y is not None:
+                sub_land_id = self.get_sub_land_at_pos(land_id, int(x), int(y), int(z))
+                if sub_land_id is not None:
+                    sub_info = self.get_sub_land_info(sub_land_id)
+                    if sub_info and self._check_sub_land_permission(player, sub_info):
+                        return True
+            # 回落到父领地权限检查
             land_info = self.get_land_info(land_id)
             if not land_info:
                 return True
@@ -735,9 +807,17 @@ class ARCCorePlugin(Plugin):
 
     def land_interact_check(self, player: Player, dimension: str, pos: tuple):
         """检查玩家是否有权限在领地内进行方块互动"""
-        # print("land_interact_check", player.name, dimension, pos)
-        land_id = self.get_land_at_pos(dimension, pos[0], pos[2])
+        x, y, z = pos[0], (pos[1] if len(pos) > 1 else None), pos[2]
+        land_id = self.get_land_at_pos(dimension, x, z, y)
         if land_id is not None:
+            # 先检查子领地权限
+            if y is not None:
+                sub_land_id = self.get_sub_land_at_pos(land_id, int(x), int(y), int(z))
+                if sub_land_id is not None:
+                    sub_info = self.get_sub_land_info(sub_land_id)
+                    if sub_info and self._check_sub_land_permission(player, sub_info):
+                        return True
+            # 回落到父领地权限检查
             land_info = self.get_land_info(land_id)
             if not land_info:
                 return True
@@ -785,7 +865,7 @@ class ARCCorePlugin(Plugin):
                         # 获取玩家位置信息
                         player_pos = self.get_player_position_vector(player)
                         dimension = player.location.dimension.name
-                        land_id = self.get_land_at_pos(dimension, player_pos[0], player_pos[2])
+                        land_id = self.get_land_at_pos(dimension, player_pos[0], player_pos[2], player_pos[1])
                         
                         # 使用锁保护共享数据
                         with self.position_thread_lock:
@@ -819,10 +899,7 @@ class ARCCorePlugin(Plugin):
                                                     # 显示领地边界粒子效果
                                                     land_info = self.get_land_info(land_id)
                                                     if land_info:
-                                                        pos = self.get_player_position_vector(target_player)
-                                                        if pos:
-                                                            y_coord = math.ceil(pos[1])
-                                                            self.display_land_particle_boundary(target_player, land_info, y_coord)
+                                                        self.display_land_particle_boundary(target_player, land_info)
                                                     
                                                 except Exception as e:
                                                     self.logger.warning(f"[ARC Core]Failed to send land message to {target_player.name}: {str(e)}")
@@ -905,6 +982,7 @@ class ARCCorePlugin(Plugin):
         self.init_economy_table()
         self._upgrade_player_economy_table_to_float()
         self.init_land_tables()
+        self.init_sub_land_table()
         self.init_teleport_tables()
 
     # Player basic info
@@ -3344,6 +3422,8 @@ class ARCCorePlugin(Plugin):
                 'dimension': 'TEXT NOT NULL',  # 领地所在维度
                 'min_x': 'INTEGER NOT NULL',  # 最小X坐标
                 'max_x': 'INTEGER NOT NULL',  # 最大X坐标
+                'min_y': 'INTEGER NOT NULL DEFAULT 0',  # 最小Y坐标
+                'max_y': 'INTEGER NOT NULL DEFAULT 255',  # 最大Y坐标
                 'min_z': 'INTEGER NOT NULL',  # 最小Z坐标
                 'max_z': 'INTEGER NOT NULL',  # 最大Z坐标
                 'tp_x': 'REAL NOT NULL',  # 传送点X坐标
@@ -3354,7 +3434,8 @@ class ARCCorePlugin(Plugin):
                 'allow_public_interact': 'INTEGER DEFAULT 0',  # 是否对所有人开放方块互动 (0=不开放, 1=开放)
                 'allow_actor_interaction': 'INTEGER DEFAULT 0',  # 是否允许生物互动 (0=不允许, 1=允许)
                 'allow_actor_damage': 'INTEGER DEFAULT 0',  # 是否允许攻击生物 (0=不允许, 1=允许)
-                'owner_paid_money': 'REAL DEFAULT 0'  # 购买时玩家实际支付的金钱，用于出售时按实付退款
+                'owner_paid_money': 'REAL DEFAULT 0',  # 购买时玩家实际支付的金钱，用于出售时按实付退款
+                'allow_non_public_land': 'INTEGER DEFAULT 0'  # 公共领地是否允许玩家在其中圈私人领地
             }
 
             # 检查表是否已经存在
@@ -3375,73 +3456,47 @@ class ARCCorePlugin(Plugin):
             return False
 
     def _upgrade_land_table(self) -> bool:
-        """升级领地数据表结构，为老用户添加新字段"""
+        """升级领地数据表结构，为老用户添加新字段。使用 _column_exists 判断，避免依赖 execute() 的异常机制（execute 内部会吞掉异常）"""
         try:
-            # 尝试添加allow_explosion字段，如果字段已存在会失败但不影响功能
-            try:
-                self.database_manager.execute("ALTER TABLE lands ADD COLUMN allow_explosion INTEGER DEFAULT 0")
-                print("[ARC Core]Upgraded land table: added allow_explosion column")
-            except Exception as alter_error:
-                # 字段可能已经存在，这是正常的
-                if "duplicate column name" in str(alter_error).lower() or "already exists" in str(alter_error).lower():
-                    print("[ARC Core]Land table already has allow_explosion column")
+            def _add_column(col: str, definition: str):
+                if not self._column_exists('lands', col):
+                    ok = self.database_manager.execute(f"ALTER TABLE lands ADD COLUMN {col} {definition}")
+                    if ok:
+                        print(f"[ARC Core]Upgraded land table: added {col} column")
+                    else:
+                        print(f"[ARC Core]Failed to add {col} column")
+                    return ok
+                return None  # 列已存在，无需操作
+
+            _add_column('allow_explosion', 'INTEGER DEFAULT 0')
+            _add_column('allow_public_interact', 'INTEGER DEFAULT 0')
+            _add_column('allow_actor_interaction', 'INTEGER DEFAULT 0')
+            _add_column('allow_actor_damage', 'INTEGER DEFAULT 0')
+
+            # owner_paid_money 需要在首次添加时为存量领地回填估算价格（一次性迁移，不得重复执行）
+            if not self._column_exists('lands', 'owner_paid_money'):
+                ok = self.database_manager.execute("ALTER TABLE lands ADD COLUMN owner_paid_money REAL DEFAULT 0")
+                if ok:
+                    print("[ARC Core]Upgraded land table: added owner_paid_money column, initializing values for existing lands...")
+                    land_price_raw = self.setting_manager.GetSetting('LAND_PRICE')
+                    try:
+                        upgrade_land_price = float(int(land_price_raw)) if land_price_raw is not None else 100.0
+                    except (ValueError, TypeError):
+                        upgrade_land_price = 100.0
+                    self.database_manager.execute(
+                        "UPDATE lands SET owner_paid_money = (max_x - min_x + 1) * (max_z - min_z + 1) * ?",
+                        (upgrade_land_price,)
+                    )
+                    print(f"[ARC Core]owner_paid_money initialized (land_price={upgrade_land_price}, one-time migration only)")
                 else:
-                    print(f"[ARC Core]Could not add allow_explosion column: {str(alter_error)}")
-            
-            # 尝试添加allow_public_interact字段，如果字段已存在会失败但不影响功能
-            try:
-                self.database_manager.execute("ALTER TABLE lands ADD COLUMN allow_public_interact INTEGER DEFAULT 0")
-                print("[ARC Core]Upgraded land table: added allow_public_interact column")
-            except Exception as alter_error:
-                # 字段可能已经存在，这是正常的
-                if "duplicate column name" in str(alter_error).lower() or "already exists" in str(alter_error).lower():
-                    print("[ARC Core]Land table already has allow_public_interact column")
-                else:
-                    print(f"[ARC Core]Could not add allow_public_interact column: {str(alter_error)}")
-            
-            # 尝试添加allow_actor_interaction字段，如果字段已存在会失败但不影响功能
-            try:
-                self.database_manager.execute("ALTER TABLE lands ADD COLUMN allow_actor_interaction INTEGER DEFAULT 0")
-                print("[ARC Core]Upgraded land table: added allow_actor_interaction column")
-            except Exception as alter_error:
-                # 字段可能已经存在，这是正常的
-                if "duplicate column name" in str(alter_error).lower() or "already exists" in str(alter_error).lower():
-                    print("[ARC Core]Land table already has allow_actor_interaction column")
-                else:
-                    print(f"[ARC Core]Could not add allow_actor_interaction column: {str(alter_error)}")
-            
-            # 尝试添加allow_actor_damage字段，如果字段已存在会失败但不影响功能
-            try:
-                self.database_manager.execute("ALTER TABLE lands ADD COLUMN allow_actor_damage INTEGER DEFAULT 0")
-                print("[ARC Core]Upgraded land table: added allow_actor_damage column")
-            except Exception as alter_error:
-                # 字段可能已经存在，这是正常的
-                if "duplicate column name" in str(alter_error).lower() or "already exists" in str(alter_error).lower():
-                    print("[ARC Core]Land table already has allow_actor_damage column")
-                else:
-                    print(f"[ARC Core]Could not add allow_actor_damage column: {str(alter_error)}")
-            
-            # 尝试添加 owner_paid_money 字段（购买时实付金额，出售时按此退款）
-            try:
-                self.database_manager.execute("ALTER TABLE lands ADD COLUMN owner_paid_money REAL DEFAULT 0")
-                print("[ARC Core]Upgraded land table: added owner_paid_money column")
-                # 注意：此时 self.land_price 尚未从配置加载，需从 setting_manager 读取
-                land_price_raw = self.setting_manager.GetSetting('LAND_PRICE')
-                try:
-                    upgrade_land_price = float(int(land_price_raw)) if land_price_raw is not None else 1000.0
-                except (ValueError, TypeError):
-                    upgrade_land_price = 1000.0
-                self.database_manager.execute(
-                    "UPDATE lands SET owner_paid_money = (max_x - min_x + 1) * (max_z - min_z + 1) * ?",
-                    (upgrade_land_price,)
-                )
-                print("[ARC Core]Initialized owner_paid_money for existing lands (area * current land_price)")
-            except Exception as alter_error:
-                if "duplicate column name" in str(alter_error).lower() or "already exists" in str(alter_error).lower():
-                    print("[ARC Core]Land table already has owner_paid_money column")
-                else:
-                    print(f"[ARC Core]Could not add owner_paid_money column: {str(alter_error)}")
-            
+                    print("[ARC Core]Failed to add owner_paid_money column")
+
+            _add_column('allow_non_public_land', 'INTEGER DEFAULT 0')
+            _add_column('min_y', 'INTEGER NOT NULL DEFAULT 0')
+            _add_column('max_y', 'INTEGER NOT NULL DEFAULT 255')
+            # allow_sub_land 已废弃，保留迁移仅为兼容旧数据库，不做任何逻辑依赖
+            _add_column('allow_sub_land', 'INTEGER DEFAULT 0')
+
             return True
         except Exception as e:
             print(f"[ARC Core]Upgrade land table error: {str(e)}")
@@ -3511,35 +3566,21 @@ class ARCCorePlugin(Plugin):
 
         return chunk_keys
 
-    def create_land(self, owner_xuid: str, land_name: str, dimension: str,
-                    min_x: int, max_x: int, min_z: int, max_z: int,
-                    tp_x: float, tp_y: float, tp_z: float, owner_paid_money: float = 0.0) -> Optional[int]:
-        """创建新领地。owner_paid_money 为购买时玩家实际支付的金钱，出售时按此退款。"""
+    def _register_land_to_chunk_mapping(self, land_id: int, dimension: str,
+                                        min_x: int, max_x: int, min_z: int, max_z: int) -> bool:
+        """
+        将一块领地的 ID 注册到对应维度的区块映射表中（根据 XZ 范围计算涉及的区块并写入）。
+        调用前需保证该维度的区块表已存在（可先 _ensure_dimension_table）。
+        :return: 是否成功
+        """
         try:
-            # 确保维度表存在
-            if not self._ensure_dimension_table(dimension):
-                return None
-
-            # 插入领地基本信息
-            self.database_manager.execute(
-                "INSERT INTO lands (owner_xuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, shared_users, allow_explosion, allow_public_interact, owner_paid_money) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (owner_xuid, land_name, dimension, min_x, max_x, min_z, max_z, tp_x, tp_y, tp_z, '[]', 0, 0, float(owner_paid_money))
-            )
-            result = self.database_manager.query_one("SELECT last_insert_rowid() as land_id")
-            land_id = result['land_id']
-
-            # 获取对应维度的区块表
             chunk_table = self._get_dimension_table(dimension)
-
-            # 更新区块映射
             affected_chunks = self._get_affected_chunks(min_x, max_x, min_z, max_z)
             for chunk_key in affected_chunks:
                 existing = self.database_manager.query_one(
                     f"SELECT land_ids FROM {chunk_table} WHERE chunk_key = ?",
                     (chunk_key,)
                 )
-
                 if existing:
                     land_ids = json.loads(existing['land_ids'])
                     land_ids.append(land_id)
@@ -3552,19 +3593,80 @@ class ARCCorePlugin(Plugin):
                 else:
                     self.database_manager.insert(
                         chunk_table,
-                        {
-                            'chunk_key': chunk_key,
-                            'land_ids': json.dumps([land_id])
-                        }
+                        {'chunk_key': chunk_key, 'land_ids': json.dumps([land_id])}
                     )
+            return True
+        except Exception as e:
+            self.logger.error(f"Register land to chunk mapping error: {str(e)}")
+            return False
+
+    def rebuild_chunk_land_mapping(self) -> tuple[bool, str]:
+        """
+        根据 lands 表当前数据重建所有维度的区块-领地映射表。
+        会先删除所有 chunk_lands_* 表再按领地边界重新生成。适用于在数据库里直接改了领地边界后的同步。
+        :return: (是否成功, 结果描述信息)
+        """
+        try:
+            tables = self.database_manager.query_all(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'chunk_lands_%'"
+            )
+            for row in tables:
+                self.database_manager.execute(f"DROP TABLE IF EXISTS \"{row['name']}\"")
+
+            lands = self.database_manager.query_all(
+                "SELECT land_id, dimension, min_x, max_x, min_z, max_z FROM lands"
+            )
+            if not lands:
+                return True, self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_NO_LANDS')
+
+            dimensions_done = set()
+            for land in lands:
+                dimension = land['dimension']
+                if dimension not in dimensions_done:
+                    if not self._ensure_dimension_table(dimension):
+                        self.logger.warning(f"Rebuild chunk mapping: failed to ensure dimension table for {dimension}")
+                        continue
+                    dimensions_done.add(dimension)
+                self._register_land_to_chunk_mapping(
+                    land['land_id'], dimension,
+                    land['min_x'], land['max_x'], land['min_z'], land['max_z']
+                )
+
+            num_lands = len(lands)
+            num_dims = len(dimensions_done)
+            return True, self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_SUCCESS').format(
+                num_dims, num_lands
+            )
+        except Exception as e:
+            self.logger.error(f"Rebuild chunk land mapping error: {str(e)}")
+            return False, self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_FAILED').format(str(e))
+
+    def create_land(self, owner_xuid: str, land_name: str, dimension: str,
+                    min_x: int, max_x: int, min_y: int, max_y: int, min_z: int, max_z: int,
+                    tp_x: float, tp_y: float, tp_z: float, owner_paid_money: float = 0.0) -> Optional[int]:
+        """创建新领地。owner_paid_money 为购买时玩家实际支付的金钱，出售时按此退款。"""
+        try:
+            if not self._ensure_dimension_table(dimension):
+                return None
+
+            self.database_manager.execute(
+                "INSERT INTO lands (owner_xuid, land_name, dimension, min_x, max_x, min_y, max_y, min_z, max_z, tp_x, tp_y, tp_z, shared_users, allow_explosion, allow_public_interact, owner_paid_money) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (owner_xuid, land_name, dimension, min_x, max_x, min_y, max_y, min_z, max_z, tp_x, tp_y, tp_z, '[]', 0, 0, float(owner_paid_money))
+            )
+            result = self.database_manager.query_one("SELECT last_insert_rowid() as land_id")
+            land_id = result['land_id']
+
+            if not self._register_land_to_chunk_mapping(land_id, dimension, min_x, max_x, min_z, max_z):
+                self.logger.error("Create land: chunk mapping failed, land_id=%s", land_id)
 
             return land_id
         except Exception as e:
             self.logger.error(f"Create land error: {str(e)}")
             return None
 
-    def get_land_at_pos(self, dimension: str, x: int, z: int) -> Optional[int]:
-        """获取指定位置的领地ID"""
+    def get_land_at_pos(self, dimension: str, x: int, z: int, y: int = None) -> Optional[int]:
+        """获取指定位置的领地ID，可选y坐标进行三维精确判断"""
         try:
             x_int = int(x)
             z_int = int(z)
@@ -3585,6 +3687,7 @@ class ARCCorePlugin(Plugin):
                 return None
 
             land_ids = json.loads(chunk_data['land_ids'])
+            public_land_id = None  # 备选：公共领地（优先级低）
             for land_id in land_ids:
                 land_info = self.database_manager.query_one(
                     "SELECT * FROM lands WHERE land_id = ?",
@@ -3594,9 +3697,18 @@ class ARCCorePlugin(Plugin):
                         land_info['min_x'] <= x <= land_info['max_x'] and
                         land_info['min_z'] <= z <= land_info['max_z']
                 ):
-                    return land_id
+                    if y is not None:
+                        land_min_y = land_info.get('min_y', 0)
+                        land_max_y = land_info.get('max_y', 255)
+                        if not (land_min_y <= int(y) <= land_max_y):
+                            continue
+                    # 私人领地（非公共）优先返回；公共领地作为兜底
+                    if land_info['owner_xuid'] != self.PUBLIC_LAND_OWNER_XUID:
+                        return land_id
+                    else:
+                        public_land_id = land_id
 
-            return None
+            return public_land_id
         except Exception as e:
             self.logger.error(f"Get land at pos error: {str(e)}")
             return None
@@ -3649,13 +3761,18 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"Delete land error: {str(e)}")
             return False
 
-    def check_land_availability(self, dimension: str, min_x: int, max_x: int, min_z: int, max_z: int) -> tuple[bool, str]:
+    def check_land_availability(self, dimension: str, min_x: int, max_x: int, min_y: int, max_y: int, min_z: int, max_z: int) -> tuple[bool, Optional[str], Optional[list]]:
+        """
+        检查领地范围是否可用（无重叠且满足最小间距）。
+        返回 (是否可用, 失败原因键或None, 重叠的领地ID列表或None)
+        """
         try:
             # 确保坐标顺序正确
             min_x, max_x = min(min_x, max_x), max(min_x, max_x)
+            min_y, max_y = min(min_y, max_y), max(min_y, max_y)
             min_z, max_z = min(min_z, max_z), max(min_z, max_z)
 
-            # 扩展检查范围以包含最小距离
+            # 扩展检查范围以包含最小距离（仅XZ方向）
             check_min_x = min_x - self.land_min_distance
             check_max_x = max_x + self.land_min_distance
             check_min_z = min_z - self.land_min_distance
@@ -3666,7 +3783,7 @@ class ARCCorePlugin(Plugin):
 
             # 确保维度表存在
             if not self._ensure_dimension_table(dimension):
-                return False, 'SYSTEM_ERROR'
+                return False, 'SYSTEM_ERROR', None
 
             chunk_table = self._get_dimension_table(dimension)
 
@@ -3681,7 +3798,8 @@ class ARCCorePlugin(Plugin):
                     land_ids = json.loads(chunk_data['land_ids'])
                     nearby_land_ids.update(land_ids)
 
-            # 检查每个相关领地
+            # 检查每个相关领地，收集所有重叠的领地ID
+            overlapping_land_ids = []
             for land_id in nearby_land_ids:
                 land_info = self.database_manager.query_one(
                     "SELECT * FROM lands WHERE land_id = ? AND dimension = ?",
@@ -3691,16 +3809,252 @@ class ARCCorePlugin(Plugin):
                 if not land_info:
                     continue
 
-                # 使用扩展后的范围检查是否与现有领地重叠
-                if (check_min_x <= land_info['max_x'] and check_max_x >= land_info['min_x'] and
-                        check_min_z <= land_info['max_z'] and check_max_z >= land_info['min_z']):
-                    return False, 'LAND_MIN_DISTANCE_NOT_SATISFIED'
+                # 跳过允许玩家在内圈私人领地的公共领地
+                if (land_info.get('owner_xuid') == self.PUBLIC_LAND_OWNER_XUID and
+                        land_info.get('allow_non_public_land', 0)):
+                    continue
 
-            return True, None
+                exist_min_y = land_info.get('min_y', 0)
+                exist_max_y = land_info.get('max_y', 255)
+
+                # 先判断Y轴是否有重叠，再判断XZ平面
+                y_overlap = (min_y <= exist_max_y and max_y >= exist_min_y)
+                xz_overlap = (check_min_x <= land_info['max_x'] and check_max_x >= land_info['min_x'] and
+                              check_min_z <= land_info['max_z'] and check_max_z >= land_info['min_z'])
+
+                if y_overlap and xz_overlap:
+                    overlapping_land_ids.append(land_id)
+
+            if overlapping_land_ids:
+                return False, 'LAND_MIN_DISTANCE_NOT_SATISFIED', overlapping_land_ids
+
+            return True, None, None
 
         except Exception as e:
             self.logger.error(f"[ARC Core]Check land availability error: {str(e)}")
+            return False, 'SYSTEM_ERROR', None
+
+    # ─── Sub-land System ────────────────────────────────────────────────────────
+
+    def init_sub_land_table(self) -> bool:
+        """初始化子领地数据表"""
+        try:
+            sub_land_fields = {
+                'sub_land_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'parent_land_id': 'INTEGER NOT NULL',
+                'owner_xuid': 'TEXT NOT NULL',
+                'sub_land_name': 'TEXT NOT NULL',
+                'min_x': 'INTEGER NOT NULL',
+                'max_x': 'INTEGER NOT NULL',
+                'min_y': 'INTEGER NOT NULL DEFAULT 0',
+                'max_y': 'INTEGER NOT NULL DEFAULT 255',
+                'min_z': 'INTEGER NOT NULL',
+                'max_z': 'INTEGER NOT NULL',
+                'shared_users': 'TEXT DEFAULT "[]"'
+            }
+            return self.database_manager.create_table('sub_lands', sub_land_fields)
+        except Exception as e:
+            print(f"[ARC Core]Init sub_land table error: {str(e)}")
+            return False
+
+    def create_sub_land(self, parent_land_id: int, owner_xuid: str, sub_land_name: str,
+                        min_x: int, max_x: int, min_y: int, max_y: int,
+                        min_z: int, max_z: int) -> Optional[int]:
+        """创建子领地，返回新子领地ID，失败返回None"""
+        try:
+            self.database_manager.execute(
+                "INSERT INTO sub_lands (parent_land_id, owner_xuid, sub_land_name, min_x, max_x, min_y, max_y, min_z, max_z, shared_users) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (parent_land_id, owner_xuid, sub_land_name, min_x, max_x, min_y, max_y, min_z, max_z, '[]')
+            )
+            result = self.database_manager.query_one("SELECT last_insert_rowid() as sub_land_id")
+            return result['sub_land_id'] if result else None
+        except Exception as e:
+            self.logger.error(f"Create sub land error: {str(e)}")
+            return None
+
+    def delete_sub_land(self, sub_land_id: int) -> bool:
+        """删除子领地"""
+        try:
+            return self.database_manager.delete('sub_lands', 'sub_land_id = ?', (sub_land_id,))
+        except Exception as e:
+            self.logger.error(f"Delete sub land error: {str(e)}")
+            return False
+
+    def get_sub_land_info(self, sub_land_id: int) -> dict:
+        """获取子领地信息字典，不存在返回空字典"""
+        try:
+            result = self.database_manager.query_one(
+                "SELECT * FROM sub_lands WHERE sub_land_id = ?", (sub_land_id,)
+            )
+            if result:
+                return {
+                    'sub_land_id': result['sub_land_id'],
+                    'parent_land_id': result['parent_land_id'],
+                    'owner_xuid': result['owner_xuid'],
+                    'sub_land_name': result['sub_land_name'],
+                    'min_x': result['min_x'], 'max_x': result['max_x'],
+                    'min_y': result.get('min_y', 0), 'max_y': result.get('max_y', 255),
+                    'min_z': result['min_z'], 'max_z': result['max_z'],
+                    'shared_users': json.loads(result.get('shared_users') or '[]')
+                }
+            return {}
+        except Exception as e:
+            self.logger.error(f"Get sub land info error: {str(e)}")
+            return {}
+
+    def get_sub_lands_by_parent(self, parent_land_id: int) -> dict:
+        """获取某领地下的所有子领地 {sub_land_id: info_dict}"""
+        try:
+            results = self.database_manager.query_all(
+                "SELECT * FROM sub_lands WHERE parent_land_id = ?", (parent_land_id,)
+            )
+            lands = {}
+            for r in results:
+                lands[r['sub_land_id']] = {
+                    'sub_land_id': r['sub_land_id'],
+                    'parent_land_id': r['parent_land_id'],
+                    'owner_xuid': r['owner_xuid'],
+                    'sub_land_name': r['sub_land_name'],
+                    'min_x': r['min_x'], 'max_x': r['max_x'],
+                    'min_y': r.get('min_y', 0), 'max_y': r.get('max_y', 255),
+                    'min_z': r['min_z'], 'max_z': r['max_z'],
+                    'shared_users': json.loads(r.get('shared_users') or '[]')
+                }
+            return lands
+        except Exception as e:
+            self.logger.error(f"Get sub lands by parent error: {str(e)}")
+            return {}
+
+    def get_sub_lands_by_owner_in_parent(self, parent_land_id: int, owner_xuid: str) -> dict:
+        """获取某玩家在指定父领地内拥有的所有子领地"""
+        try:
+            results = self.database_manager.query_all(
+                "SELECT * FROM sub_lands WHERE parent_land_id = ? AND owner_xuid = ?",
+                (parent_land_id, owner_xuid)
+            )
+            lands = {}
+            for r in results:
+                lands[r['sub_land_id']] = {
+                    'sub_land_id': r['sub_land_id'],
+                    'parent_land_id': r['parent_land_id'],
+                    'owner_xuid': r['owner_xuid'],
+                    'sub_land_name': r['sub_land_name'],
+                    'min_x': r['min_x'], 'max_x': r['max_x'],
+                    'min_y': r.get('min_y', 0), 'max_y': r.get('max_y', 255),
+                    'min_z': r['min_z'], 'max_z': r['max_z'],
+                    'shared_users': json.loads(r.get('shared_users') or '[]')
+                }
+            return lands
+        except Exception as e:
+            self.logger.error(f"Get sub lands by owner error: {str(e)}")
+            return {}
+
+    def get_sub_land_at_pos(self, parent_land_id: int, x: int, y: int, z: int) -> Optional[int]:
+        """获取指定坐标处的子领地ID（在父领地范围内查询），不存在返回None"""
+        try:
+            results = self.database_manager.query_all(
+                "SELECT sub_land_id, min_x, max_x, min_y, max_y, min_z, max_z FROM sub_lands WHERE parent_land_id = ?",
+                (parent_land_id,)
+            )
+            for r in results:
+                sl_min_y = r.get('min_y', 0)
+                sl_max_y = r.get('max_y', 255)
+                if (r['min_x'] <= x <= r['max_x'] and
+                        sl_min_y <= y <= sl_max_y and
+                        r['min_z'] <= z <= r['max_z']):
+                    return r['sub_land_id']
+            return None
+        except Exception as e:
+            self.logger.error(f"Get sub land at pos error: {str(e)}")
+            return None
+
+    def check_sub_land_availability(self, parent_land_id: int,
+                                    min_x: int, max_x: int, min_y: int, max_y: int,
+                                    min_z: int, max_z: int,
+                                    exclude_sub_land_id: int = None) -> tuple:
+        """
+        检查子领地范围是否可用：
+        1. 必须完全在父领地范围内
+        2. 不能与同父领地下其他子领地重叠
+        返回 (True, None) 或 (False, reason_str)
+        """
+        try:
+            parent_info = self.get_land_info(parent_land_id)
+            if not parent_info:
+                return False, 'SYSTEM_ERROR'
+
+            p_min_x, p_max_x = parent_info['min_x'], parent_info['max_x']
+            p_min_y, p_max_y = parent_info.get('min_y', 0), parent_info.get('max_y', 255)
+            p_min_z, p_max_z = parent_info['min_z'], parent_info['max_z']
+
+            if min_x < p_min_x or max_x > p_max_x or min_y < p_min_y or max_y > p_max_y or min_z < p_min_z or max_z > p_max_z:
+                return False, 'SUB_LAND_OUT_OF_PARENT'
+
+            siblings = self.database_manager.query_all(
+                "SELECT sub_land_id, min_x, max_x, min_y, max_y, min_z, max_z FROM sub_lands WHERE parent_land_id = ?",
+                (parent_land_id,)
+            )
+            for r in siblings:
+                if exclude_sub_land_id is not None and r['sub_land_id'] == exclude_sub_land_id:
+                    continue
+                sl_min_y = r.get('min_y', 0)
+                sl_max_y = r.get('max_y', 255)
+                if (min_x <= r['max_x'] and max_x >= r['min_x'] and
+                        min_y <= sl_max_y and max_y >= sl_min_y and
+                        min_z <= r['max_z'] and max_z >= r['min_z']):
+                    return False, 'SUB_LAND_OVERLAP'
+
+            return True, None
+        except Exception as e:
+            self.logger.error(f"Check sub land availability error: {str(e)}")
             return False, 'SYSTEM_ERROR'
+
+    def add_sub_land_shared_user(self, sub_land_id: int, xuid: str) -> bool:
+        try:
+            info = self.get_sub_land_info(sub_land_id)
+            if not info:
+                return False
+            shared = info['shared_users']
+            if xuid in shared:
+                return False
+            shared.append(xuid)
+            return bool(self.database_manager.execute(
+                "UPDATE sub_lands SET shared_users = ? WHERE sub_land_id = ?",
+                (json.dumps(shared), sub_land_id)
+            ))
+        except Exception as e:
+            self.logger.error(f"Add sub land shared user error: {str(e)}")
+            return False
+
+    def remove_sub_land_shared_user(self, sub_land_id: int, xuid: str) -> bool:
+        try:
+            info = self.get_sub_land_info(sub_land_id)
+            if not info:
+                return False
+            shared = info['shared_users']
+            if xuid not in shared:
+                return False
+            shared.remove(xuid)
+            return bool(self.database_manager.execute(
+                "UPDATE sub_lands SET shared_users = ? WHERE sub_land_id = ?",
+                (json.dumps(shared), sub_land_id)
+            ))
+        except Exception as e:
+            self.logger.error(f"Remove sub land shared user error: {str(e)}")
+            return False
+
+    def rename_sub_land(self, sub_land_id: int, new_name: str) -> bool:
+        try:
+            return bool(self.database_manager.execute(
+                "UPDATE sub_lands SET sub_land_name = ? WHERE sub_land_id = ?",
+                (new_name, sub_land_id)
+            ))
+        except Exception as e:
+            self.logger.error(f"Rename sub land error: {str(e)}")
+            return False
+
+    # ─── End Sub-land System ────────────────────────────────────────────────────
 
     def get_player_land_count(self, xuid: str) -> int:
         """
@@ -3748,6 +4102,8 @@ class ARCCorePlugin(Plugin):
                     'dimension': land['dimension'],
                     'min_x': land['min_x'],
                     'max_x': land['max_x'],
+                    'min_y': land.get('min_y', 0),
+                    'max_y': land.get('max_y', 255),
                     'min_z': land['min_z'],
                     'max_z': land['max_z'],
                     'tp_x': land['tp_x'],
@@ -3757,7 +4113,8 @@ class ARCCorePlugin(Plugin):
                     'allow_explosion': bool(land.get('allow_explosion', 0)),
                     'allow_public_interact': bool(land.get('allow_public_interact', 0)),
                     'allow_actor_interaction': bool(land.get('allow_actor_interaction', 0)),
-                    'allow_actor_damage': bool(land.get('allow_actor_damage', 0))
+                    'allow_actor_damage': bool(land.get('allow_actor_damage', 0)),
+                    'allow_non_public_land': bool(land.get('allow_non_public_land', 0))
                 }
 
             return lands_info
@@ -3782,6 +4139,8 @@ class ARCCorePlugin(Plugin):
                     'dimension': land['dimension'],
                     'min_x': land['min_x'],
                     'max_x': land['max_x'],
+                    'min_y': land.get('min_y', 0),
+                    'max_y': land.get('max_y', 255),
                     'min_z': land['min_z'],
                     'max_z': land['max_z'],
                     'tp_x': land['tp_x'],
@@ -3792,7 +4151,8 @@ class ARCCorePlugin(Plugin):
                     'allow_explosion': bool(land.get('allow_explosion', 0)),
                     'allow_public_interact': bool(land.get('allow_public_interact', 0)),
                     'allow_actor_interaction': bool(land.get('allow_actor_interaction', 0)),
-                    'allow_actor_damage': bool(land.get('allow_actor_damage', 0))
+                    'allow_actor_damage': bool(land.get('allow_actor_damage', 0)),
+                    'allow_non_public_land': bool(land.get('allow_non_public_land', 0))
                 }
             return lands_info
         except Exception as e:
@@ -3829,6 +4189,8 @@ class ARCCorePlugin(Plugin):
                     'dimension': result['dimension'],
                     'min_x': result['min_x'],
                     'max_x': result['max_x'],
+                    'min_y': result.get('min_y', 0),
+                    'max_y': result.get('max_y', 255),
                     'min_z': result['min_z'],
                     'max_z': result['max_z'],
                     'tp_x': result['tp_x'],
@@ -3839,7 +4201,8 @@ class ARCCorePlugin(Plugin):
                     'allow_explosion': bool(result.get('allow_explosion', 0)),
                     'allow_public_interact': bool(result.get('allow_public_interact', 0)),
                     'allow_actor_interaction': bool(result.get('allow_actor_interaction', 0)),
-                    'allow_actor_damage': bool(result.get('allow_actor_damage', 0))
+                    'allow_actor_damage': bool(result.get('allow_actor_damage', 0)),
+                    'allow_non_public_land': bool(result.get('allow_non_public_land', 0))
                 }
             return {}
 
@@ -3894,7 +4257,7 @@ class ARCCorePlugin(Plugin):
             if not self.get_land_info(land_id):
                 return False
             return self.database_manager.execute(
-                "UPDATE lands SET owner_xuid = ?, allow_public_interact = 1, allow_actor_interaction = 1, allow_actor_damage = 1 WHERE land_id = ?",
+                "UPDATE lands SET owner_xuid = ?, owner_paid_money = 0, allow_public_interact = 1, allow_actor_interaction = 1, allow_actor_damage = 1 WHERE land_id = ?",
                 (self.PUBLIC_LAND_OWNER_XUID, land_id)
             )
         except Exception as e:
@@ -4070,8 +4433,8 @@ class ARCCorePlugin(Plugin):
                 land_id,
                 land_info['land_name'],
                 land_info['dimension'],
-                (int(land_info['min_x']), int(land_info['min_z'])),
-                (int(land_info['max_x']), int(land_info['max_z'])),
+                (int(land_info['min_x']), int(land_info.get('min_y', 0)), int(land_info['min_z'])),
+                (int(land_info['max_x']), int(land_info.get('max_y', 255)), int(land_info['max_z'])),
                 (int(land_info['tp_x']), int(land_info['tp_y']), int(land_info['tp_z'])),
                 shared_user_name_str
             ),
@@ -4103,6 +4466,9 @@ class ARCCorePlugin(Plugin):
                                      )
         land_detail_panel.add_button(self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.show_land_public_interact_setting_panel(p, l_id)
+                                     )
+        land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_MANAGE_SUB_LAND_BUTTON_TEXT'),
+                                     on_click=lambda p=player, l_id=land_id: self.show_sub_land_manage_panel(p, l_id)
                                      )
         land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_TRANSFER_LAND_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.show_transfer_land_panel(p, l_id)
@@ -4695,7 +5061,68 @@ class ARCCorePlugin(Plugin):
             self.show_own_land_detail_panel(player, land_id, land_info)
 
     def show_create_new_land_guide(self, player: Player):
-        player.send_message(self.language_manager.GetText('CREATE_NEW_LAND_GUIDE'))
+        """显示创建领地的坐标输入表单，可预填上次设定的值"""
+        cached = self.player_new_land_creation_info.get(player.name, {})
+        default_min_x = str(cached.get('min_x', math.floor(player.location.x)))
+        default_max_x = str(cached.get('max_x', math.floor(player.location.x)))
+        default_min_y = str(cached.get('min_y', math.floor(player.location.y)))
+        default_max_y = str(cached.get('max_y', math.floor(player.location.y)))
+        default_min_z = str(cached.get('min_z', math.floor(player.location.z)))
+        default_max_z = str(cached.get('max_z', math.floor(player.location.z)))
+
+        controls = [
+            Label(text=self.language_manager.GetText('CREATE_LAND_FORM_DIMENSION_LABEL').format(player.location.dimension.name)),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MIN_X'), placeholder='例如: -100', default_value=default_min_x),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MAX_X'), placeholder='例如: 100', default_value=default_max_x),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MIN_Y'), placeholder='例如: 0', default_value=default_min_y),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MAX_Y'), placeholder='例如: 255', default_value=default_max_y),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MIN_Z'), placeholder='例如: -100', default_value=default_min_z),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MAX_Z'), placeholder='例如: 100', default_value=default_max_z),
+        ]
+
+        def on_submit(p: Player, json_str: str):
+            try:
+                data = json.loads(json_str)
+                # data[0] is Label (ignored), data[1..6] are the text inputs
+                min_x_str = data[1]
+                max_x_str = data[2]
+                min_y_str = data[3]
+                max_y_str = data[4]
+                min_z_str = data[5]
+                max_z_str = data[6]
+                try:
+                    min_x = int(min_x_str)
+                    max_x = int(max_x_str)
+                    min_y = int(min_y_str)
+                    max_y = int(max_y_str)
+                    min_z = int(min_z_str)
+                    max_z = int(max_z_str)
+                except (ValueError, TypeError):
+                    p.send_message(self.language_manager.GetText('CREATE_LAND_FORM_INVALID_COORD'))
+                    return
+                # 自动排序
+                min_x, max_x = min(min_x, max_x), max(min_x, max_x)
+                min_y, max_y = min(min_y, max_y), max(min_y, max_y)
+                min_z, max_z = min(min_z, max_z), max(min_z, max_z)
+                self.player_new_land_creation_info[p.name] = {
+                    'dimension': p.location.dimension.name,
+                    'min_x': min_x, 'max_x': max_x,
+                    'min_y': min_y, 'max_y': max_y,
+                    'min_z': min_z, 'max_z': max_z
+                }
+                self._visualize_pending_land(p)
+                self.show_new_land_info(p)
+            except Exception as e:
+                self.logger.error(f"Create land form submit error: {str(e)}")
+                p.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+
+        form = ModalForm(
+            title=self.language_manager.GetText('CREATE_LAND_FORM_TITLE'),
+            controls=controls,
+            on_submit=on_submit,
+            on_close=self.show_land_main_menu
+        )
+        player.send_form(form)
 
     def show_current_land_info(self, player: Player):
         """显示玩家当前位置的领地信息并绘制粒子边界"""
@@ -4735,190 +5162,549 @@ class ARCCorePlugin(Plugin):
                                     if land_info.get('allow_public_interact', False) 
                                     else self.language_manager.GetText('LAND_CURRENT_POSITION_PUBLIC_INTERACT_DISABLED'))
             
-            # 发送领地信息
+            shared_users = land_info.get('shared_users', [])
+            if shared_users:
+                shared_names = [self.get_player_name_by_xuid(uid) or uid for uid in shared_users]
+                shared_str = ', '.join(shared_names)
+            else:
+                shared_str = self.language_manager.GetText('LAND_DETAIL_NO_SHARED_USER_TEXT')
+
             land_message = self.language_manager.GetText('LAND_CURRENT_POSITION_INFO').format(
                 land_id,
                 land_info['land_name'],
                 owner_name,
                 land_info['dimension'],
-                land_info['min_x'], land_info['min_z'],
-                land_info['max_x'], land_info['max_z'],
+                land_info['min_x'], land_info.get('min_y', 0), land_info['min_z'],
+                land_info['max_x'], land_info.get('max_y', 255), land_info['max_z'],
                 land_info['tp_x'], land_info['tp_y'], land_info['tp_z'],
                 explosion_status,
                 public_interact_status
             )
-            player.send_message(land_message)
-            
-            # 发送授权玩家信息
-            shared_users = land_info.get('shared_users', [])
-            if shared_users:
-                shared_names = []
-                for xuid in shared_users:
-                    name = self.get_player_name_by_xuid(xuid)
-                    if name:
-                        shared_names.append(name)
-                if shared_names:
-                    shared_message = self.language_manager.GetText('LAND_CURRENT_POSITION_SHARED_USERS').format(', '.join(shared_names))
-                    player.send_message(shared_message)
-            else:
-                player.send_message(self.language_manager.GetText('LAND_CURRENT_POSITION_NO_SHARED_USERS'))
-            
+
+            info_panel = ActionForm(
+                title=self.language_manager.GetText('LAND_CURRENT_PANEL_TITLE'),
+                content=land_message + '\n' + self.language_manager.GetText('LAND_CURRENT_POSITION_SHARED_USERS').format(shared_str),
+                on_close=self.show_land_main_menu
+            )
+
+            info_panel.add_button(
+                self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+                on_click=self.show_land_main_menu
+            )
+
             # 显示粒子边界
-            self.display_land_particle_boundary(player, land_info, math.ceil(y))
+            self.display_land_particle_boundary(player, land_info)
+            player.send_form(info_panel)
             
         except Exception as e:
             self.logger.error(f"Show current land info error: {str(e)}")
             player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
 
-    def display_land_particle_boundary(self, player: Player, land_info: dict, y_coord: float):
-        """显示领地粒子边界"""
+    def display_land_particle_boundary(self, player: Player, land_info: dict, y_coord: float = None):
+        """显示三维领地粒子边界（立方体12条棱）"""
         try:
-            # player.send_message(self.language_manager.GetText('LAND_CURRENT_POSITION_PARTICLE_DISPLAY'))
-            
             min_x = land_info['min_x']
             max_x = land_info['max_x']
+            min_y = land_info.get('min_y', 0)
+            max_y = land_info.get('max_y', 255)
             min_z = land_info['min_z']
             max_z = land_info['max_z']
-            
-            # 计算四个角点坐标
+
+            STEPS = 8  # 每条棱的插值段数（含端点共9个点）
+
+            def emit(x, y, z):
+                self.server.dispatch_command(
+                    self.server.command_sender,
+                    f"particle minecraft:crop_growth_emitter {x} {y} {z}"
+                )
+
+            def draw_edge(p1, p2):
+                """在两点之间均匀生成粒子"""
+                for i in range(STEPS + 1):
+                    t = i / STEPS
+                    x = p1[0] + (p2[0] - p1[0]) * t
+                    y = p1[1] + (p2[1] - p1[1]) * t
+                    z = p1[2] + (p2[2] - p1[2]) * t
+                    emit(x, y, z)
+
+            # 立方体8个顶点
             corners = [
-                (min_x, y_coord, min_z),  # 左下角
-                (max_x, y_coord, min_z),  # 右下角
-                (max_x, y_coord, max_z),  # 右上角
-                (min_x, y_coord, max_z)   # 左上角
+                (min_x, min_y, min_z),
+                (max_x, min_y, min_z),
+                (max_x, min_y, max_z),
+                (min_x, min_y, max_z),
+                (min_x, max_y, min_z),
+                (max_x, max_y, min_z),
+                (max_x, max_y, max_z),
+                (min_x, max_y, max_z),
             ]
-            
-            # 发送四个角点的粒子
-            for x, y, z in corners:
-                particle_cmd = f"particle minecraft:crop_growth_emitter {x} {y} {z}"
-                self.server.dispatch_command(self.server.command_sender, particle_cmd)
-            
-            # 计算每条边的插值点（每条边8个点，不包括端点）
-            # 底边 (min_x, min_z) -> (max_x, min_z)
-            for i in range(1, 8):
-                x = min_x + (max_x - min_x) * i / 8
-                z = min_z
-                particle_cmd = f"particle minecraft:crop_growth_emitter {x} {y_coord} {z}"
-                self.server.dispatch_command(self.server.command_sender, particle_cmd)
-            
-            # 右边 (max_x, min_z) -> (max_x, max_z)
-            for i in range(1, 8):
-                x = max_x
-                z = min_z + (max_z - min_z) * i / 8
-                particle_cmd = f"particle minecraft:crop_growth_emitter {x} {y_coord} {z}"
-                self.server.dispatch_command(self.server.command_sender, particle_cmd)
-            
-            # 顶边 (max_x, max_z) -> (min_x, max_z)
-            for i in range(1, 8):
-                x = max_x - (max_x - min_x) * i / 8
-                z = max_z
-                particle_cmd = f"particle minecraft:crop_growth_emitter {x} {y_coord} {z}"
-                self.server.dispatch_command(self.server.command_sender, particle_cmd)
-            
-            # 左边 (min_x, max_z) -> (min_x, min_z)
-            for i in range(1, 8):
-                x = min_x
-                z = max_z - (max_z - min_z) * i / 8
-                particle_cmd = f"particle minecraft:crop_growth_emitter {x} {y_coord} {z}"
-                self.server.dispatch_command(self.server.command_sender, particle_cmd)
-                
+
+            # 底面4条棱
+            draw_edge(corners[0], corners[1])
+            draw_edge(corners[1], corners[2])
+            draw_edge(corners[2], corners[3])
+            draw_edge(corners[3], corners[0])
+            # 顶面4条棱
+            draw_edge(corners[4], corners[5])
+            draw_edge(corners[5], corners[6])
+            draw_edge(corners[6], corners[7])
+            draw_edge(corners[7], corners[4])
+            # 4条竖直棱
+            draw_edge(corners[0], corners[4])
+            draw_edge(corners[1], corners[5])
+            draw_edge(corners[2], corners[6])
+            draw_edge(corners[3], corners[7])
+
         except Exception as e:
             self.logger.error(f"Display land particle boundary error: {str(e)}")
             player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
 
     def show_new_land_info(self, player: Player):
-        if_allowed, reason = self.check_land_availability(self.player_new_land_creation_info[player.name][0],
-                                         int(self.player_new_land_creation_info[player.name][1][0]),
-                                         int(self.player_new_land_creation_info[player.name][2][0]),
-                                         int(self.player_new_land_creation_info[player.name][1][1]),
-                                         int(self.player_new_land_creation_info[player.name][2][1]))
+        """显示待购买领地的预览信息面板（含购买按钮和/landbuy提示）"""
+        info = self.player_new_land_creation_info.get(player.name)
+        if not info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        dimension = info['dimension']
+        min_x, max_x = info['min_x'], info['max_x']
+        min_y, max_y = info['min_y'], info['max_y']
+        min_z, max_z = info['min_z'], info['max_z']
+
+        if_allowed, reason, overlap_ids = self.check_land_availability(dimension, min_x, max_x, min_y, max_y, min_z, max_z)
         if not if_allowed:
-            player.send_message(self.language_manager.GetText(f'CHECK_NEW_LAND_AVAILABILITY_FAIL_{reason}'))
+            msg = self.language_manager.GetText(f'CHECK_NEW_LAND_AVAILABILITY_FAIL_{reason}')
+            if overlap_ids:
+                land_parts = [f"#{lid} {self.get_land_name(lid) or ''}".strip() for lid in overlap_ids]
+                msg = msg + '\n' + self.language_manager.GetText('LAND_OVERLAP_WITH_LANDS').format(', '.join(land_parts))
+            player.send_message(msg)
             return
+
+        length = max_x - min_x + 1
+        height = max_y - min_y + 1
+        width = max_z - min_z + 1
+
+        if length <= self.land_min_size or width <= self.land_min_size:
+            player.send_message(self.language_manager.GetText('CREATE_NEW_LAND_SIZE_TOO_SMALL').format(length, width, self.land_min_size))
+            return
+
+        volume = length * height * width
+
+        remaining_free_blocks = self.get_player_free_land_blocks(player)
+        paid_blocks = max(0, volume - remaining_free_blocks)
+        money_cost = paid_blocks * self.land_price
+        used_free_blocks = min(volume, remaining_free_blocks)
+
+        player_money = self.get_player_money(player)
+        can_afford = player.is_op or player_money >= money_cost
+
+        new_land_form = ActionForm(
+            title=self.language_manager.GetText('NEW_LAND_TITLE'),
+            content=self.language_manager.GetText('NEW_LAND_INFO_TEXT').format(
+                dimension,
+                (min_x, min_y, min_z),
+                (max_x, max_y, max_z),
+                volume,
+                self._format_money_display(money_cost),
+                self._format_money_display(player_money)
+            )
+        )
+
+        if can_afford:
+            new_land_form.add_button(
+                self.language_manager.GetText('BUY_NEW_LAND_TEXT'),
+                on_click=lambda p: self.player_buy_new_land(p, dimension, min_x, max_x, min_y, max_y, min_z, max_z, volume, money_cost, used_free_blocks)
+            )
         else:
-            min_x = min(int(self.player_new_land_creation_info[player.name][1][0]),
-                        int(self.player_new_land_creation_info[player.name][2][0]))
-            max_x = max(int(self.player_new_land_creation_info[player.name][1][0]),
-                        int(self.player_new_land_creation_info[player.name][2][0]))
-            min_z = min(int(self.player_new_land_creation_info[player.name][1][1]),
-                        int(self.player_new_land_creation_info[player.name][2][1]))
-            max_z = max(int(self.player_new_land_creation_info[player.name][1][1]),
-                        int(self.player_new_land_creation_info[player.name][2][1]))
-            
-            # 计算长宽
-            length = max_x - min_x + 1
-            width = max_z - min_z + 1
-            
-            # 检查尺寸限制：长宽必须都大于配置的最小尺寸
-            if length <= self.land_min_size or width <= self.land_min_size:
-                player.send_message(self.language_manager.GetText('CREATE_NEW_LAND_SIZE_TOO_SMALL').format(length, width, self.land_min_size))
-                return
-            
-            area = length * width
-            
-            # 获取玩家剩余免费领地格子数
-            remaining_free_blocks = self.get_player_free_land_blocks(player)
-            
-            # 计算需要付费的格子数
-            paid_blocks = max(0, area - remaining_free_blocks)
-            money_cost = paid_blocks * self.land_price
-            
-            # 计算实际使用的免费格子数
-            used_free_blocks = min(area, remaining_free_blocks)
-            
-            new_land_form = ActionForm(
-                title=self.language_manager.GetText('NEW_LAND_TITLE'),
-                content=self.language_manager.GetText('NEW_LAND_INFO_TEXT').format(
-                    self.player_new_land_creation_info[player.name][0],
-                    (min_x, min_z),
-                    (max_x, max_z),
-                    area,
-                    money_cost,
-                ))
-            new_land_form.add_button(self.language_manager.GetText('BUY_NEW_LAND_TEXT'),
-                on_click=lambda player: self.player_buy_new_land(
-                player,
-                self.player_new_land_creation_info[player.name][0],  # dimension
-                (min_x, min_z),  # start_pos
-                (max_x, max_z),  # end_pos
-                area,
-                money_cost,
-                used_free_blocks
-            ))
-            player.send_form(new_land_form)
+            new_land_form.add_button(self.language_manager.GetText('BUY_NEW_LAND_NO_MONEY_TEXT'))
+
+        new_land_form.add_button(
+            self.language_manager.GetText('LAND_RESELECT_BUTTON_TEXT'),
+            on_click=self.show_create_new_land_guide
+        )
+        player.send_form(new_land_form)
+
+    def _execute_land_buy(self, player: Player):
+        """供/landbuy命令调用，检查并购买缓存中的领地"""
+        info = self.player_new_land_creation_info.get(player.name)
+        if not info:
+            player.send_message(self.language_manager.GetText('LANDBUY_NO_PENDING_LAND'))
             return
+
+        dimension = info['dimension']
+        min_x, max_x = info['min_x'], info['max_x']
+        min_y, max_y = info['min_y'], info['max_y']
+        min_z, max_z = info['min_z'], info['max_z']
+
+        if_allowed, reason, overlap_ids = self.check_land_availability(dimension, min_x, max_x, min_y, max_y, min_z, max_z)
+        if not if_allowed:
+            msg = self.language_manager.GetText(f'CHECK_NEW_LAND_AVAILABILITY_FAIL_{reason}')
+            if overlap_ids:
+                land_parts = [f"#{lid} {self.get_land_name(lid) or ''}".strip() for lid in overlap_ids]
+                msg = msg + '\n' + self.language_manager.GetText('LAND_OVERLAP_WITH_LANDS').format(', '.join(land_parts))
+            player.send_message(msg)
+            return
+
+        length = max_x - min_x + 1
+        height = max_y - min_y + 1
+        width = max_z - min_z + 1
+        volume = length * height * width
+
+        remaining_free_blocks = self.get_player_free_land_blocks(player)
+        paid_blocks = max(0, volume - remaining_free_blocks)
+        money_cost = paid_blocks * self.land_price
+        used_free_blocks = min(volume, remaining_free_blocks)
+
+        self.player_buy_new_land(player, dimension, min_x, max_x, min_y, max_y, min_z, max_z, volume, money_cost, used_free_blocks)
+
+    def _visualize_pending_land(self, player: Player):
+        """用粒子效果可视化玩家缓存中的待购买领地"""
+        info = self.player_new_land_creation_info.get(player.name)
+        if not info:
+            return
+        self.display_land_particle_boundary(player, {
+            'min_x': info['min_x'], 'max_x': info['max_x'],
+            'min_y': info['min_y'], 'max_y': info['max_y'],
+            'min_z': info['min_z'], 'max_z': info['max_z']
+        })
 
     def clear_new_land_creation_info_memory(self, player: Player):
-        self.player_new_land_creation_info.pop(player.name)
+        self.player_new_land_creation_info.pop(player.name, None)
 
-    def player_buy_new_land(self, player: Player, dimension: str, start_pos: tuple, end_pos: tuple, area: int, money_cost: int, used_free_blocks: int = 0):
+    def player_buy_new_land(self, player: Player, dimension: str,
+                            min_x: int, max_x: int, min_y: int, max_y: int, min_z: int, max_z: int,
+                            volume: int, money_cost: int, used_free_blocks: int = 0):
         if self.judge_if_player_has_enough_money(player, money_cost) or player.is_op:
             paid_money = float(money_cost) if not player.is_op else 0.0
-            land_id = self.create_land(str(player.xuid), self.language_manager.GetText('DEFAULT_LAND_NAME').format(player.name, self.get_player_land_count(str(player.xuid)) + 1), dimension, start_pos[0], end_pos[0], start_pos[1], end_pos[1], player.location.x, player.location.y, player.location.z, owner_paid_money=paid_money)
+            land_id = self.create_land(
+                str(player.xuid),
+                self.language_manager.GetText('DEFAULT_LAND_NAME').format(player.name, self.get_player_land_count(str(player.xuid)) + 1),
+                dimension, min_x, max_x, min_y, max_y, min_z, max_z,
+                player.location.x, player.location.y, player.location.z,
+                owner_paid_money=paid_money
+            )
             if land_id is not None:
                 if not player.is_op:
-                    # 扣除金钱
                     if money_cost > 0:
                         self.decrease_player_money(player, money_cost)
                         player.send_message(self.language_manager.GetText('PAY_SUCCESS_HINT').format(
-                        self._format_money_display(money_cost),
-                        self._format_money_display(self.get_player_money(player))))
-                    
-                    # 扣除免费格子数
+                            self._format_money_display(money_cost),
+                            self._format_money_display(self.get_player_money(player))))
+
                     if used_free_blocks > 0:
                         current_free_blocks = self.get_player_free_land_blocks(player)
                         new_free_blocks = max(0, current_free_blocks - used_free_blocks)
                         self.set_player_free_land_blocks(player, new_free_blocks)
                         player.send_message(self.language_manager.GetText('USE_FREE_BLOCKS_HINT').format(used_free_blocks))
-                
+
                 self.clear_new_land_creation_info_memory(player)
                 self.show_own_land_detail_panel(player, land_id, self.get_land_info(land_id))
             else:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
         else:
             player.send_message(self.language_manager.GetText('PAY_FAIL_NO_ENOUGH_MONEY').format(
-            self._format_money_display(money_cost),
-            self._format_money_display(self.get_player_money(player))))
+                self._format_money_display(money_cost),
+                self._format_money_display(self.get_player_money(player))))
+
+    # ─── Sub-land UI ─────────────────────────────────────────────────────────────
+
+    def show_sub_land_manage_panel(self, player: Player, land_id: int):
+        """领地主人管理子领地：查看所有子领地 + 新建"""
+        sub_lands = self.get_sub_lands_by_parent(land_id)
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+        panel = ActionForm(
+            title=self.language_manager.GetText('SUB_LAND_MANAGE_PANEL_TITLE'),
+            content=self.language_manager.GetText('SUB_LAND_MANAGE_PANEL_CONTENT').format(len(sub_lands)),
+            on_close=lambda p=player, l_id=land_id, l_info=land_info: self.show_own_land_detail_panel(p, l_id, l_info)
+        )
+        panel.add_button(
+            self.language_manager.GetText('SUB_LAND_CREATE_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id: self.show_create_sub_land_form(p, l_id)
+        )
+        for sl_id, sl_info in sub_lands.items():
+            owner_name = self.get_player_name_by_xuid(sl_info['owner_xuid']) or sl_info['owner_xuid']
+            panel.add_button(
+                self.language_manager.GetText('SUB_LAND_LIST_BUTTON_TEXT').format(sl_id, sl_info['sub_land_name'], owner_name),
+                on_click=lambda p=player, sl=sl_id: self.show_sub_land_detail_panel(p, sl)
+            )
+        panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, l_info=land_info: self.show_own_land_detail_panel(p, l_id, l_info)
+        )
+        player.send_form(panel)
+
+    def show_create_sub_land_form(self, player: Player, land_id: int):
+        """显示创建子领地的 XYZ 输入表单"""
+        parent_info = self.get_land_info(land_id)
+        if not parent_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        p_min_x, p_max_x = parent_info['min_x'], parent_info['max_x']
+        p_min_y, p_max_y = parent_info.get('min_y', 0), parent_info.get('max_y', 255)
+        p_min_z, p_max_z = parent_info['min_z'], parent_info['max_z']
+
+        default_px = str(math.floor(player.location.x))
+        default_py = str(math.floor(player.location.y))
+        default_pz = str(math.floor(player.location.z))
+
+        hint_label = self.language_manager.GetText('SUB_LAND_FORM_HINT').format(
+            p_min_x, p_min_y, p_min_z, p_max_x, p_max_y, p_max_z
+        )
+
+        def _back(p):
+            self.show_sub_land_manage_panel(p, land_id)
+
+        controls = [
+            Label(text=hint_label),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MIN_X'), placeholder=str(p_min_x), default_value=default_px),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MAX_X'), placeholder=str(p_max_x), default_value=default_px),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MIN_Y'), placeholder=str(p_min_y), default_value=default_py),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MAX_Y'), placeholder=str(p_max_y), default_value=default_py),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MIN_Z'), placeholder=str(p_min_z), default_value=default_pz),
+            TextInput(label=self.language_manager.GetText('CREATE_LAND_FORM_MAX_Z'), placeholder=str(p_max_z), default_value=default_pz),
+            TextInput(label=self.language_manager.GetText('SUB_LAND_NAME_INPUT_LABEL'),
+                      placeholder=self.language_manager.GetText('SUB_LAND_NAME_INPUT_PLACEHOLDER').format(player.name),
+                      default_value=self.language_manager.GetText('SUB_LAND_NAME_INPUT_PLACEHOLDER').format(player.name)),
+        ]
+
+        def on_submit(p: Player, json_str: str):
+            try:
+                data = json.loads(json_str)
+                try:
+                    min_x = int(data[1]); max_x = int(data[2])
+                    min_y = int(data[3]); max_y = int(data[4])
+                    min_z = int(data[5]); max_z = int(data[6])
+                except (ValueError, TypeError, IndexError):
+                    p.send_message(self.language_manager.GetText('CREATE_LAND_FORM_INVALID_COORD'))
+                    return
+                sub_land_name = (data[7] or '').strip()
+                if not sub_land_name:
+                    sub_land_name = self.language_manager.GetText('SUB_LAND_NAME_INPUT_PLACEHOLDER').format(p.name)
+                min_x, max_x = min(min_x, max_x), max(min_x, max_x)
+                min_y, max_y = min(min_y, max_y), max(min_y, max_y)
+                min_z, max_z = min(min_z, max_z), max(min_z, max_z)
+
+                ok, reason = self.check_sub_land_availability(land_id, min_x, max_x, min_y, max_y, min_z, max_z)
+                if not ok:
+                    p.send_message(self.language_manager.GetText(f'CHECK_SUB_LAND_FAIL_{reason}'))
+                    return
+
+                sl_id = self.create_sub_land(land_id, str(p.xuid), sub_land_name, min_x, max_x, min_y, max_y, min_z, max_z)
+                if sl_id is not None:
+                    p.send_message(self.language_manager.GetText('SUB_LAND_CREATE_SUCCESS').format(sl_id, sub_land_name))
+                    self.display_land_particle_boundary(p, {'min_x': min_x, 'max_x': max_x, 'min_y': min_y, 'max_y': max_y, 'min_z': min_z, 'max_z': max_z})
+                    self.show_sub_land_detail_panel(p, sl_id)
+                else:
+                    p.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            except Exception as e:
+                self.logger.error(f"Create sub land form submit error: {str(e)}")
+                p.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+
+        form = ModalForm(
+            title=self.language_manager.GetText('SUB_LAND_CREATE_FORM_TITLE'),
+            controls=controls,
+            on_submit=on_submit,
+            on_close=_back
+        )
+        player.send_form(form)
+
+    def show_sub_land_detail_panel(self, player: Player, sub_land_id: int):
+        """显示子领地详情面板"""
+        sl_info = self.get_sub_land_info(sub_land_id)
+        if not sl_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        parent_land_id = sl_info['parent_land_id']
+        is_owner = sl_info['owner_xuid'] == str(player.xuid) or player.is_op
+        shared_names = [self.get_player_name_by_xuid(uid) or uid for uid in sl_info['shared_users']]
+        shared_str = ', '.join(shared_names) if shared_names else self.language_manager.GetText('LAND_DETAIL_NO_SHARED_USER_TEXT')
+
+        content = self.language_manager.GetText('SUB_LAND_DETAIL_CONTENT').format(
+            sub_land_id,
+            sl_info['sub_land_name'],
+            (sl_info['min_x'], sl_info['min_y'], sl_info['min_z']),
+            (sl_info['max_x'], sl_info['max_y'], sl_info['max_z']),
+            self.get_player_name_by_xuid(sl_info['owner_xuid']) or sl_info['owner_xuid'],
+            shared_str
+        )
+
+        def _back(p):
+            self.show_sub_land_manage_panel(p, parent_land_id)
+
+        panel = ActionForm(
+            title=self.language_manager.GetText('SUB_LAND_DETAIL_PANEL_TITLE'),
+            content=content,
+            on_close=_back
+        )
+
+        if is_owner:
+            panel.add_button(
+                self.language_manager.GetText('SUB_LAND_MANAGE_AUTH_BUTTON_TEXT'),
+                on_click=lambda p=player, sl=sub_land_id: self.show_sub_land_auth_manage_panel(p, sl)
+            )
+            panel.add_button(
+                self.language_manager.GetText('SUB_LAND_RENAME_BUTTON_TEXT'),
+                on_click=lambda p=player, sl=sub_land_id: self.show_rename_sub_land_panel(p, sl)
+            )
+            panel.add_button(
+                self.language_manager.GetText('SUB_LAND_DELETE_BUTTON_TEXT'),
+                on_click=lambda p=player, sl=sub_land_id: self.confirm_delete_sub_land(p, sl)
+            )
+
+        panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=_back
+        )
+        player.send_form(panel)
+
+    def show_rename_sub_land_panel(self, player: Player, sub_land_id: int):
+        sl_info = self.get_sub_land_info(sub_land_id)
+        if not sl_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        def on_submit(p: Player, json_str: str):
+            data = json.loads(json_str)
+            new_name = (data[0] or '').strip()
+            if not new_name:
+                p.send_message(self.language_manager.GetText('CREATE_HOME_EMPTY_NAME_ERROR'))
+                return
+            self.rename_sub_land(sub_land_id, new_name)
+            self.show_sub_land_detail_panel(p, sub_land_id)
+
+        form = ModalForm(
+            title=self.language_manager.GetText('SUB_LAND_RENAME_PANEL_TITLE'),
+            controls=[TextInput(
+                label=self.language_manager.GetText('RENAME_OWN_LAND_PANEL_INPUT_LABEL').format(sub_land_id),
+                placeholder=sl_info['sub_land_name'],
+                default_value=sl_info['sub_land_name']
+            )],
+            on_submit=on_submit,
+            on_close=lambda p=player, sl=sub_land_id: self.show_sub_land_detail_panel(p, sl)
+        )
+        player.send_form(form)
+
+    def confirm_delete_sub_land(self, player: Player, sub_land_id: int):
+        sl_info = self.get_sub_land_info(sub_land_id)
+        if not sl_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        parent_land_id = sl_info['parent_land_id']
+
+        def _back(p):
+            self.show_sub_land_manage_panel(p, parent_land_id)
+
+        panel = ActionForm(
+            title=self.language_manager.GetText('SUB_LAND_CONFIRM_DELETE_TITLE').format(sub_land_id),
+            content=self.language_manager.GetText('SUB_LAND_CONFIRM_DELETE_CONTENT').format(sub_land_id, sl_info['sub_land_name']),
+            on_close=lambda p=player, sl=sub_land_id: self.show_sub_land_detail_panel(p, sl)
+        )
+        panel.add_button(
+            self.language_manager.GetText('SUB_LAND_CONFIRM_DELETE_BUTTON'),
+            on_click=lambda p=player, sl=sub_land_id, back=_back: self._do_delete_sub_land(p, sl, back)
+        )
+        panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=lambda p=player, sl=sub_land_id: self.show_sub_land_detail_panel(p, sl)
+        )
+        player.send_form(panel)
+
+    def _do_delete_sub_land(self, player: Player, sub_land_id: int, back_func):
+        if self.delete_sub_land(sub_land_id):
+            player.send_message(self.language_manager.GetText('SUB_LAND_DELETE_SUCCESS').format(sub_land_id))
+        else:
+            player.send_message(self.language_manager.GetText('SUB_LAND_DELETE_FAILED'))
+        back_func(player)
+
+    def show_sub_land_auth_manage_panel(self, player: Player, sub_land_id: int):
+        """管理子领地授权"""
+        sl_info = self.get_sub_land_info(sub_land_id)
+        if not sl_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+
+        panel = ActionForm(
+            title=self.language_manager.GetText('LAND_AUTH_MANAGE_TITLE'),
+            content=self.language_manager.GetText('SUB_LAND_AUTH_PANEL_CONTENT').format(sub_land_id, sl_info['sub_land_name']),
+            on_close=lambda p=player, sl=sub_land_id: self.show_sub_land_detail_panel(p, sl)
+        )
+        panel.add_button(
+            self.language_manager.GetText('LAND_AUTH_ADD_BUTTON'),
+            on_click=lambda p=player, sl=sub_land_id: self.show_add_sub_land_auth_panel(p, sl)
+        )
+        if sl_info['shared_users']:
+            panel.add_button(
+                self.language_manager.GetText('LAND_AUTH_REMOVE_BUTTON'),
+                on_click=lambda p=player, sl=sub_land_id: self.show_remove_sub_land_auth_panel(p, sl)
+            )
+        panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=lambda p=player, sl=sub_land_id: self.show_sub_land_detail_panel(p, sl)
+        )
+        player.send_form(panel)
+
+    def show_add_sub_land_auth_panel(self, player: Player, sub_land_id: int):
+        sl_info = self.get_sub_land_info(sub_land_id)
+        if not sl_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+        online_players = [p for p in self.server.online_players if str(p.xuid) != str(player.xuid) and str(p.xuid) != sl_info['owner_xuid'] and str(p.xuid) not in sl_info['shared_users']]
+        if not online_players:
+            player.send_message(self.language_manager.GetText('LAND_AUTH_NO_SHARED_USERS'))
+            self.show_sub_land_auth_manage_panel(player, sub_land_id)
+            return
+        panel = ActionForm(
+            title=self.language_manager.GetText('LAND_AUTH_ADD_PANEL_TITLE'),
+            content=self.language_manager.GetText('LAND_AUTH_SELECT_PLAYER_CONTENT'),
+            on_close=lambda p=player, sl=sub_land_id: self.show_sub_land_auth_manage_panel(p, sl)
+        )
+        for op in online_players:
+            panel.add_button(
+                self.language_manager.GetText('LAND_AUTH_ADD_TARGET_BUTTON').format(op.name),
+                on_click=lambda p=player, sl=sub_land_id, target=op: self._do_add_sub_land_auth(p, sl, str(target.xuid), target.name)
+            )
+        player.send_form(panel)
+
+    def _do_add_sub_land_auth(self, player: Player, sub_land_id: int, target_xuid: str, target_name: str):
+        if self.add_sub_land_shared_user(sub_land_id, target_xuid):
+            player.send_message(self.language_manager.GetText('LAND_AUTH_SUCCESS_ADD').format(sub_land_id, target_name))
+        else:
+            player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_ADD'))
+        self.show_sub_land_auth_manage_panel(player, sub_land_id)
+
+    def show_remove_sub_land_auth_panel(self, player: Player, sub_land_id: int):
+        sl_info = self.get_sub_land_info(sub_land_id)
+        if not sl_info or not sl_info['shared_users']:
+            player.send_message(self.language_manager.GetText('LAND_AUTH_NO_SHARED_USERS'))
+            self.show_sub_land_auth_manage_panel(player, sub_land_id)
+            return
+        panel = ActionForm(
+            title=self.language_manager.GetText('LAND_AUTH_REMOVE_PANEL_TITLE'),
+            content=self.language_manager.GetText('LAND_AUTH_SELECT_REMOVE_CONTENT'),
+            on_close=lambda p=player, sl=sub_land_id: self.show_sub_land_auth_manage_panel(p, sl)
+        )
+        for uid in sl_info['shared_users']:
+            name = self.get_player_name_by_xuid(uid) or uid
+            panel.add_button(
+                self.language_manager.GetText('LAND_AUTH_REMOVE_TARGET_BUTTON').format(name),
+                on_click=lambda p=player, sl=sub_land_id, u=uid, n=name: self._do_remove_sub_land_auth(p, sl, u, n)
+            )
+        player.send_form(panel)
+
+    def _do_remove_sub_land_auth(self, player: Player, sub_land_id: int, target_xuid: str, target_name: str):
+        if self.remove_sub_land_shared_user(sub_land_id, target_xuid):
+            player.send_message(self.language_manager.GetText('LAND_AUTH_SUCCESS_REMOVE').format(target_name, sub_land_id))
+        else:
+            player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_REMOVE'))
+        self.show_sub_land_auth_manage_panel(player, sub_land_id)
+
+    # ─── End Sub-land UI ─────────────────────────────────────────────────────────
 
     # OP Panel
     def show_op_main_panel(self, player: Player):
@@ -4933,6 +5719,10 @@ class ARCCorePlugin(Plugin):
                                  on_click=self.show_money_manage_menu)
         op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_MANAGE_ALL_LANDS'),
                                  on_click=self.show_op_all_lands_panel)
+        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_MANAGE_LAND_AT_POS'),
+                                 on_click=self.show_op_land_at_pos)
+        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_REBUILD_CHUNK_MAPPING'),
+                                 on_click=self.show_op_rebuild_chunk_mapping_confirm)
         op_main_panel.add_button(self.language_manager.GetText('INVITE_REWARD_CONFIG_BUTTON'),
                                  on_click=self.show_invite_reward_config_panel)
         op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_RELOAD_CONFIG_BUTTON'),
@@ -4947,6 +5737,121 @@ class ARCCorePlugin(Plugin):
         op_main_panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
                                   on_click=self.show_main_menu)
         player.send_form(op_main_panel)
+
+    def show_op_land_at_pos(self, player: Player):
+        """OP 直接获取脚下私人领地并进入管理面板"""
+        x = math.floor(player.location.x)
+        y = math.floor(player.location.y)
+        z = math.floor(player.location.z)
+        dimension = player.dimension.name.lower()
+
+        # 查找该位置的私人领地（get_land_at_pos 已优先返回非公共领地）
+        land_id = self.get_land_at_pos(dimension, x, z, y)
+        if land_id is None or self.is_public_land(land_id):
+            result_panel = ActionForm(
+                title=self.language_manager.GetText('OP_LAND_AT_POS_TITLE'),
+                content=self.language_manager.GetText('OP_LAND_AT_POS_NOT_FOUND').format(x, y, z),
+                on_close=self.show_op_main_panel
+            )
+            result_panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+                                    on_click=self.show_op_main_panel)
+            player.send_form(result_panel)
+            return
+
+        self.show_op_land_detail_panel(player, land_id, from_page=0)
+
+    def show_op_rebuild_chunk_mapping_confirm(self, player: Player):
+        """OP 确认重建领地区块映射"""
+        confirm = ActionForm(
+            title=self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_TITLE'),
+            content=self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_CONFIRM_CONTENT'),
+            on_close=self.show_op_main_panel
+        )
+        confirm.add_button(
+            self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_CONFIRM_BUTTON'),
+            on_click=self._do_op_rebuild_chunk_mapping
+        )
+        confirm.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=self.show_op_main_panel
+        )
+        player.send_form(confirm)
+
+    def _do_op_rebuild_chunk_mapping(self, player: Player):
+        """执行重建区块映射并反馈结果"""
+        success, message = self.rebuild_chunk_land_mapping()
+        result_panel = ActionForm(
+            title=self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_TITLE'),
+            content=message,
+            on_close=self.show_op_main_panel
+        )
+        result_panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_main_panel)
+        player.send_form(result_panel)
+        if success:
+            player.send_message(self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_DONE'))
+
+    def show_op_force_delete_land_confirm(self, player: Player, land_id: int, from_page: int):
+        """OP 强制删除领地确认面板（私人领地全额退款给主人，公共领地不退款）"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.show_op_land_detail_panel(player, land_id, from_page)
+            return
+
+        is_public = self.is_public_land(land_id)
+        owner_xuid = land_info['owner_xuid']
+        owner_name = self.get_player_name_by_xuid(owner_xuid) or owner_xuid if not is_public else ''
+        refund = 0.0
+        if not is_public:
+            owner_paid = land_info.get('owner_paid_money')
+            if owner_paid is not None:
+                refund = round(float(owner_paid), 2)
+            else:
+                land_volume = ((land_info['max_x'] - land_info['min_x'] + 1) *
+                               (land_info.get('max_y', 255) - land_info.get('min_y', 0) + 1) *
+                               (land_info['max_z'] - land_info['min_z'] + 1))
+                refund = round(float(land_volume) * self.land_price, 2)
+
+        if is_public:
+            content = self.language_manager.GetText('OP_FORCE_DELETE_LAND_CONFIRM_CONTENT_PUBLIC').format(
+                land_id, land_info['land_name']
+            )
+        else:
+            content = self.language_manager.GetText('OP_FORCE_DELETE_LAND_CONFIRM_CONTENT').format(
+                land_id, land_info['land_name'], owner_name,
+                self._format_money_display(refund)
+            )
+
+        confirm_panel = ActionForm(
+            title=self.language_manager.GetText('OP_FORCE_DELETE_LAND_CONFIRM_TITLE').format(land_id),
+            content=content,
+            on_close=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_detail_panel(p, l_id, pg)
+        )
+        confirm_panel.add_button(
+            self.language_manager.GetText('OP_FORCE_DELETE_LAND_CONFIRM_BUTTON'),
+            on_click=lambda p=player, l_id=land_id, o_name=owner_name, r=refund, pg=from_page: self._do_op_force_delete_land(p, l_id, o_name, r, pg)
+        )
+        confirm_panel.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_land_detail_panel(p, l_id, pg)
+        )
+        player.send_form(confirm_panel)
+
+    def _do_op_force_delete_land(self, player: Player, land_id: int, owner_name: str, refund: float, from_page: int):
+        """OP 执行强制删除领地；私人领地全额退款给主人，公共领地不退款"""
+        if self.delete_land(land_id):
+            if refund > 0 and owner_name:
+                self.increase_player_money_by_name(owner_name, refund, notify=True)
+            if refund > 0:
+                player.send_message(self.language_manager.GetText('OP_FORCE_DELETE_LAND_SUCCESS').format(
+                    land_id, owner_name, self._format_money_display(refund)
+                ))
+            else:
+                player.send_message(self.language_manager.GetText('OP_FORCE_DELETE_LAND_SUCCESS_PUBLIC').format(land_id))
+            self.show_op_all_lands_panel(player, from_page)
+        else:
+            player.send_message(self.language_manager.GetText('OP_FORCE_DELETE_LAND_FAILED').format(land_id))
+            self.show_op_land_detail_panel(player, land_id, from_page)
 
     def op_reload_config(self, player: Player):
         """OP 重载配置文件：设置、广播、迎新指令/文案、语言文件"""
@@ -5164,11 +6069,10 @@ class ARCCorePlugin(Plugin):
             return self.op_coordinate2_dict[player.name]
 
     def run_command_as_self(self, player: Player):
-        last_cmd = self.op_last_command_dict.get(player.name, '')
         command_input = TextInput(
             label=self.language_manager.GetText('RUN_COMMAND_PANEL_COMMAND_INPUT_LABEL'),
             placeholder=self.language_manager.GetText('RUN_COMMAND_PANEL_COMMAND_INPUT_PLACEHOLDER').format(player.name),
-            default_value=last_cmd
+            default_value=''
         )
 
         def try_execute_command(player: Player, json_str: str):
@@ -5408,6 +6312,10 @@ class ARCCorePlugin(Plugin):
                 on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_confirm_set_land_public(p, l_id, pg)
             )
         detail_panel.add_button(
+            self.language_manager.GetText('OP_FORCE_DELETE_LAND_BUTTON'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_force_delete_land_confirm(p, l_id, pg)
+        )
+        detail_panel.add_button(
             self.language_manager.GetText('RETURN_BUTTON_TEXT'),
             on_click=lambda p=player, pg=from_page: self.show_op_all_lands_panel(p, pg)
         )
@@ -5638,6 +6546,8 @@ class ARCCorePlugin(Plugin):
         status_lines.append('开放爆炸: ' + (self.language_manager.GetText('LAND_EXPLOSION_STATUS_ENABLED') if land_info.get('allow_explosion') else self.language_manager.GetText('LAND_EXPLOSION_STATUS_DISABLED')))
         status_lines.append('开放生物互动: ' + (self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_ENABLED') if land_info.get('allow_actor_interaction') else self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_DISABLED')))
         status_lines.append('开放生物伤害: ' + (self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_ENABLED') if land_info.get('allow_actor_damage') else self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_DISABLED')))
+        anpl_enabled = self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_STATUS_ENABLED') if land_info.get('allow_non_public_land') else self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_STATUS_DISABLED')
+        status_lines.append(self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_CURRENT_STATUS').format(anpl_enabled))
         content = '\n'.join(status_lines)
         settings_panel = ActionForm(
             title=self.language_manager.GetText('OP_PUBLIC_LAND_SETTINGS_BUTTON'),
@@ -5659,6 +6569,10 @@ class ARCCorePlugin(Plugin):
         settings_panel.add_button(
             self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_BUTTON_TEXT'),
             on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_toggle_panel(p, l_id, 'allow_actor_damage', pg)
+        )
+        settings_panel.add_button(
+            self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_SETTING_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_toggle_panel(p, l_id, 'allow_non_public_land', pg)
         )
         settings_panel.add_button(
             self.language_manager.GetText('RETURN_BUTTON_TEXT'),
@@ -5683,6 +6597,9 @@ class ARCCorePlugin(Plugin):
         elif setting_key == 'allow_actor_interaction':
             status_text = self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_ENABLED') if current else self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_DISABLED')
             title = self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_TITLE')
+        elif setting_key == 'allow_non_public_land':
+            status_text = self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_STATUS_ENABLED') if current else self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_STATUS_DISABLED')
+            title = self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_SETTING_BUTTON_TEXT')
         else:  # allow_actor_damage
             status_text = self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_ENABLED') if current else self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_DISABLED')
             title = self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_TITLE')
@@ -5691,7 +6608,13 @@ class ARCCorePlugin(Plugin):
             content=status_text,
             on_close=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_settings_panel(p, l_id, pg)
         )
-        enable_key = {'allow_public_interact': ('LAND_PUBLIC_INTERACT_TOGGLE_ENABLE_BUTTON', 'LAND_PUBLIC_INTERACT_TOGGLE_DISABLE_BUTTON'), 'allow_explosion': ('LAND_EXPLOSION_TOGGLE_ENABLE_BUTTON', 'LAND_EXPLOSION_TOGGLE_DISABLE_BUTTON'), 'allow_actor_interaction': ('LAND_ACTOR_INTERACTION_TOGGLE_ENABLE_BUTTON', 'LAND_ACTOR_INTERACTION_TOGGLE_DISABLE_BUTTON'), 'allow_actor_damage': ('LAND_ACTOR_DAMAGE_TOGGLE_ENABLE_BUTTON', 'LAND_ACTOR_DAMAGE_TOGGLE_DISABLE_BUTTON')}[setting_key]
+        enable_key = {
+            'allow_public_interact': ('LAND_PUBLIC_INTERACT_TOGGLE_ENABLE_BUTTON', 'LAND_PUBLIC_INTERACT_TOGGLE_DISABLE_BUTTON'),
+            'allow_explosion': ('LAND_EXPLOSION_TOGGLE_ENABLE_BUTTON', 'LAND_EXPLOSION_TOGGLE_DISABLE_BUTTON'),
+            'allow_actor_interaction': ('LAND_ACTOR_INTERACTION_TOGGLE_ENABLE_BUTTON', 'LAND_ACTOR_INTERACTION_TOGGLE_DISABLE_BUTTON'),
+            'allow_actor_damage': ('LAND_ACTOR_DAMAGE_TOGGLE_ENABLE_BUTTON', 'LAND_ACTOR_DAMAGE_TOGGLE_DISABLE_BUTTON'),
+            'allow_non_public_land': ('ALLOW_NON_PUBLIC_LAND_TOGGLE_ENABLE_BUTTON', 'ALLOW_NON_PUBLIC_LAND_TOGGLE_DISABLE_BUTTON'),
+        }[setting_key]
         btn_text = self.language_manager.GetText(enable_key[0]) if not current else self.language_manager.GetText(enable_key[1])
         toggle_panel.add_button(
             btn_text,
@@ -5706,6 +6629,7 @@ class ARCCorePlugin(Plugin):
             'allow_explosion': ('allow_explosion', 'LAND_EXPLOSION_SETTING_UPDATED_ENABLE', 'LAND_EXPLOSION_SETTING_UPDATED_DISABLE', 'LAND_EXPLOSION_SETTING_FAILED'),
             'allow_actor_interaction': ('allow_actor_interaction', 'LAND_ACTOR_INTERACTION_SETTING_UPDATED_ENABLE', 'LAND_ACTOR_INTERACTION_SETTING_UPDATED_DISABLE', 'LAND_ACTOR_INTERACTION_SETTING_FAILED'),
             'allow_actor_damage': ('allow_actor_damage', 'LAND_ACTOR_DAMAGE_SETTING_UPDATED_ENABLE', 'LAND_ACTOR_DAMAGE_SETTING_UPDATED_DISABLE', 'LAND_ACTOR_DAMAGE_SETTING_FAILED'),
+            'allow_non_public_land': ('allow_non_public_land', 'ALLOW_NON_PUBLIC_LAND_UPDATED_ENABLE', 'ALLOW_NON_PUBLIC_LAND_UPDATED_DISABLE', 'ALLOW_NON_PUBLIC_LAND_FAILED'),
         }
         col, msg_enable, msg_disable, msg_fail = column_map[setting_key]
         try:
