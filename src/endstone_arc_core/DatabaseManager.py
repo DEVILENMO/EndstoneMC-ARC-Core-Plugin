@@ -1,5 +1,5 @@
 import sqlite3
-from typing import Any, List, Dict, Optional, Union
+from typing import Any, List, Dict, Optional
 import threading
 from pathlib import Path
 

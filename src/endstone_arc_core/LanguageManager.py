@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 MAIN_PATH = 'plugins/ARCCore'
@@ -37,7 +36,7 @@ class LanguageManager:
 
         # If the target language hasn't been loaded yet, load it
         if target_lang not in LanguageManager.language_dict:
-            temp_manager = LanguageManager(target_lang)
+            LanguageManager(target_lang)  # 触发加载该语言文件到 language_dict
 
         # If key doesn't exist in target language, add it
         if key not in LanguageManager.language_dict[target_lang]:
