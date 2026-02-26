@@ -14,9 +14,10 @@ from endstone.event import event_handler, PlayerJoinEvent, PlayerQuitEvent, Bloc
 from endstone.plugin import Plugin
 
 from endstone_arc_core.DatabaseManager import DatabaseManager
+from endstone_arc_core.Economy import Economy
 from endstone_arc_core.LanguageManager import LanguageManager
 from endstone_arc_core.SettingManager import SettingManager
-from endstone_arc_core.MigrationManager import MigrationManager
+from endstone_arc_core.TeleportSystem import TeleportSystem, generate_tp_command_to_position, generate_tp_command_to_player
 
 MAIN_PATH = 'plugins/ARCCore'
 
@@ -86,7 +87,8 @@ class ARCCorePlugin(Plugin):
         default_language_dode = self.setting_manager.GetSetting('DEFAULT_LANGUAGE_CODE')
         self.language_manager = LanguageManager(default_language_dode if default_language_dode is not None else 'ZH-CN')
         self.database_manager = DatabaseManager(Path(MAIN_PATH) / self.setting_manager.GetSetting('DATABASE_PATH'))
-        self.migration_manager = MigrationManager(self.database_manager)
+        self.economy = Economy(self.database_manager, self.setting_manager)
+        self.teleport_system = TeleportSystem(self.database_manager, self.setting_manager)
         self.init_database()
 
         self.if_protect_spawn = self.setting_manager.GetSetting('IF_PROTECT_SPAWN')
@@ -144,81 +146,6 @@ class ARCCorePlugin(Plugin):
         self.position_thread_lock = threading.Lock()
         self.position_check_interval = 0.5  # 每0.5秒检查一次，比原来的1.25秒更快
 
-        # 死亡回归系统
-        self.player_death_locations = {}  # 存储玩家死亡位置 {player_name: {'dimension': str, 'x': float, 'y': float, 'z': float}}
-
-        # 传送系统
-        self.max_player_home_num = self.setting_manager.GetSetting('MAX_PLAYER_HOME_NUM')
-        try:
-            self.max_player_home_num = int(self.max_player_home_num)
-        except (ValueError, TypeError):
-            self.max_player_home_num = 3
-        self.teleport_requests = {}  # 存储传送请求 {player_name: {'type': 'tpa'/'tphere', 'target': target_name, 'expire_time': time}}
-        
-        # 随机传送配置
-        self.enable_random_teleport = self.setting_manager.GetSetting('ENABLE_RANDOM_TELEPORT')
-        if self.enable_random_teleport is None:
-            self.enable_random_teleport = True
-        else:
-            try:
-                self.enable_random_teleport = str(self.enable_random_teleport).lower() in ['true', '1', 'yes']
-            except (ValueError, AttributeError):
-                self.enable_random_teleport = True
-        
-        self.random_teleport_center_x = self.setting_manager.GetSetting('RANDOM_TELEPORT_CENTER_X')
-        try:
-            self.random_teleport_center_x = int(self.random_teleport_center_x)
-        except (ValueError, TypeError):
-            self.random_teleport_center_x = 0
-            
-        self.random_teleport_center_z = self.setting_manager.GetSetting('RANDOM_TELEPORT_CENTER_Z')
-        try:
-            self.random_teleport_center_z = int(self.random_teleport_center_z)
-        except (ValueError, TypeError):
-            self.random_teleport_center_z = 0
-            
-        self.random_teleport_radius = self.setting_manager.GetSetting('RANDOM_TELEPORT_RADIUS')
-        try:
-            self.random_teleport_radius = int(self.random_teleport_radius)
-        except (ValueError, TypeError):
-            self.random_teleport_radius = 5000
-        
-        # 传送收费配置
-        self.teleport_cost_public_warp = self.setting_manager.GetSetting('TELEPORT_COST_PUBLIC_WARP')
-        try:
-            self.teleport_cost_public_warp = int(self.teleport_cost_public_warp)
-        except (ValueError, TypeError):
-            self.teleport_cost_public_warp = 0
-            
-        self.teleport_cost_home = self.setting_manager.GetSetting('TELEPORT_COST_HOME')
-        try:
-            self.teleport_cost_home = int(self.teleport_cost_home)
-        except (ValueError, TypeError):
-            self.teleport_cost_home = 0
-            
-        self.teleport_cost_land = self.setting_manager.GetSetting('TELEPORT_COST_LAND')
-        try:
-            self.teleport_cost_land = int(self.teleport_cost_land)
-        except (ValueError, TypeError):
-            self.teleport_cost_land = 0
-            
-        self.teleport_cost_death_location = self.setting_manager.GetSetting('TELEPORT_COST_DEATH_LOCATION')
-        try:
-            self.teleport_cost_death_location = int(self.teleport_cost_death_location)
-        except (ValueError, TypeError):
-            self.teleport_cost_death_location = 0
-            
-        self.teleport_cost_random = self.setting_manager.GetSetting('TELEPORT_COST_RANDOM')
-        try:
-            self.teleport_cost_random = int(self.teleport_cost_random)
-        except (ValueError, TypeError):
-            self.teleport_cost_random = 100
-            
-        self.teleport_cost_player = self.setting_manager.GetSetting('TELEPORT_COST_PLAYER')
-        try:
-            self.teleport_cost_player = int(self.teleport_cost_player)
-        except (ValueError, TypeError):
-            self.teleport_cost_player = 50
 
         # 公告系统
         self.broadcast_messages = []  # 存储公告消息列表
@@ -347,11 +274,9 @@ class ARCCorePlugin(Plugin):
     def on_enable(self) -> None:
         self.register_events(self)
         self.logger.info(f"{ColorFormat.YELLOW}[ARC Core]Plugin enabled!")
-        
-        # 设置迁移管理器的日志记录器并执行迁移
-        self.migration_manager.set_logger(self.logger)
-        if not self.migration_manager.migrate_to_xuid():
-            self.logger.warning(f"{ColorFormat.RED}[ARC Core]No migration executed.")
+        self.economy.set_logger(self.logger)
+        self.teleport_system.set_server(self.server)
+        self.teleport_system.set_logger(self.logger)
 
         # 初始化公告系统和清道夫系统
         self._load_broadcast_messages()
@@ -362,7 +287,7 @@ class ARCCorePlugin(Plugin):
 
         # Scheduler tasks
         # 移除了原有的 player_position_listener，现在使用多线程方式
-        self.server.scheduler.run_task(self, self.cleanup_expired_teleport_requests, delay=0, period=100)  # 每5秒清理一次过期请求
+        self.server.scheduler.run_task(self, self.teleport_system.cleanup_expired_requests, delay=0, period=100)  # 每5秒清理一次过期请求
         
         # 公告系统定时任务
         if self.broadcast_messages:
@@ -533,8 +458,7 @@ class ARCCorePlugin(Plugin):
                 del self.player_in_land_id_dict[event.player.name]
         
         # 清理死亡位置记录
-        if event.player.name in self.player_death_locations:
-            del self.player_death_locations[event.player.name]
+        self.teleport_system.clear_death_location(event.player.name)
 
     @event_handler
     def on_block_break(self, event: BlockBreakEvent):
@@ -569,12 +493,13 @@ class ARCCorePlugin(Plugin):
     @event_handler
     def on_actor_death(self, event: PlayerDeathEvent):
         # 记录玩家死亡位置
-        self.player_death_locations[event.player.name] = {
-            'dimension': event.player.location.dimension.name,
-            'x': event.player.location.x,
-            'y': event.player.location.y,
-            'z': event.player.location.z
-        }
+        self.teleport_system.record_death_location(
+            event.player.name,
+            event.player.location.dimension.name,
+            event.player.location.x,
+            event.player.location.y,
+            event.player.location.z,
+        )
         event.player.send_message(self.language_manager.GetText('DEATH_LOCATION_RECORDED'))
         
         # 发送死亡播报
@@ -979,11 +904,11 @@ class ARCCorePlugin(Plugin):
     def init_database(self):
         self.init_player_basic_table()
         self.init_spawn_locations_table()
-        self.init_economy_table()
-        self._upgrade_player_economy_table_to_float()
+        self.economy.init_economy_table()
+        self.economy.upgrade_player_economy_table_to_float()
         self.init_land_tables()
         self.init_sub_land_table()
-        self.init_teleport_tables()
+        self.teleport_system.init_teleport_tables()
 
     # Player basic info
     def _column_exists(self, table: str, column: str) -> bool:
@@ -1120,37 +1045,8 @@ class ARCCorePlugin(Plugin):
             return False
 
     def init_player_economy_info(self, player: Player) -> bool:
-        """
-        初始化玩家经济信息
-        :param player: 玩家对象
-        :return: 是否初始化成功
-        """
-        try:
-            player_xuid = str(player.xuid)
-            # 检查玩家经济数据是否已存在
-            existing_data = self.database_manager.query_one(
-                "SELECT xuid FROM player_economy WHERE xuid = ?",
-                (player_xuid,)
-            )
-            if existing_data:
-                return True  # 已存在，无需重复创建
-
-            # 获取初始金钱设置（支持小数，精确到分）
-            player_init_money_num = self.setting_manager.GetSetting('PLAYER_INIT_MONEY_NUM')
-            try:
-                init_money = self._round_money(float(player_init_money_num))
-            except (ValueError, TypeError):
-                init_money = 0.0
-
-            # 创建经济数据
-            economy_data = {
-                'xuid': player_xuid,
-                'money': init_money
-            }
-            return self.database_manager.insert('player_economy', economy_data)
-        except Exception as e:
-            self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Init player economy info error: {str(e)}")
-            return False
+        """初始化玩家经济信息（委托 Economy）"""
+        return self.economy.init_player_economy_by_xuid(str(player.xuid))
 
     def ensure_player_data_initialized(self, player: Player) -> tuple[bool, bool]:
         """
@@ -1770,194 +1666,66 @@ class ARCCorePlugin(Plugin):
             self.player_authentication_state[player.name] = False
         return self.player_authentication_state[player.name]
 
-    # Economy system（金钱以 float 存储，精确到分，两位小数）
+    # Economy system（委托 Economy 模块，金钱以 float 存储，精确到分）
     def _round_money(self, value: float) -> float:
-        """将金额四舍五入到分（两位小数）"""
-        return round(float(value), 2)
+        return self.economy.round_money(value)
 
     def _format_money_display(self, value: float) -> str:
-        """格式化金额用于界面显示（始终两位小数）"""
-        return "%.2f" % self._round_money(value)
-
-    def init_economy_table(self) -> bool:
-        """初始化经济系统表格（money 使用 REAL，支持小数到分）"""
-        fields = {
-            'xuid': 'TEXT PRIMARY KEY',  # 玩家XUID字符串作为主键
-            'money': 'REAL NOT NULL DEFAULT 0'  # 玩家金钱数量，支持小数，精确到分
-        }
-        return self.database_manager.create_table('player_economy', fields)
-
-    def _upgrade_player_economy_table_to_float(self) -> bool:
-        """若 player_economy 表中 money 列为 INTEGER，则迁移为 REAL（仅执行一次）"""
-        try:
-            if not self.database_manager.table_exists('player_economy'):
-                return True
-            columns_info = self.database_manager.query_all("PRAGMA table_info(player_economy)")
-            money_type = None
-            for col in columns_info:
-                if col.get('name') == 'money':
-                    money_type = str(col.get('type', '')).upper()
-                    break
-            if money_type != 'INTEGER':
-                return True
-            # 创建新表（REAL），复制数据，替换旧表
-            self.database_manager.execute(
-                "CREATE TABLE player_economy_new (xuid TEXT PRIMARY KEY, money REAL NOT NULL DEFAULT 0)"
-            )
-            self.database_manager.execute(
-                "INSERT INTO player_economy_new (xuid, money) SELECT xuid, CAST(money AS REAL) FROM player_economy"
-            )
-            self.database_manager.execute("DROP TABLE player_economy")
-            self.database_manager.execute("ALTER TABLE player_economy_new RENAME TO player_economy")
-            print("[ARC Core]Upgraded player_economy money column to REAL (float).")
-            return True
-        except Exception as e:
-            print(f"[ARC Core]Upgrade player_economy to float error: {str(e)}")
-            return False
+        return self.economy.format_money_display(value)
 
     def _set_player_money_by_name(self, player_name: str, amount: float) -> bool:
-        """
-        设置玩家金钱（底层函数，基于玩家名称）
-        :param player_name: 玩家名称
-        :param amount: 金钱数量（支持小数，精确到分）
-        :return: 是否设置成功
-        """
-        try:
-            amount = self._round_money(amount)
-
-            player_xuid = self.get_player_xuid_by_name(player_name)
-            if not player_xuid:
+        player_xuid = self.get_player_xuid_by_name(player_name)
+        if not player_xuid:
+            if self.logger:
                 self.logger.error(f"{ColorFormat.RED}[ARC Core]Player {player_name} not found")
-                return False
-
-            return self.database_manager.update(
-                table='player_economy',
-                data={'money': amount},
-                where='xuid = ?',
-                params=(player_xuid,)
-            )
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Set player money error: {str(e)}")
             return False
+        return self.economy.set_player_money_by_xuid(player_xuid, amount)
 
     def _set_player_money(self, player: Player, amount: float) -> bool:
-        """
-        设置玩家金钱（Player对象封装器）
-        :param player: 玩家对象
-        :param amount: 金钱数量（支持小数，精确到分）
-        :return: 是否设置成功
-        """
         return self._set_player_money_by_name(player.name, amount)
 
     def get_player_money_by_name(self, player_name: str) -> float:
-        """
-        获取玩家金钱（底层函数，基于玩家名称）
-        :param player_name: 玩家名称
-        :return: 玩家金钱数量（精确到分）
-        """
-        try:
-            player_xuid = self.get_player_xuid_by_name(player_name)
-            if not player_xuid:
-                return 0.0
-
-            result = self.database_manager.query_one(
-                "SELECT money FROM player_economy WHERE xuid = ?",
-                (player_xuid,)
-            )
-            if result is None:
-                player_init_money_num = self.setting_manager.GetSetting('PLAYER_INIT_MONEY_NUM')
-                try:
-                    init_money = self._round_money(float(player_init_money_num))
-                except (ValueError, TypeError):
-                    init_money = 0.0
-                self.database_manager.insert(
-                    'player_economy',
-                    {'xuid': player_xuid, 'money': init_money}
-                )
-                return init_money
-            return self._round_money(result['money'])
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money error: {str(e)}")
-            return 0.0
+        player_xuid = self.get_player_xuid_by_name(player_name)
+        return self.economy.get_player_money_by_xuid(player_xuid) if player_xuid else 0.0
 
     def get_player_money(self, player: Player) -> float:
-        """
-        获取玩家金钱（Player对象封装器）
-        :param player: 玩家对象
-        :return: 玩家金钱数量（精确到分）
-        """
-        return self.get_player_money_by_name(player.name)
+        return self.economy.get_player_money_by_xuid(str(player.xuid))
 
     def increase_player_money_by_name(self, player_name: str, amount: float, notify: bool = True) -> bool:
-        """
-        增加玩家金钱（底层函数，基于玩家名称）
-        :param player_name: 玩家名称
-        :param amount: 增加的金钱数量（支持小数，精确到分）
-        :param notify: 是否通知在线玩家
-        :return: 是否操作成功
-        """
-        try:
-            amount = abs(self._round_money(amount))
-            if amount <= 0:
-                return True
-            current_money = self.get_player_money_by_name(player_name)
-            new_money = self._round_money(current_money + amount)
-            success = self._set_player_money_by_name(player_name, new_money)
-
-            if success and notify:
-                online_player = self.server.get_player(player_name)
-                if online_player is not None:
-                    online_player.send_message(
-                        self.language_manager.GetText('MONEY_ADD_HINT').format(
-                            self._format_money_display(amount),
-                            self._format_money_display(new_money)
-                        )
-                    )
-
-            return success
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Add player money error: {str(e)}")
+        player_xuid = self.get_player_xuid_by_name(player_name)
+        if not player_xuid:
             return False
+        success = self.economy.increase_player_money_by_xuid(player_xuid, amount)
+        if success and notify:
+            online_player = self.server.get_player(player_name)
+            if online_player is not None:
+                new_money = self.economy.get_player_money_by_xuid(player_xuid)
+                online_player.send_message(
+                    self.language_manager.GetText('MONEY_ADD_HINT').format(
+                        self._format_money_display(amount),
+                        self._format_money_display(new_money)
+                    )
+                )
+        return success
 
     def decrease_player_money_by_name(self, player_name: str, amount: float, notify: bool = True) -> bool:
-        """
-        减少玩家金钱（底层函数，基于玩家名称）
-        :param player_name: 玩家名称
-        :param amount: 减少的金钱数量（支持小数，精确到分）
-        :param notify: 是否通知在线玩家
-        :return: 是否操作成功
-        """
-        try:
-            amount = abs(self._round_money(amount))
-            if amount <= 0:
-                return True
-            current_money = self.get_player_money_by_name(player_name)
-            new_money = self._round_money(current_money - amount)
-            success = self._set_player_money_by_name(player_name, new_money)
-
-            if success and notify:
-                online_player = self.server.get_player(player_name)
-                if online_player is not None:
-                    online_player.send_message(
-                        self.language_manager.GetText('MONEY_REDUCE_HINT').format(
-                            self._format_money_display(amount),
-                            self._format_money_display(new_money)
-                        )
-                    )
-
-            return success
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Remove player money error: {str(e)}")
+        player_xuid = self.get_player_xuid_by_name(player_name)
+        if not player_xuid:
             return False
+        success = self.economy.decrease_player_money_by_xuid(player_xuid, amount)
+        if success and notify:
+            online_player = self.server.get_player(player_name)
+            if online_player is not None:
+                new_money = self.economy.get_player_money_by_xuid(player_xuid)
+                online_player.send_message(
+                    self.language_manager.GetText('MONEY_REDUCE_HINT').format(
+                        self._format_money_display(amount),
+                        self._format_money_display(new_money)
+                    )
+                )
+        return success
 
     def change_player_money_by_name(self, player_name: str, money_to_change: float, notify: bool = True) -> bool:
-        """
-        改变玩家金钱（底层函数，基于玩家名称）
-        :param player_name: 玩家名称
-        :param money_to_change: 要改变的金钱数量（正数为增加，负数为减少），支持小数
-        :param notify: 是否通知在线玩家
-        :return: 是否操作成功
-        """
         m = self._round_money(money_to_change)
         if m == 0:
             return True
@@ -1966,21 +1734,9 @@ class ARCCorePlugin(Plugin):
         return self.decrease_player_money_by_name(player_name, abs(m), notify)
 
     def increase_player_money(self, player: Player, amount: float) -> bool:
-        """
-        增加玩家金钱（Player对象封装器）
-        :param player: 玩家对象
-        :param amount: 增加的金钱数量（支持小数，精确到分）
-        :return: 是否操作成功
-        """
         return self.increase_player_money_by_name(player.name, amount)
 
     def decrease_player_money(self, player: Player, amount: float) -> bool:
-        """
-        减少玩家金钱（Player对象封装器）
-        :param player: 玩家对象
-        :param amount: 减少的金钱数量（支持小数，精确到分）
-        :return: 是否操作成功
-        """
         return self.decrease_player_money_by_name(player.name, amount)
 
     def get_player_free_land_blocks(self, player: Player) -> int:
@@ -2110,68 +1866,25 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Add pending invite rewards error: {str(e)}")
 
     def get_top_richest_players(self, top_count: int) -> Dict[str, float]:
-        try:
-            results = self.database_manager.query_all(
-                "SELECT * FROM player_economy ORDER BY money DESC LIMIT ?",
-                (top_count,)
-            )
-
-            rich_list = {}
-            for entry in results:
-                try:
-                    xuid_str = entry['xuid']
-                    player_name = self.get_player_name_by_xuid(xuid_str)
-                    if player_name:
-                        rich_list[player_name] = self._round_money(entry['money'])
-                except Exception:
-                    continue
-
-            return rich_list
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get top richest players error: {str(e)}")
-            return {}
+        rich_list = {}
+        for entry in self.economy.get_top_richest_xuids(top_count):
+            try:
+                player_name = self.get_player_name_by_xuid(entry['xuid'])
+                if player_name:
+                    rich_list[player_name] = self._round_money(entry['money'])
+            except Exception:
+                continue
+        return rich_list
 
     def get_player_money_rank(self, player: Player) -> Optional[int]:
-        """
-        获取玩家金钱排名
-        :param player: 玩家对象
-        :return: 玩家排名（从1开始），如果玩家不存在则返回None
-        """
-        try:
-            # 使用SQL的ROW_NUMBER()函数来获取排名
-            result = self.database_manager.query_one("""
-                WITH RankedPlayers AS (
-                    SELECT xuid, money,
-                    ROW_NUMBER() OVER (ORDER BY money DESC) as rank
-                    FROM player_economy
-                )
-                SELECT rank 
-                FROM RankedPlayers 
-                WHERE xuid = ?
-            """, (str(player.xuid),))
-
-            return result['rank'] if result else None
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money rank error: {str(e)}")
-            return None
+        return self.economy.get_player_money_rank_by_xuid(str(player.xuid))
 
     def judge_if_player_has_enough_money_by_name(self, player_name: str, amount: float) -> bool:
-        """
-        判断玩家是否有足够金钱（底层函数，基于玩家名称）
-        :param player_name: 玩家名称
-        :param amount: 需要的金钱数量（支持小数）
-        :return: 是否有足够金钱
-        """
-        return self.get_player_money_by_name(player_name) >= abs(self._round_money(amount))
+        player_xuid = self.get_player_xuid_by_name(player_name)
+        return self.economy.judge_if_player_has_enough_money_by_xuid(player_xuid, amount) if player_xuid else False
 
     def judge_if_player_has_enough_money(self, player: Player, amount: float) -> bool:
-        """
-        判断玩家是否有足够金钱（Player对象封装器）
-        :param player: 玩家对象
-        :param amount: 需要的金钱数量（支持小数）
-        :return: 是否有足够金钱
-        """
-        return self.judge_if_player_has_enough_money_by_name(player.name, amount)
+        return self.economy.judge_if_player_has_enough_money_by_xuid(str(player.xuid), amount)
 
     # Bank
     def show_bank_main_menu(self, player: Player):
@@ -2397,35 +2110,35 @@ class ARCCorePlugin(Plugin):
         
         # 公共传送点按钮
         public_warp_text = self.language_manager.GetText('TELEPORT_MAIN_MENU_PUBLIC_WARP_BUTTON')
-        if self.teleport_cost_public_warp > 0:
-            public_warp_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(public_warp_text, self.teleport_cost_public_warp)
+        if self.teleport_system.teleport_cost_public_warp > 0:
+            public_warp_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(public_warp_text, self.teleport_system.teleport_cost_public_warp)
         teleport_main_menu.add_button(public_warp_text, on_click=self.show_public_warp_menu)
         
         # 私人传送点按钮
         home_text = self.language_manager.GetText('TELEPORT_MAIN_MENU_HOME_BUTTON')
-        if self.teleport_cost_home > 0:
-            home_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(home_text, self.teleport_cost_home)
+        if self.teleport_system.teleport_cost_home > 0:
+            home_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(home_text, self.teleport_system.teleport_cost_home)
         teleport_main_menu.add_button(home_text, on_click=self.show_home_menu)
         
         # 随机传送按钮
-        if self.enable_random_teleport:
+        if self.teleport_system.enable_random_teleport:
             random_text = self.language_manager.GetText('TELEPORT_MAIN_MENU_RANDOM_BUTTON')
-            if self.teleport_cost_random > 0:
-                random_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(random_text, self.teleport_cost_random)
+            if self.teleport_system.teleport_cost_random > 0:
+                random_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(random_text, self.teleport_system.teleport_cost_random)
             teleport_main_menu.add_button(random_text, on_click=self.start_random_teleport)
         
         # 如果玩家有死亡位置记录，显示返回死亡地点的按钮
-        if player.name in self.player_death_locations:
-            death_location = self.player_death_locations[player.name]
+        if self.teleport_system.has_death_location(player.name):
+            death_location = self.teleport_system.get_death_location(player.name)
             death_text = self.language_manager.GetText('TELEPORT_MAIN_MENU_DEATH_LOCATION_BUTTON').format(death_location['dimension'])
-            if self.teleport_cost_death_location > 0:
-                death_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(death_text, self.teleport_cost_death_location)
+            if self.teleport_system.teleport_cost_death_location > 0:
+                death_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(death_text, self.teleport_system.teleport_cost_death_location)
             teleport_main_menu.add_button(death_text, on_click=self.teleport_to_death_location)
         
         # 玩家传送请求按钮
         player_request_text = self.language_manager.GetText('TELEPORT_MAIN_MENU_PLAYER_REQUEST_BUTTON')
-        if self.teleport_cost_player > 0:
-            player_request_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(player_request_text, self.teleport_cost_player)
+        if self.teleport_system.teleport_cost_player > 0:
+            player_request_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(player_request_text, self.teleport_system.teleport_cost_player)
         teleport_main_menu.add_button(player_request_text, on_click=self.show_player_teleport_request_menu)
         
         if player.is_op:
@@ -2436,156 +2149,39 @@ class ARCCorePlugin(Plugin):
                                       on_click=self.show_main_menu)
         player.send_form(teleport_main_menu)
 
-    # Teleport System Database
-    def init_teleport_tables(self) -> bool:
-        """初始化传送系统相关数据表"""
-        try:
-            # 公共传送点表
-            warp_fields = {
-                'warp_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
-                'warp_name': 'TEXT NOT NULL UNIQUE',
-                'dimension': 'TEXT NOT NULL',
-                'x': 'REAL NOT NULL',
-                'y': 'REAL NOT NULL',
-                'z': 'REAL NOT NULL',
-                'created_by': 'TEXT NOT NULL',  # 创建者XUID
-                'created_time': 'INTEGER NOT NULL'  # 创建时间戳
-            }
-            
-            # 玩家私人传送点表
-            home_fields = {
-                'home_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
-                'owner_xuid': 'TEXT NOT NULL',
-                'home_name': 'TEXT NOT NULL',
-                'dimension': 'TEXT NOT NULL',
-                'x': 'REAL NOT NULL',
-                'y': 'REAL NOT NULL',
-                'z': 'REAL NOT NULL',
-                'created_time': 'INTEGER NOT NULL'
-            }
-            
-            return (self.database_manager.create_table('public_warps', warp_fields) and
-                    self.database_manager.create_table('player_homes', home_fields))
-        except Exception as e:
-            self.logger.error(f"Init teleport tables error: {str(e)}")
-            return False
-
-    # Public Warps Management
+    # Teleport System（委托 TeleportSystem）
     def create_public_warp(self, warp_name: str, dimension: str, x: float, y: float, z: float, creator_xuid: str) -> bool:
-        """创建公共传送点"""
-        try:
-            import time
-            warp_data = {
-                'warp_name': warp_name,
-                'dimension': dimension,
-                'x': x,
-                'y': y,
-                'z': z,
-                'created_by': creator_xuid,
-                'created_time': int(time.time())
-            }
-            return self.database_manager.insert('public_warps', warp_data)
-        except Exception as e:
-            self.logger.error(f"Create public warp error: {str(e)}")
-            return False
+        return self.teleport_system.create_public_warp(warp_name, dimension, x, y, z, creator_xuid)
 
     def delete_public_warp(self, warp_name: str) -> bool:
-        """删除公共传送点"""
-        try:
-            return self.database_manager.delete('public_warps', 'warp_name = ?', (warp_name,))
-        except Exception as e:
-            self.logger.error(f"Delete public warp error: {str(e)}")
-            return False
+        return self.teleport_system.delete_public_warp(warp_name)
 
     def get_public_warp(self, warp_name: str) -> Optional[Dict[str, Any]]:
-        """获取公共传送点信息"""
-        try:
-            return self.database_manager.query_one(
-                "SELECT * FROM public_warps WHERE warp_name = ?",
-                (warp_name,)
-            )
-        except Exception as e:
-            self.logger.error(f"Get public warp error: {str(e)}")
-            return None
+        return self.teleport_system.get_public_warp(warp_name)
 
     def get_all_public_warps(self) -> Dict[str, Dict[str, Any]]:
-        """获取所有公共传送点"""
-        try:
-            results = self.database_manager.query_all("SELECT * FROM public_warps ORDER BY warp_name")
-            return {row['warp_name']: row for row in results}
-        except Exception as e:
-            self.logger.error(f"Get all public warps error: {str(e)}")
-            return {}
+        return self.teleport_system.get_all_public_warps()
 
     def public_warp_exists(self, warp_name: str) -> bool:
-        """检查公共传送点是否存在"""
-        return self.get_public_warp(warp_name) is not None
+        return self.teleport_system.public_warp_exists(warp_name)
 
-    # Player Homes Management
     def create_player_home(self, owner_xuid: str, home_name: str, dimension: str, x: float, y: float, z: float) -> bool:
-        """创建玩家传送点"""
-        try:
-            import time
-            home_data = {
-                'owner_xuid': owner_xuid,
-                'home_name': home_name,
-                'dimension': dimension,
-                'x': x,
-                'y': y,
-                'z': z,
-                'created_time': int(time.time())
-            }
-            return self.database_manager.insert('player_homes', home_data)
-        except Exception as e:
-            self.logger.error(f"Create player home error: {str(e)}")
-            return False
+        return self.teleport_system.create_player_home(owner_xuid, home_name, dimension, x, y, z)
 
     def delete_player_home(self, owner_xuid: str, home_name: str) -> bool:
-        """删除玩家传送点"""
-        try:
-            return self.database_manager.delete('player_homes', 'owner_xuid = ? AND home_name = ?', (owner_xuid, home_name))
-        except Exception as e:
-            self.logger.error(f"Delete player home error: {str(e)}")
-            return False
+        return self.teleport_system.delete_player_home(owner_xuid, home_name)
 
     def get_player_home(self, owner_xuid: str, home_name: str) -> Optional[Dict[str, Any]]:
-        """获取玩家传送点信息"""
-        try:
-            return self.database_manager.query_one(
-                "SELECT * FROM player_homes WHERE owner_xuid = ? AND home_name = ?",
-                (owner_xuid, home_name)
-            )
-        except Exception as e:
-            self.logger.error(f"Get player home error: {str(e)}")
-            return None
+        return self.teleport_system.get_player_home(owner_xuid, home_name)
 
     def get_player_homes(self, owner_xuid: str) -> Dict[str, Dict[str, Any]]:
-        """获取玩家所有传送点"""
-        try:
-            results = self.database_manager.query_all(
-                "SELECT * FROM player_homes WHERE owner_xuid = ? ORDER BY home_name",
-                (owner_xuid,)
-            )
-            return {row['home_name']: row for row in results}
-        except Exception as e:
-            self.logger.error(f"Get player homes error: {str(e)}")
-            return {}
+        return self.teleport_system.get_player_homes(owner_xuid)
 
     def get_player_home_count(self, owner_xuid: str) -> int:
-        """获取玩家传送点数量"""
-        try:
-            result = self.database_manager.query_one(
-                "SELECT COUNT(*) as count FROM player_homes WHERE owner_xuid = ?",
-                (owner_xuid,)
-            )
-            return result['count'] if result else 0
-        except Exception as e:
-            self.logger.error(f"Get player home count error: {str(e)}")
-            return 0
+        return self.teleport_system.get_player_home_count(owner_xuid)
 
     def player_home_exists(self, owner_xuid: str, home_name: str) -> bool:
-        """检查玩家传送点是否存在"""
-        return self.get_player_home(owner_xuid, home_name) is not None
+        return self.teleport_system.player_home_exists(owner_xuid, home_name)
 
     # Teleport System UI
     def show_public_warp_menu(self, player: Player):
@@ -2610,8 +2206,8 @@ class ARCCorePlugin(Plugin):
             creator_name = self.get_player_name_by_xuid(warp_info['created_by']) or 'Unknown'
             warp_button_text = self.language_manager.GetText('PUBLIC_WARP_BUTTON_TEXT').format(warp_name, warp_info['dimension'], creator_name)
             # 如果公共传送点收费，显示价格
-            if self.teleport_cost_public_warp > 0:
-                warp_button_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(warp_button_text, self.teleport_cost_public_warp)
+            if self.teleport_system.teleport_cost_public_warp > 0:
+                warp_button_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(warp_button_text, self.teleport_system.teleport_cost_public_warp)
             warp_menu.add_button(
                 warp_button_text,
                 on_click=lambda p=player, w_name=warp_name, w_info=warp_info: self.teleport_to_public_warp(p, w_name, w_info)
@@ -2626,7 +2222,7 @@ class ARCCorePlugin(Plugin):
         
         home_menu = ActionForm(
             title=self.language_manager.GetText('HOME_MENU_TITLE'),
-            content=self.language_manager.GetText('HOME_MENU_CONTENT').format(home_count, self.max_player_home_num),
+            content=self.language_manager.GetText('HOME_MENU_CONTENT').format(home_count, self.teleport_system.max_player_home_num),
             on_close=self.show_teleport_menu
         )
         
@@ -2638,7 +2234,7 @@ class ARCCorePlugin(Plugin):
             )
         
         # 添加新传送点按钮
-        if home_count < self.max_player_home_num:
+        if home_count < self.teleport_system.max_player_home_num:
             home_menu.add_button(
                 self.language_manager.GetText('HOME_ADD_NEW_BUTTON'),
                 on_click=self.show_create_home_panel
@@ -2662,8 +2258,8 @@ class ARCCorePlugin(Plugin):
         
         # 私人传送点传送按钮（显示价格）
         home_teleport_text = self.language_manager.GetText('HOME_TELEPORT_BUTTON')
-        if self.teleport_cost_home > 0:
-            home_teleport_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(home_teleport_text, self.teleport_cost_home)
+        if self.teleport_system.teleport_cost_home > 0:
+            home_teleport_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(home_teleport_text, self.teleport_system.teleport_cost_home)
         detail_menu.add_button(
             home_teleport_text,
             on_click=lambda p=player, h_name=home_name, h_info=home_info: self.teleport_to_home(p, h_name, h_info)
@@ -2751,19 +2347,19 @@ class ARCCorePlugin(Plugin):
     def teleport_to_public_warp(self, player: Player, warp_name: str, warp_info: Dict[str, Any]):
         """传送到公共传送点"""
         # 检查费用
-        if self.teleport_cost_public_warp > 0:
+        if self.teleport_system.teleport_cost_public_warp > 0:
             player_money = self.get_player_money(player)
-            if player_money < self.teleport_cost_public_warp:
+            if player_money < self.teleport_system.teleport_cost_public_warp:
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self._format_money_display(self.teleport_cost_public_warp),
+                    self._format_money_display(self.teleport_system.teleport_cost_public_warp),
                     self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
-            if self.decrease_player_money(player, self.teleport_cost_public_warp):
+            if self.decrease_player_money(player, self.teleport_system.teleport_cost_public_warp):
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self._format_money_display(self.teleport_cost_public_warp),
+                    self._format_money_display(self.teleport_system.teleport_cost_public_warp),
                     self._format_money_display(self.get_player_money(player))
                 ))
             else:
@@ -2775,19 +2371,19 @@ class ARCCorePlugin(Plugin):
     def teleport_to_home(self, player: Player, home_name: str, home_info: Dict[str, Any]):
         """传送到玩家传送点"""
         # 检查费用
-        if self.teleport_cost_home > 0:
+        if self.teleport_system.teleport_cost_home > 0:
             player_money = self.get_player_money(player)
-            if player_money < self.teleport_cost_home:
+            if player_money < self.teleport_system.teleport_cost_home:
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self._format_money_display(self.teleport_cost_home),
+                    self._format_money_display(self.teleport_system.teleport_cost_home),
                     self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
-            if self.decrease_player_money(player, self.teleport_cost_home):
+            if self.decrease_player_money(player, self.teleport_system.teleport_cost_home):
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self._format_money_display(self.teleport_cost_home),
+                    self._format_money_display(self.teleport_system.teleport_cost_home),
                     self._format_money_display(self.get_player_money(player))
                 ))
             else:
@@ -2834,91 +2430,43 @@ class ARCCorePlugin(Plugin):
         else:
             message = self.language_manager.GetText('TELEPORT_SUCCESS').format(destination_name)
         player.send_message(message)
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position, dimension))
+        self.teleport_system.execute_teleport_to_position(player.name, position, dimension)
     
     def execute_teleport_to_player(self, player: Player, target_player: Player):
         """执行传送"""
         message = self.language_manager.GetText('TELEPORT_SUCCESS').format(target_player.name)
         player.send_message(message)
-        # 获取目标玩家的当前维度
         target_dimension = target_player.location.dimension.name
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_player(player.name, target_player.name, target_dimension))
-    
-    @staticmethod
-    def format_dimension_name(dimension: str) -> str:
-        """
-        将完整的维度名称转换为execute命令所需的格式
-        :param dimension: 完整维度名称 (如 'minecraft:overworld')
-        :return: 简化的维度名称 (如 'overworld')
-        """
-        # 明确的维度名称映射，确保正确处理
-        dimension_mapping = {
-            # 标准Minecraft格式
-            'minecraft:overworld': 'overworld',
-            'minecraft:the_nether': 'the_nether', 
-            'minecraft:the_end': 'the_end',
-            # EndStone可能的格式
-            'Overworld': 'overworld',
-            'TheNether': 'the_nether',
-            'TheEnd': 'the_end',
-            # 其他可能的格式
-            'overworld': 'overworld',
-            'the_nether': 'the_nether',
-            'the_end': 'the_end',
-            'nether': 'the_nether',
-            'end': 'the_end'
-        }
-        
-        # 如果在映射表中，直接返回映射的值
-        if dimension in dimension_mapping:
-            return dimension_mapping[dimension]
-        
-        # 否则使用通用的处理方式（去掉命名空间前缀）
-        if ':' in dimension:
-            return dimension.split(':')[1]
-        return dimension
-
-    @staticmethod
-    def generate_tp_command_to_position(player_name: str, position: tuple, dimension: str = 'overworld'):
-        formatted_name = f'"{player_name}"' if ' ' in player_name else player_name
-        formatted_dimension = ARCCorePlugin.format_dimension_name(dimension)
-        return f'execute in {formatted_dimension} run tp {formatted_name} {" ".join([str(int(_)) for _ in position])}'
-
-    @staticmethod
-    def generate_tp_command_to_player(player_name: str, target_player_name: str, dimension: str = 'overworld'):
-        formatted_player = f'"{player_name}"' if ' ' in player_name else player_name
-        formatted_target = f'"{target_player_name}"' if ' ' in target_player_name else target_player_name
-        formatted_dimension = ARCCorePlugin.format_dimension_name(dimension)
-        return f'execute in {formatted_dimension} run tp {formatted_player} {formatted_target}'
+        self.teleport_system.execute_teleport_to_player(player.name, target_player.name, target_dimension)
 
     # Death Location Teleport
     def teleport_to_death_location(self, player: Player):
         """传送到死亡地点"""
-        if player.name not in self.player_death_locations:
+        if not self.teleport_system.has_death_location(player.name):
             player.send_message(self.language_manager.GetText('NO_DEATH_LOCATION_RECORDED'))
             return
         
         # 检查费用
-        if self.teleport_cost_death_location > 0:
+        if self.teleport_system.teleport_cost_death_location > 0:
             player_money = self.get_player_money(player)
-            if player_money < self.teleport_cost_death_location:
+            if player_money < self.teleport_system.teleport_cost_death_location:
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self._format_money_display(self.teleport_cost_death_location),
+                    self._format_money_display(self.teleport_system.teleport_cost_death_location),
                     self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
-            if self.decrease_player_money(player, self.teleport_cost_death_location):
+            if self.decrease_player_money(player, self.teleport_system.teleport_cost_death_location):
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self._format_money_display(self.teleport_cost_death_location),
+                    self._format_money_display(self.teleport_system.teleport_cost_death_location),
                     self._format_money_display(self.get_player_money(player))
                 ))
             else:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
                 return
         
-        death_location = self.player_death_locations[player.name]
+        death_location = self.teleport_system.get_death_location(player.name)
         
         # 开始传送倒计时
         self.server.scheduler.run_task(
@@ -2931,43 +2479,38 @@ class ARCCorePlugin(Plugin):
 
     def execute_death_location_teleport(self, player: Player):
         """执行死亡地点传送"""
-        if player.name not in self.player_death_locations:
+        if not self.teleport_system.has_death_location(player.name):
             player.send_message(self.language_manager.GetText('NO_DEATH_LOCATION_RECORDED'))
             return
-        
-        death_location = self.player_death_locations[player.name]
+        death_location = self.teleport_system.get_death_location(player.name)
         position = (death_location['x'], death_location['y'], death_location['z'])
         dimension = death_location['dimension']
-        
-        # 执行传送
         player.send_message(self.language_manager.GetText('TELEPORT_TO_DEATH_LOCATION_SUCCESS'))
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position, dimension))
-        
-        # 清理死亡位置记录
-        del self.player_death_locations[player.name]
+        self.teleport_system.execute_teleport_to_position(player.name, position, dimension)
+        self.teleport_system.clear_death_location(player.name)
 
     # Random Teleport System
     def start_random_teleport(self, player: Player):
         """开始随机传送"""
         # 检查功能是否启用
-        if not self.enable_random_teleport:
+        if not self.teleport_system.enable_random_teleport:
             player.send_message(self.language_manager.GetText('RANDOM_TELEPORT_DISABLED'))
             return
         
         # 检查费用
-        if self.teleport_cost_random > 0:
+        if self.teleport_system.teleport_cost_random > 0:
             player_money = self.get_player_money(player)
-            if player_money < self.teleport_cost_random:
+            if player_money < self.teleport_system.teleport_cost_random:
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self._format_money_display(self.teleport_cost_random),
+                    self._format_money_display(self.teleport_system.teleport_cost_random),
                     self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
-            if self.decrease_player_money(player, self.teleport_cost_random):
+            if self.decrease_player_money(player, self.teleport_system.teleport_cost_random):
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self._format_money_display(self.teleport_cost_random),
+                    self._format_money_display(self.teleport_system.teleport_cost_random),
                     self._format_money_display(self.get_player_money(player))
                 ))
             else:
@@ -2986,41 +2529,20 @@ class ARCCorePlugin(Plugin):
     
     def execute_random_teleport(self, player: Player):
         """执行随机传送"""
-        import random
-        
-        # 生成随机坐标
-        angle = random.uniform(0, 2 * math.pi)
-        distance = random.uniform(0, self.random_teleport_radius)
-        
-        random_x = self.random_teleport_center_x + int(distance * math.cos(angle))
-        random_z = self.random_teleport_center_z + int(distance * math.sin(angle))
-        random_y = 256
-        
-        # 执行传送到主世界
-        position = (random_x, random_y, random_z)
+        position = self.teleport_system.get_random_teleport_position()
         dimension = 'overworld'
-        
-        player.send_message(self.language_manager.GetText('RANDOM_TELEPORT_SUCCESS').format(random_x, random_z))
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position, dimension))
-        
-        # 添加羽落效果（10秒）
+        player.send_message(self.language_manager.GetText('RANDOM_TELEPORT_SUCCESS').format(position[0], position[2]))
+        self.teleport_system.execute_teleport_to_position(player.name, position, dimension)
         self.server.scheduler.run_task(
             self,
-            lambda: self.apply_slow_falling_effect(player),
-            delay=2  # 稍微延迟以确保传送完成
+            lambda: self._apply_slow_falling_effect(player),
+            delay=2
         )
-    
-    def apply_slow_falling_effect(self, player: Player):
-        """给玩家添加羽落效果"""
-        try:
-            # 使用 effect 命令给玩家添加缓降效果
-            self.server.dispatch_command(
-                self.server.command_sender,
-                f'effect "{player.name}" slow_falling 10 255 true'
-            )
-            player.send_message(self.language_manager.GetText('RANDOM_TELEPORT_SLOW_FALLING_APPLIED'))
-        except Exception as e:
-            self.logger.error(f"Failed to apply slow falling effect: {str(e)}")
+
+    def _apply_slow_falling_effect(self, player: Player):
+        """给玩家添加羽落效果（随机传送用）"""
+        self.teleport_system.apply_slow_falling_effect(player.name)
+        player.send_message(self.language_manager.GetText('RANDOM_TELEPORT_SLOW_FALLING_APPLIED'))
 
     # Player Teleport Request System
     def show_player_teleport_request_menu(self, player: Player):
@@ -3108,38 +2630,28 @@ class ARCCorePlugin(Plugin):
         import time
         
         # 检查费用
-        if self.teleport_cost_player > 0:
+        if self.teleport_system.teleport_cost_player > 0:
             player_money = self.get_player_money(sender)
-            if player_money < self.teleport_cost_player:
+            if player_money < self.teleport_system.teleport_cost_player:
                 sender.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self._format_money_display(self.teleport_cost_player),
+                    self._format_money_display(self.teleport_system.teleport_cost_player),
                     self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
-            if self.decrease_player_money(sender, self.teleport_cost_player):
+            if self.decrease_player_money(sender, self.teleport_system.teleport_cost_player):
                 sender.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self._format_money_display(self.teleport_cost_player),
+                    self._format_money_display(self.teleport_system.teleport_cost_player),
                     self._format_money_display(self.get_player_money(sender))
                 ))
             else:
                 sender.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
                 return
         
-        # 检查是否已有请求
-        if target.name in self.teleport_requests:
+        if not self.teleport_system.add_request(target.name, 'tpa', sender.name):
             sender.send_message(self.language_manager.GetText('TELEPORT_REQUEST_ALREADY_EXISTS').format(target.name))
             return
-        
-        # 创建请求
-        self.teleport_requests[target.name] = {
-            'type': 'tpa',
-            'sender': sender.name,
-            'expire_time': time.time() + 60  # 60秒过期
-        }
-        
-        # 通知双方
         sender.send_message(self.language_manager.GetText('TPA_REQUEST_SENT').format(target.name))
         target.send_message(self.language_manager.GetText('TPA_REQUEST_RECEIVED').format(sender.name))
 
@@ -3148,56 +2660,34 @@ class ARCCorePlugin(Plugin):
         import time
         
         # 检查费用
-        if self.teleport_cost_player > 0:
+        if self.teleport_system.teleport_cost_player > 0:
             player_money = self.get_player_money(sender)
-            if player_money < self.teleport_cost_player:
+            if player_money < self.teleport_system.teleport_cost_player:
                 sender.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self._format_money_display(self.teleport_cost_player),
+                    self._format_money_display(self.teleport_system.teleport_cost_player),
                     self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
-            if self.decrease_player_money(sender, self.teleport_cost_player):
+            if self.decrease_player_money(sender, self.teleport_system.teleport_cost_player):
                 sender.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self._format_money_display(self.teleport_cost_player),
+                    self._format_money_display(self.teleport_system.teleport_cost_player),
                     self._format_money_display(self.get_player_money(sender))
                 ))
             else:
                 sender.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
                 return
         
-        # 检查是否已有请求
-        if target.name in self.teleport_requests:
+        if not self.teleport_system.add_request(target.name, 'tphere', sender.name):
             sender.send_message(self.language_manager.GetText('TELEPORT_REQUEST_ALREADY_EXISTS').format(target.name))
             return
-        
-        # 创建请求
-        self.teleport_requests[target.name] = {
-            'type': 'tphere',
-            'sender': sender.name,
-            'expire_time': time.time() + 60  # 60秒过期
-        }
-        
-        # 通知双方
         sender.send_message(self.language_manager.GetText('TPHERE_REQUEST_SENT').format(target.name))
         target.send_message(self.language_manager.GetText('TPHERE_REQUEST_RECEIVED').format(sender.name))
 
     def get_pending_requests_for_player(self, player: Player) -> list:
         """获取玩家的待处理请求"""
-        import time
-        current_time = time.time()
-        pending_requests = []
-        
-        if player.name in self.teleport_requests:
-            request = self.teleport_requests[player.name]
-            if request['expire_time'] > current_time:
-                pending_requests.append(request)
-            else:
-                # 清理过期请求
-                del self.teleport_requests[player.name]
-        
-        return pending_requests
+        return self.teleport_system.get_pending_requests_for_player(player.name)
 
     def show_pending_requests_menu(self, player: Player):
         """显示待处理请求菜单"""
@@ -3231,44 +2721,32 @@ class ARCCorePlugin(Plugin):
 
     def accept_teleport_request(self, player: Player):
         """接受传送请求"""
-        if player.name not in self.teleport_requests:
+        request = self.teleport_system.get_request(player.name)
+        if not request:
             player.send_message(self.language_manager.GetText('NO_PENDING_REQUESTS'))
             return
-        
-        request = self.teleport_requests[player.name]
         sender = self.server.get_player(request['sender'])
-        
         if not sender:
             player.send_message(self.language_manager.GetText('REQUEST_SENDER_OFFLINE'))
-            del self.teleport_requests[player.name]
+            self.teleport_system.remove_request(player.name)
             return
-        
-        # 执行传送
         if request['type'] == 'tpa':
-            # TPA: 发送者传送到接受者处
             self.start_teleport_to_player_countdown(sender, player)
-            # 修正：接受者收到"你接受了XX的传送请求"，发起者收到"玩家XX接受了你的传送请求"
             player.send_message(self.language_manager.GetText('TPA_REQUEST_ACCEPTED_BY_TARGET').format(sender.name))
             sender.send_message(self.language_manager.GetText('TPA_REQUEST_ACCEPTED').format(player.name))
         else:
-            # TPHERE: 接受者传送到发送者处
             self.start_teleport_to_player_countdown(player, sender)
-            # 修正：接受者收到"你接受了XX的传送到此地请求"，发起者收到"玩家XX接受了你的传送到此地请求"
             player.send_message(self.language_manager.GetText('TPHERE_REQUEST_ACCEPTED_BY_TARGET').format(sender.name))
             sender.send_message(self.language_manager.GetText('TPHERE_REQUEST_ACCEPTED').format(player.name))
-        
-        # 清理请求
-        del self.teleport_requests[player.name]
+        self.teleport_system.remove_request(player.name)
 
     def deny_teleport_request(self, player: Player):
         """拒绝传送请求"""
-        if player.name not in self.teleport_requests:
+        request = self.teleport_system.get_request(player.name)
+        if not request:
             player.send_message(self.language_manager.GetText('NO_PENDING_REQUESTS'))
             return
-        
-        request = self.teleport_requests[player.name]
         sender = self.server.get_player(request['sender'])
-        
         if sender:
             if request['type'] == 'tpa':
                 sender.send_message(self.language_manager.GetText('TPA_REQUEST_DENIED').format(player.name))
@@ -3276,9 +2754,7 @@ class ARCCorePlugin(Plugin):
             else:
                 sender.send_message(self.language_manager.GetText('TPHERE_REQUEST_DENIED').format(player.name))
                 player.send_message(self.language_manager.GetText('TPHERE_REQUEST_DENIED_BY_YOU').format(sender.name))
-        
-        # 清理请求
-        del self.teleport_requests[player.name]
+        self.teleport_system.remove_request(player.name)
 
     # OP Warp Management
     def show_op_warp_manage_menu(self, player: Player):
@@ -3395,20 +2871,6 @@ class ARCCorePlugin(Plugin):
         else:
             player.send_message(self.language_manager.GetText('DELETE_WARP_FAILED'))
         self.show_delete_warp_menu(player)
-
-    # Cleanup Tasks
-    def cleanup_expired_teleport_requests(self):
-        """清理过期的传送请求"""
-        import time
-        current_time = time.time()
-        expired_requests = []
-        
-        for player_name, request in self.teleport_requests.items():
-            if request['expire_time'] <= current_time:
-                expired_requests.append(player_name)
-        
-        for player_name in expired_requests:
-            del self.teleport_requests[player_name]
 
     # Land System
     def init_land_tables(self) -> bool:
@@ -4443,8 +3905,8 @@ class ARCCorePlugin(Plugin):
         
         # 领地传送按钮（显示价格）
         land_teleport_text = self.language_manager.GetText('LAND_DETAIL_PANEL_TELEPORT_BUTTON_TEXT')
-        if self.teleport_cost_land > 0:
-            land_teleport_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(land_teleport_text, self.teleport_cost_land)
+        if self.teleport_system.teleport_cost_land > 0:
+            land_teleport_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(land_teleport_text, self.teleport_system.teleport_cost_land)
         land_detail_panel.add_button(land_teleport_text, on_click=lambda p=player, l_id=land_id: self.teleport_to_land(p, l_id))
         land_detail_panel.add_button(self.language_manager.GetText('LAND_DETAIL_PANEL_RENAME_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.show_rename_own_land_panel(p, l_id)
@@ -4516,19 +3978,19 @@ class ARCCorePlugin(Plugin):
 
     def teleport_to_land(self, player: Player, land_id: int):
         # 检查费用
-        if self.teleport_cost_land > 0:
+        if self.teleport_system.teleport_cost_land > 0:
             player_money = self.get_player_money(player)
-            if player_money < self.teleport_cost_land:
+            if player_money < self.teleport_system.teleport_cost_land:
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_NOT_ENOUGH_MONEY').format(
-                    self._format_money_display(self.teleport_cost_land),
+                    self._format_money_display(self.teleport_system.teleport_cost_land),
                     self._format_money_display(player_money)
                 ))
                 return
             
             # 扣除费用
-            if self.decrease_player_money(player, self.teleport_cost_land):
+            if self.decrease_player_money(player, self.teleport_system.teleport_cost_land):
                 player.send_message(self.language_manager.GetText('TELEPORT_COST_DEDUCTED').format(
-                    self._format_money_display(self.teleport_cost_land),
+                    self._format_money_display(self.teleport_system.teleport_cost_land),
                     self._format_money_display(self.get_player_money(player))
                 ))
             else:
@@ -4542,7 +4004,7 @@ class ARCCorePlugin(Plugin):
     def delay_teleport_to_land(self, player: Player, land_id: int, position: tuple):
         player.send_message(self.language_manager.GetText('TELEPORT_TO_LAND_START_HINT').format(land_id))
         land_dimension = self.get_land_dimension(land_id)
-        self.server.dispatch_command(self.server.command_sender, self.generate_tp_command_to_position(player.name, position, land_dimension))
+        self.server.dispatch_command(self.server.command_sender, generate_tp_command_to_position(player.name, position, land_dimension))
 
     def confirm_delete_land(self, player: Player, land_id: int):
         deleta_land_info = self.get_land_info(land_id)
@@ -5908,43 +5370,7 @@ class ARCCorePlugin(Plugin):
                 self.land_min_distance = int(self.setting_manager.GetSetting('MIN_LAND_DISTANCE'))
             except (ValueError, TypeError):
                 self.land_min_distance = 0
-            self.max_player_home_num = self.setting_manager.GetSetting('MAX_PLAYER_HOME_NUM')
-            try:
-                self.max_player_home_num = int(self.max_player_home_num)
-            except (ValueError, TypeError):
-                self.max_player_home_num = 3
-            self.enable_random_teleport = self.setting_manager.GetSetting('ENABLE_RANDOM_TELEPORT')
-            if self.enable_random_teleport is None:
-                self.enable_random_teleport = True
-            else:
-                try:
-                    self.enable_random_teleport = str(self.enable_random_teleport).lower() in ['true', '1', 'yes']
-                except (ValueError, AttributeError):
-                    self.enable_random_teleport = True
-            try:
-                self.random_teleport_center_x = int(self.setting_manager.GetSetting('RANDOM_TELEPORT_CENTER_X'))
-            except (ValueError, TypeError):
-                self.random_teleport_center_x = 0
-            try:
-                self.random_teleport_center_z = int(self.setting_manager.GetSetting('RANDOM_TELEPORT_CENTER_Z'))
-            except (ValueError, TypeError):
-                self.random_teleport_center_z = 0
-            try:
-                self.random_teleport_radius = int(self.setting_manager.GetSetting('RANDOM_TELEPORT_RADIUS'))
-            except (ValueError, TypeError):
-                self.random_teleport_radius = 5000
-            def _int_setting(key: str, default: int) -> int:
-                raw = self.setting_manager.GetSetting(key)
-                try:
-                    return int(raw) if raw is not None else default
-                except (ValueError, TypeError):
-                    return default
-            self.teleport_cost_public_warp = _int_setting('TELEPORT_COST_PUBLIC_WARP', 0)
-            self.teleport_cost_home = _int_setting('TELEPORT_COST_HOME', 0)
-            self.teleport_cost_land = _int_setting('TELEPORT_COST_LAND', 0)
-            self.teleport_cost_death_location = _int_setting('TELEPORT_COST_DEATH_LOCATION', 0)
-            self.teleport_cost_random = _int_setting('TELEPORT_COST_RANDOM', 100)
-            self.teleport_cost_player = _int_setting('TELEPORT_COST_PLAYER', 50)
+            self.teleport_system.reload_config()
             self.hide_op_in_money_ranking = self.setting_manager.GetSetting('HIDE_OP_IN_MONEY_RANKING')
             if self.hide_op_in_money_ranking is None:
                 self.hide_op_in_money_ranking = True
@@ -6667,27 +6093,15 @@ class ARCCorePlugin(Plugin):
 
     # API methods for other plugins
     def api_get_all_money_data(self) -> dict:
-        """
-        获取所有玩家的金钱数据
-        :return: 字典，键为玩家名称，值为金钱数量
-        """
-        try:
-            results = self.database_manager.query_all(
-                "SELECT xuid, money FROM player_economy"
-            )
-            money_data = {}
-            for entry in results:
-                try:
-                    xuid_str = entry['xuid']
-                    player_name = self.get_player_name_by_xuid(xuid_str)
-                    if player_name:
-                        money_data[player_name] = entry['money']
-                except Exception:
-                    continue
-            return money_data
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get money data error: {str(e)}")
-            return {}
+        money_data = {}
+        for entry in self.economy.get_all_money_raw():
+            try:
+                player_name = self.get_player_name_by_xuid(entry['xuid'])
+                if player_name:
+                    money_data[player_name] = entry['money']
+            except Exception:
+                continue
+        return money_data
 
     def api_get_player_money(self, player_name: str) -> float:
         """
@@ -6698,52 +6112,26 @@ class ARCCorePlugin(Plugin):
         return self.get_player_money_by_name(player_name)
 
     def api_get_richest_player_money_data(self) -> list:
-        """
-        获取最富有玩家的信息
-        :return: [玩家名称, 金钱数量]
-        """
-        try:
-            result = self.database_manager.query_one(
-                "SELECT xuid, money FROM player_economy ORDER BY money DESC LIMIT 1"
-            )
-            if result:
-                player_name = self.get_player_name_by_xuid(result['xuid'])
-                if player_name:
-                    return [player_name, self._round_money(result['money'])]
-            return ["", 0.0]
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money top error: {str(e)}")
-            return ["", 0.0]
+        result = self.economy.get_richest_one()
+        if result:
+            player_name = self.get_player_name_by_xuid(result['xuid'])
+            if player_name:
+                return [player_name, self._round_money(result['money'])]
+        return ["", 0.0]
 
     def api_get_poorest_player_money_data(self) -> list:
-        """
-        获取最贫穷玩家的信息
-        :return: [玩家名称, 金钱数量]
-        """
-        try:
-            result = self.database_manager.query_one(
-                "SELECT xuid, money FROM player_economy ORDER BY money ASC LIMIT 1"
-            )
-            if result:
-                player_name = self.get_player_name_by_xuid(result['xuid'])
-                if player_name:
-                    return [player_name, self._round_money(result['money'])]
-            return ["", 0.0]
-        except Exception as e:
-            self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player money bottom error: {str(e)}")
-            return ["", 0.0]
+        result = self.economy.get_poorest_one()
+        if result:
+            player_name = self.get_player_name_by_xuid(result['xuid'])
+            if player_name:
+                return [player_name, self._round_money(result['money'])]
+        return ["", 0.0]
 
     def api_change_player_money(self, player_name: str, money_to_change: float) -> bool:
-        """
-        改变目标玩家的金钱（API封装器）
-        :param player_name: 玩家名称
-        :param money_to_change: 要改变的金钱数量（正数为增加，负数为减少），支持小数精确到分
-        :return: 是否操作成功
-        """
         if self._round_money(money_to_change) == 0:
-            self.logger.error(f'{ColorFormat.RED}[ARC Core]Money change cannot be zero...')
+            if self.logger:
+                self.logger.error(f'{ColorFormat.RED}[ARC Core]Money change cannot be zero...')
             return False
-        
         return self.change_player_money_by_name(player_name, money_to_change, notify=True)
     
     def api_if_position_in_land(self, dimension: str, position: tuple) -> int:
