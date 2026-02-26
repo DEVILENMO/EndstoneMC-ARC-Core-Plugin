@@ -17,7 +17,8 @@ from endstone_arc_core.DatabaseManager import DatabaseManager
 from endstone_arc_core.Economy import Economy
 from endstone_arc_core.LanguageManager import LanguageManager
 from endstone_arc_core.SettingManager import SettingManager
-from endstone_arc_core.TeleportSystem import TeleportSystem, generate_tp_command_to_position, generate_tp_command_to_player
+from endstone_arc_core.TeleportSystem import TeleportSystem, generate_tp_command_to_position
+from endstone_arc_core.LandSystem import LandSystem
 
 MAIN_PATH = 'plugins/ARCCore'
 
@@ -89,6 +90,7 @@ class ARCCorePlugin(Plugin):
         self.database_manager = DatabaseManager(Path(MAIN_PATH) / self.setting_manager.GetSetting('DATABASE_PATH'))
         self.economy = Economy(self.database_manager, self.setting_manager)
         self.teleport_system = TeleportSystem(self.database_manager, self.setting_manager)
+        self.land_system = LandSystem(self.database_manager, self.setting_manager)
         self.init_database()
 
         self.if_protect_spawn = self.setting_manager.GetSetting('IF_PROTECT_SPAWN')
@@ -277,6 +279,8 @@ class ARCCorePlugin(Plugin):
         self.economy.set_logger(self.logger)
         self.teleport_system.set_server(self.server)
         self.teleport_system.set_logger(self.logger)
+        self.land_system.set_logger(self.logger)
+        self.land_system.reload_config()
 
         # 初始化公告系统和清道夫系统
         self._load_broadcast_messages()
@@ -906,8 +910,8 @@ class ARCCorePlugin(Plugin):
         self.init_spawn_locations_table()
         self.economy.init_economy_table()
         self.economy.upgrade_player_economy_table_to_float()
-        self.init_land_tables()
-        self.init_sub_land_table()
+        self.land_system.init_land_tables()
+        self.land_system.init_sub_land_table()
         self.teleport_system.init_teleport_tables()
 
     # Player basic info
@@ -2873,969 +2877,131 @@ class ARCCorePlugin(Plugin):
         self.show_delete_warp_menu(player)
 
     # Land System
-    def init_land_tables(self) -> bool:
-        """初始化领地相关的数据表"""
-        try:
-            # 只创建领地基本信息表
-            land_fields = {
-                'land_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',  # 领地编号
-                'owner_xuid': 'TEXT NOT NULL',  # 领地主人XUID
-                'land_name': 'TEXT NOT NULL',  # 领地名称
-                'dimension': 'TEXT NOT NULL',  # 领地所在维度
-                'min_x': 'INTEGER NOT NULL',  # 最小X坐标
-                'max_x': 'INTEGER NOT NULL',  # 最大X坐标
-                'min_y': 'INTEGER NOT NULL DEFAULT 0',  # 最小Y坐标
-                'max_y': 'INTEGER NOT NULL DEFAULT 255',  # 最大Y坐标
-                'min_z': 'INTEGER NOT NULL',  # 最小Z坐标
-                'max_z': 'INTEGER NOT NULL',  # 最大Z坐标
-                'tp_x': 'REAL NOT NULL',  # 传送点X坐标
-                'tp_y': 'REAL NOT NULL',  # 传送点Y坐标
-                'tp_z': 'REAL NOT NULL',  # 传送点Z坐标
-                'shared_users': 'TEXT',  # 共有人UUID列表(JSON字符串)
-                'allow_explosion': 'INTEGER DEFAULT 0',  # 是否允许爆炸 (0=不允许, 1=允许)
-                'allow_public_interact': 'INTEGER DEFAULT 0',  # 是否对所有人开放方块互动 (0=不开放, 1=开放)
-                'allow_actor_interaction': 'INTEGER DEFAULT 0',  # 是否允许生物互动 (0=不允许, 1=允许)
-                'allow_actor_damage': 'INTEGER DEFAULT 0',  # 是否允许攻击生物 (0=不允许, 1=允许)
-                'owner_paid_money': 'REAL DEFAULT 0',  # 购买时玩家实际支付的金钱，用于出售时按实付退款
-                'allow_non_public_land': 'INTEGER DEFAULT 0'  # 公共领地是否允许玩家在其中圈私人领地
-            }
+    # ─── Land data methods (delegated to LandSystem) ─────────────────────────
 
-            # 检查表是否已经存在
-            table_exists = self.database_manager.table_exists('lands')
-            
-            if table_exists:
-                # 表已存在，执行升级检查
-                self._upgrade_land_table()
-                return True
-            else:
-                # 表不存在，创建新表
-                success = self.database_manager.create_table('lands', land_fields)
-                if success:
-                    print("[ARC Core]Created new land table with all fields")
-                return success
-        except Exception as e:
-            print(f"[ARC Core]Init land tables error: {str(e)}")
-            return False
-
-    def _upgrade_land_table(self) -> bool:
-        """升级领地数据表结构，为老用户添加新字段。使用 _column_exists 判断，避免依赖 execute() 的异常机制（execute 内部会吞掉异常）"""
-        try:
-            def _add_column(col: str, definition: str):
-                if not self._column_exists('lands', col):
-                    ok = self.database_manager.execute(f"ALTER TABLE lands ADD COLUMN {col} {definition}")
-                    if ok:
-                        print(f"[ARC Core]Upgraded land table: added {col} column")
-                    else:
-                        print(f"[ARC Core]Failed to add {col} column")
-                    return ok
-                return None  # 列已存在，无需操作
-
-            _add_column('allow_explosion', 'INTEGER DEFAULT 0')
-            _add_column('allow_public_interact', 'INTEGER DEFAULT 0')
-            _add_column('allow_actor_interaction', 'INTEGER DEFAULT 0')
-            _add_column('allow_actor_damage', 'INTEGER DEFAULT 0')
-
-            # owner_paid_money 需要在首次添加时为存量领地回填估算价格（一次性迁移，不得重复执行）
-            if not self._column_exists('lands', 'owner_paid_money'):
-                ok = self.database_manager.execute("ALTER TABLE lands ADD COLUMN owner_paid_money REAL DEFAULT 0")
-                if ok:
-                    print("[ARC Core]Upgraded land table: added owner_paid_money column, initializing values for existing lands...")
-                    land_price_raw = self.setting_manager.GetSetting('LAND_PRICE')
-                    try:
-                        upgrade_land_price = float(int(land_price_raw)) if land_price_raw is not None else 100.0
-                    except (ValueError, TypeError):
-                        upgrade_land_price = 100.0
-                    self.database_manager.execute(
-                        "UPDATE lands SET owner_paid_money = (max_x - min_x + 1) * (max_z - min_z + 1) * ?",
-                        (upgrade_land_price,)
-                    )
-                    print(f"[ARC Core]owner_paid_money initialized (land_price={upgrade_land_price}, one-time migration only)")
-                else:
-                    print("[ARC Core]Failed to add owner_paid_money column")
-
-            _add_column('allow_non_public_land', 'INTEGER DEFAULT 0')
-            _add_column('min_y', 'INTEGER NOT NULL DEFAULT 0')
-            _add_column('max_y', 'INTEGER NOT NULL DEFAULT 255')
-            # allow_sub_land 已废弃，保留迁移仅为兼容旧数据库，不做任何逻辑依赖
-            _add_column('allow_sub_land', 'INTEGER DEFAULT 0')
-
-            return True
-        except Exception as e:
-            print(f"[ARC Core]Upgrade land table error: {str(e)}")
-            return True  # 即使升级失败也不影响插件启动
-
-    def _ensure_dimension_table(self, dimension: str) -> bool:
-        """
-        确保维度对应的区块表存在
-        :param dimension: 维度名称
-        :return: 是否成功
-        """
-        try:
-            table_name = self._get_dimension_table(dimension)
-
-            # 如果表已存在，直接返回True
-            if self.database_manager.table_exists(table_name):
-                return True
-
-            # 创建新的区块表
-            chunk_fields = {
-                'chunk_key': 'TEXT PRIMARY KEY',  # 区块键(chunkX_chunkZ)
-                'land_ids': 'TEXT NOT NULL'  # 该区块包含的领地ID列表(JSON字符串)
-            }
-
-            return self.database_manager.create_table(table_name, chunk_fields)
-        except Exception as e:
-            self.logger.error(f"Ensure dimension table error: {str(e)}")
-            return False
-
-    def _get_dimension_table(self, dimension: str) -> str:
-        """
-        获取维度对应的区块表名
-        :param dimension: 维度名称
-        :return: 表名
-        """
-        # 将minecraft:维度名转换为表名，移除非法字符
-        dim_name = dimension.split(':')[-1].lower()
-        # 替换所有非字母数字字符为下划线
-        dim_name = ''.join(c if c.isalnum() else '_' for c in dim_name)
-        return f'chunk_lands_{dim_name}'
-
-    def _get_chunk_key(self, x: int, z: int) -> str:
-        """
-        获取区块键
-        :param x: x坐标
-        :param z: z坐标
-        :return: 区块键
-        """
-        chunk_x = x >> 4  # 除以16
-        chunk_z = z >> 4
-        return f"{chunk_x}_{chunk_z}"
-
-    def _get_affected_chunks(self, min_x: int, max_x: int, min_z: int, max_z: int) -> Set[str]:
-        """
-        获取受影响的所有区块键
-        :return: 区块键集合
-        """
-        chunk_keys = set()
-        start_chunk_x = min_x >> 4
-        end_chunk_x = max_x >> 4
-        start_chunk_z = min_z >> 4
-        end_chunk_z = max_z >> 4
-
-        for chunk_x in range(start_chunk_x, end_chunk_x + 1):
-            for chunk_z in range(start_chunk_z, end_chunk_z + 1):
-                chunk_keys.add(f"{chunk_x}_{chunk_z}")
-
-        return chunk_keys
-
-    def _register_land_to_chunk_mapping(self, land_id: int, dimension: str,
-                                        min_x: int, max_x: int, min_z: int, max_z: int) -> bool:
-        """
-        将一块领地的 ID 注册到对应维度的区块映射表中（根据 XZ 范围计算涉及的区块并写入）。
-        调用前需保证该维度的区块表已存在（可先 _ensure_dimension_table）。
-        :return: 是否成功
-        """
-        try:
-            chunk_table = self._get_dimension_table(dimension)
-            affected_chunks = self._get_affected_chunks(min_x, max_x, min_z, max_z)
-            for chunk_key in affected_chunks:
-                existing = self.database_manager.query_one(
-                    f"SELECT land_ids FROM {chunk_table} WHERE chunk_key = ?",
-                    (chunk_key,)
-                )
-                if existing:
-                    land_ids = json.loads(existing['land_ids'])
-                    land_ids.append(land_id)
-                    self.database_manager.update(
-                        chunk_table,
-                        {'land_ids': json.dumps(land_ids)},
-                        'chunk_key = ?',
-                        (chunk_key,)
-                    )
-                else:
-                    self.database_manager.insert(
-                        chunk_table,
-                        {'chunk_key': chunk_key, 'land_ids': json.dumps([land_id])}
-                    )
-            return True
-        except Exception as e:
-            self.logger.error(f"Register land to chunk mapping error: {str(e)}")
-            return False
-
-    def rebuild_chunk_land_mapping(self) -> tuple[bool, str]:
-        """
-        根据 lands 表当前数据重建所有维度的区块-领地映射表。
-        会先删除所有 chunk_lands_* 表再按领地边界重新生成。适用于在数据库里直接改了领地边界后的同步。
-        :return: (是否成功, 结果描述信息)
-        """
-        try:
-            tables = self.database_manager.query_all(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'chunk_lands_%'"
-            )
-            for row in tables:
-                self.database_manager.execute(f"DROP TABLE IF EXISTS \"{row['name']}\"")
-
-            lands = self.database_manager.query_all(
-                "SELECT land_id, dimension, min_x, max_x, min_z, max_z FROM lands"
-            )
-            if not lands:
-                return True, self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_NO_LANDS')
-
-            dimensions_done = set()
-            for land in lands:
-                dimension = land['dimension']
-                if dimension not in dimensions_done:
-                    if not self._ensure_dimension_table(dimension):
-                        self.logger.warning(f"Rebuild chunk mapping: failed to ensure dimension table for {dimension}")
-                        continue
-                    dimensions_done.add(dimension)
-                self._register_land_to_chunk_mapping(
-                    land['land_id'], dimension,
-                    land['min_x'], land['max_x'], land['min_z'], land['max_z']
-                )
-
-            num_lands = len(lands)
-            num_dims = len(dimensions_done)
-            return True, self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_SUCCESS').format(
-                num_dims, num_lands
-            )
-        except Exception as e:
-            self.logger.error(f"Rebuild chunk land mapping error: {str(e)}")
-            return False, self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_FAILED').format(str(e))
+    def rebuild_chunk_land_mapping(self) -> tuple:
+        """委托 LandSystem 重建区块映射，并将结果格式化为语言文本"""
+        success, num_dims, num_lands, err = self.land_system.rebuild_chunk_land_mapping()
+        if not success:
+            return False, self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_FAILED').format(err)
+        if num_lands == 0:
+            return True, self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_NO_LANDS')
+        return True, self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_SUCCESS').format(num_dims, num_lands)
 
     def create_land(self, owner_xuid: str, land_name: str, dimension: str,
                     min_x: int, max_x: int, min_y: int, max_y: int, min_z: int, max_z: int,
                     tp_x: float, tp_y: float, tp_z: float, owner_paid_money: float = 0.0) -> Optional[int]:
-        """创建新领地。owner_paid_money 为购买时玩家实际支付的金钱，出售时按此退款。"""
-        try:
-            if not self._ensure_dimension_table(dimension):
-                return None
-
-            self.database_manager.execute(
-                "INSERT INTO lands (owner_xuid, land_name, dimension, min_x, max_x, min_y, max_y, min_z, max_z, tp_x, tp_y, tp_z, shared_users, allow_explosion, allow_public_interact, owner_paid_money) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (owner_xuid, land_name, dimension, min_x, max_x, min_y, max_y, min_z, max_z, tp_x, tp_y, tp_z, '[]', 0, 0, float(owner_paid_money))
-            )
-            result = self.database_manager.query_one("SELECT last_insert_rowid() as land_id")
-            land_id = result['land_id']
-
-            if not self._register_land_to_chunk_mapping(land_id, dimension, min_x, max_x, min_z, max_z):
-                self.logger.error("Create land: chunk mapping failed, land_id=%s", land_id)
-
-            return land_id
-        except Exception as e:
-            self.logger.error(f"Create land error: {str(e)}")
-            return None
+        return self.land_system.create_land(
+            owner_xuid, land_name, dimension,
+            min_x, max_x, min_y, max_y, min_z, max_z,
+            tp_x, tp_y, tp_z, owner_paid_money
+        )
 
     def get_land_at_pos(self, dimension: str, x: int, z: int, y: int = None) -> Optional[int]:
-        """获取指定位置的领地ID，可选y坐标进行三维精确判断"""
-        try:
-            x_int = int(x)
-            z_int = int(z)
-
-            # 确保维度表存在
-            if not self._ensure_dimension_table(dimension):
-                return None
-
-            chunk_table = self._get_dimension_table(dimension)
-            chunk_key = self._get_chunk_key(x_int, z_int)
-
-            chunk_data = self.database_manager.query_one(
-                f"SELECT land_ids FROM {chunk_table} WHERE chunk_key = ?",
-                (chunk_key,)
-            )
-
-            if not chunk_data:
-                return None
-
-            land_ids = json.loads(chunk_data['land_ids'])
-            public_land_id = None  # 备选：公共领地（优先级低）
-            for land_id in land_ids:
-                land_info = self.database_manager.query_one(
-                    "SELECT * FROM lands WHERE land_id = ?",
-                    (land_id,)
-                )
-                if land_info and (
-                        land_info['min_x'] <= x <= land_info['max_x'] and
-                        land_info['min_z'] <= z <= land_info['max_z']
-                ):
-                    if y is not None:
-                        land_min_y = land_info.get('min_y', 0)
-                        land_max_y = land_info.get('max_y', 255)
-                        if not (land_min_y <= int(y) <= land_max_y):
-                            continue
-                    # 私人领地（非公共）优先返回；公共领地作为兜底
-                    if land_info['owner_xuid'] != self.PUBLIC_LAND_OWNER_XUID:
-                        return land_id
-                    else:
-                        public_land_id = land_id
-
-            return public_land_id
-        except Exception as e:
-            self.logger.error(f"Get land at pos error: {str(e)}")
-            return None
+        return self.land_system.get_land_at_pos(dimension, x, z, y)
 
     def delete_land(self, land_id: int) -> bool:
-        """删除领地"""
-        try:
-            # 获取领地信息
-            land_info = self.database_manager.query_one(
-                "SELECT * FROM lands WHERE land_id = ?",
-                (land_id,)
-            )
+        return self.land_system.delete_land(land_id)
 
-            if not land_info:
-                return False
-
-            # 获取对应维度的区块表
-            chunk_table = self._get_dimension_table(land_info['dimension'])
-
-            # 从所有相关区块中移除领地ID
-            affected_chunks = self._get_affected_chunks(
-                land_info['min_x'],
-                land_info['max_x'],
-                land_info['min_z'],
-                land_info['max_z']
-            )
-
-            for chunk_key in affected_chunks:
-                chunk_data = self.database_manager.query_one(
-                    f"SELECT land_ids FROM {chunk_table} WHERE chunk_key = ?",
-                    (chunk_key,)
-                )
-                if chunk_data:
-                    land_ids = json.loads(chunk_data['land_ids'])
-                    if land_id in land_ids:
-                        land_ids.remove(land_id)
-                        if land_ids:
-                            self.database_manager.update(
-                                chunk_table,
-                                {'land_ids': json.dumps(land_ids)},
-                                'chunk_key = ?',
-                                (chunk_key,)
-                            )
-                        else:
-                            self.database_manager.delete(chunk_table, 'chunk_key = ?', (chunk_key,))
-
-            # 删除领地基本信息
-            return self.database_manager.delete('lands', 'land_id = ?', (land_id,))
-        except Exception as e:
-            self.logger.error(f"Delete land error: {str(e)}")
-            return False
-
-    def check_land_availability(self, dimension: str, min_x: int, max_x: int, min_y: int, max_y: int, min_z: int, max_z: int) -> tuple[bool, Optional[str], Optional[list]]:
-        """
-        检查领地范围是否可用（无重叠且满足最小间距）。
-        返回 (是否可用, 失败原因键或None, 重叠的领地ID列表或None)
-        """
-        try:
-            # 确保坐标顺序正确
-            min_x, max_x = min(min_x, max_x), max(min_x, max_x)
-            min_y, max_y = min(min_y, max_y), max(min_y, max_y)
-            min_z, max_z = min(min_z, max_z), max(min_z, max_z)
-
-            # 扩展检查范围以包含最小距离（仅XZ方向）
-            check_min_x = min_x - self.land_min_distance
-            check_max_x = max_x + self.land_min_distance
-            check_min_z = min_z - self.land_min_distance
-            check_max_z = max_z + self.land_min_distance
-
-            # 获取可能受影响的所有区块
-            affected_chunks = self._get_affected_chunks(check_min_x, check_max_x, check_min_z, check_max_z)
-
-            # 确保维度表存在
-            if not self._ensure_dimension_table(dimension):
-                return False, 'SYSTEM_ERROR', None
-
-            chunk_table = self._get_dimension_table(dimension)
-
-            # 收集所有可能相关的领地ID
-            nearby_land_ids = set()
-            for chunk_key in affected_chunks:
-                chunk_data = self.database_manager.query_one(
-                    f"SELECT land_ids FROM {chunk_table} WHERE chunk_key = ?",
-                    (chunk_key,)
-                )
-                if chunk_data:
-                    land_ids = json.loads(chunk_data['land_ids'])
-                    nearby_land_ids.update(land_ids)
-
-            # 检查每个相关领地，收集所有重叠的领地ID
-            overlapping_land_ids = []
-            for land_id in nearby_land_ids:
-                land_info = self.database_manager.query_one(
-                    "SELECT * FROM lands WHERE land_id = ? AND dimension = ?",
-                    (land_id, dimension)
-                )
-
-                if not land_info:
-                    continue
-
-                # 跳过允许玩家在内圈私人领地的公共领地
-                if (land_info.get('owner_xuid') == self.PUBLIC_LAND_OWNER_XUID and
-                        land_info.get('allow_non_public_land', 0)):
-                    continue
-
-                exist_min_y = land_info.get('min_y', 0)
-                exist_max_y = land_info.get('max_y', 255)
-
-                # 先判断Y轴是否有重叠，再判断XZ平面
-                y_overlap = (min_y <= exist_max_y and max_y >= exist_min_y)
-                xz_overlap = (check_min_x <= land_info['max_x'] and check_max_x >= land_info['min_x'] and
-                              check_min_z <= land_info['max_z'] and check_max_z >= land_info['min_z'])
-
-                if y_overlap and xz_overlap:
-                    overlapping_land_ids.append(land_id)
-
-            if overlapping_land_ids:
-                return False, 'LAND_MIN_DISTANCE_NOT_SATISFIED', overlapping_land_ids
-
-            return True, None, None
-
-        except Exception as e:
-            self.logger.error(f"[ARC Core]Check land availability error: {str(e)}")
-            return False, 'SYSTEM_ERROR', None
-
-    # ─── Sub-land System ────────────────────────────────────────────────────────
-
-    def init_sub_land_table(self) -> bool:
-        """初始化子领地数据表"""
-        try:
-            sub_land_fields = {
-                'sub_land_id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
-                'parent_land_id': 'INTEGER NOT NULL',
-                'owner_xuid': 'TEXT NOT NULL',
-                'sub_land_name': 'TEXT NOT NULL',
-                'min_x': 'INTEGER NOT NULL',
-                'max_x': 'INTEGER NOT NULL',
-                'min_y': 'INTEGER NOT NULL DEFAULT 0',
-                'max_y': 'INTEGER NOT NULL DEFAULT 255',
-                'min_z': 'INTEGER NOT NULL',
-                'max_z': 'INTEGER NOT NULL',
-                'shared_users': 'TEXT DEFAULT "[]"'
-            }
-            return self.database_manager.create_table('sub_lands', sub_land_fields)
-        except Exception as e:
-            print(f"[ARC Core]Init sub_land table error: {str(e)}")
-            return False
+    def check_land_availability(self, dimension: str, min_x: int, max_x: int, min_y: int, max_y: int, min_z: int, max_z: int) -> tuple:
+        return self.land_system.check_land_availability(dimension, min_x, max_x, min_y, max_y, min_z, max_z)
 
     def create_sub_land(self, parent_land_id: int, owner_xuid: str, sub_land_name: str,
                         min_x: int, max_x: int, min_y: int, max_y: int,
                         min_z: int, max_z: int) -> Optional[int]:
-        """创建子领地，返回新子领地ID，失败返回None"""
-        try:
-            self.database_manager.execute(
-                "INSERT INTO sub_lands (parent_land_id, owner_xuid, sub_land_name, min_x, max_x, min_y, max_y, min_z, max_z, shared_users) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (parent_land_id, owner_xuid, sub_land_name, min_x, max_x, min_y, max_y, min_z, max_z, '[]')
-            )
-            result = self.database_manager.query_one("SELECT last_insert_rowid() as sub_land_id")
-            return result['sub_land_id'] if result else None
-        except Exception as e:
-            self.logger.error(f"Create sub land error: {str(e)}")
-            return None
+        return self.land_system.create_sub_land(
+            parent_land_id, owner_xuid, sub_land_name,
+            min_x, max_x, min_y, max_y, min_z, max_z
+        )
 
     def delete_sub_land(self, sub_land_id: int) -> bool:
-        """删除子领地"""
-        try:
-            return self.database_manager.delete('sub_lands', 'sub_land_id = ?', (sub_land_id,))
-        except Exception as e:
-            self.logger.error(f"Delete sub land error: {str(e)}")
-            return False
+        return self.land_system.delete_sub_land(sub_land_id)
 
     def get_sub_land_info(self, sub_land_id: int) -> dict:
-        """获取子领地信息字典，不存在返回空字典"""
-        try:
-            result = self.database_manager.query_one(
-                "SELECT * FROM sub_lands WHERE sub_land_id = ?", (sub_land_id,)
-            )
-            if result:
-                return {
-                    'sub_land_id': result['sub_land_id'],
-                    'parent_land_id': result['parent_land_id'],
-                    'owner_xuid': result['owner_xuid'],
-                    'sub_land_name': result['sub_land_name'],
-                    'min_x': result['min_x'], 'max_x': result['max_x'],
-                    'min_y': result.get('min_y', 0), 'max_y': result.get('max_y', 255),
-                    'min_z': result['min_z'], 'max_z': result['max_z'],
-                    'shared_users': json.loads(result.get('shared_users') or '[]')
-                }
-            return {}
-        except Exception as e:
-            self.logger.error(f"Get sub land info error: {str(e)}")
-            return {}
+        return self.land_system.get_sub_land_info(sub_land_id)
 
     def get_sub_lands_by_parent(self, parent_land_id: int) -> dict:
-        """获取某领地下的所有子领地 {sub_land_id: info_dict}"""
-        try:
-            results = self.database_manager.query_all(
-                "SELECT * FROM sub_lands WHERE parent_land_id = ?", (parent_land_id,)
-            )
-            lands = {}
-            for r in results:
-                lands[r['sub_land_id']] = {
-                    'sub_land_id': r['sub_land_id'],
-                    'parent_land_id': r['parent_land_id'],
-                    'owner_xuid': r['owner_xuid'],
-                    'sub_land_name': r['sub_land_name'],
-                    'min_x': r['min_x'], 'max_x': r['max_x'],
-                    'min_y': r.get('min_y', 0), 'max_y': r.get('max_y', 255),
-                    'min_z': r['min_z'], 'max_z': r['max_z'],
-                    'shared_users': json.loads(r.get('shared_users') or '[]')
-                }
-            return lands
-        except Exception as e:
-            self.logger.error(f"Get sub lands by parent error: {str(e)}")
-            return {}
+        return self.land_system.get_sub_lands_by_parent(parent_land_id)
 
     def get_sub_lands_by_owner_in_parent(self, parent_land_id: int, owner_xuid: str) -> dict:
-        """获取某玩家在指定父领地内拥有的所有子领地"""
-        try:
-            results = self.database_manager.query_all(
-                "SELECT * FROM sub_lands WHERE parent_land_id = ? AND owner_xuid = ?",
-                (parent_land_id, owner_xuid)
-            )
-            lands = {}
-            for r in results:
-                lands[r['sub_land_id']] = {
-                    'sub_land_id': r['sub_land_id'],
-                    'parent_land_id': r['parent_land_id'],
-                    'owner_xuid': r['owner_xuid'],
-                    'sub_land_name': r['sub_land_name'],
-                    'min_x': r['min_x'], 'max_x': r['max_x'],
-                    'min_y': r.get('min_y', 0), 'max_y': r.get('max_y', 255),
-                    'min_z': r['min_z'], 'max_z': r['max_z'],
-                    'shared_users': json.loads(r.get('shared_users') or '[]')
-                }
-            return lands
-        except Exception as e:
-            self.logger.error(f"Get sub lands by owner error: {str(e)}")
-            return {}
+        return self.land_system.get_sub_lands_by_owner_in_parent(parent_land_id, owner_xuid)
 
     def get_sub_land_at_pos(self, parent_land_id: int, x: int, y: int, z: int) -> Optional[int]:
-        """获取指定坐标处的子领地ID（在父领地范围内查询），不存在返回None"""
-        try:
-            results = self.database_manager.query_all(
-                "SELECT sub_land_id, min_x, max_x, min_y, max_y, min_z, max_z FROM sub_lands WHERE parent_land_id = ?",
-                (parent_land_id,)
-            )
-            for r in results:
-                sl_min_y = r.get('min_y', 0)
-                sl_max_y = r.get('max_y', 255)
-                if (r['min_x'] <= x <= r['max_x'] and
-                        sl_min_y <= y <= sl_max_y and
-                        r['min_z'] <= z <= r['max_z']):
-                    return r['sub_land_id']
-            return None
-        except Exception as e:
-            self.logger.error(f"Get sub land at pos error: {str(e)}")
-            return None
+        return self.land_system.get_sub_land_at_pos(parent_land_id, x, y, z)
 
     def check_sub_land_availability(self, parent_land_id: int,
                                     min_x: int, max_x: int, min_y: int, max_y: int,
                                     min_z: int, max_z: int,
                                     exclude_sub_land_id: int = None) -> tuple:
-        """
-        检查子领地范围是否可用：
-        1. 必须完全在父领地范围内
-        2. 不能与同父领地下其他子领地重叠
-        返回 (True, None) 或 (False, reason_str)
-        """
-        try:
-            parent_info = self.get_land_info(parent_land_id)
-            if not parent_info:
-                return False, 'SYSTEM_ERROR'
-
-            p_min_x, p_max_x = parent_info['min_x'], parent_info['max_x']
-            p_min_y, p_max_y = parent_info.get('min_y', 0), parent_info.get('max_y', 255)
-            p_min_z, p_max_z = parent_info['min_z'], parent_info['max_z']
-
-            if min_x < p_min_x or max_x > p_max_x or min_y < p_min_y or max_y > p_max_y or min_z < p_min_z or max_z > p_max_z:
-                return False, 'SUB_LAND_OUT_OF_PARENT'
-
-            siblings = self.database_manager.query_all(
-                "SELECT sub_land_id, min_x, max_x, min_y, max_y, min_z, max_z FROM sub_lands WHERE parent_land_id = ?",
-                (parent_land_id,)
-            )
-            for r in siblings:
-                if exclude_sub_land_id is not None and r['sub_land_id'] == exclude_sub_land_id:
-                    continue
-                sl_min_y = r.get('min_y', 0)
-                sl_max_y = r.get('max_y', 255)
-                if (min_x <= r['max_x'] and max_x >= r['min_x'] and
-                        min_y <= sl_max_y and max_y >= sl_min_y and
-                        min_z <= r['max_z'] and max_z >= r['min_z']):
-                    return False, 'SUB_LAND_OVERLAP'
-
-            return True, None
-        except Exception as e:
-            self.logger.error(f"Check sub land availability error: {str(e)}")
-            return False, 'SYSTEM_ERROR'
+        return self.land_system.check_sub_land_availability(
+            parent_land_id, min_x, max_x, min_y, max_y, min_z, max_z, exclude_sub_land_id
+        )
 
     def add_sub_land_shared_user(self, sub_land_id: int, xuid: str) -> bool:
-        try:
-            info = self.get_sub_land_info(sub_land_id)
-            if not info:
-                return False
-            shared = info['shared_users']
-            if xuid in shared:
-                return False
-            shared.append(xuid)
-            return bool(self.database_manager.execute(
-                "UPDATE sub_lands SET shared_users = ? WHERE sub_land_id = ?",
-                (json.dumps(shared), sub_land_id)
-            ))
-        except Exception as e:
-            self.logger.error(f"Add sub land shared user error: {str(e)}")
-            return False
+        return self.land_system.add_sub_land_shared_user(sub_land_id, xuid)
 
     def remove_sub_land_shared_user(self, sub_land_id: int, xuid: str) -> bool:
-        try:
-            info = self.get_sub_land_info(sub_land_id)
-            if not info:
-                return False
-            shared = info['shared_users']
-            if xuid not in shared:
-                return False
-            shared.remove(xuid)
-            return bool(self.database_manager.execute(
-                "UPDATE sub_lands SET shared_users = ? WHERE sub_land_id = ?",
-                (json.dumps(shared), sub_land_id)
-            ))
-        except Exception as e:
-            self.logger.error(f"Remove sub land shared user error: {str(e)}")
-            return False
+        return self.land_system.remove_sub_land_shared_user(sub_land_id, xuid)
 
     def rename_sub_land(self, sub_land_id: int, new_name: str) -> bool:
-        try:
-            return bool(self.database_manager.execute(
-                "UPDATE sub_lands SET sub_land_name = ? WHERE sub_land_id = ?",
-                (new_name, sub_land_id)
-            ))
-        except Exception as e:
-            self.logger.error(f"Rename sub land error: {str(e)}")
-            return False
-
-    # ─── End Sub-land System ────────────────────────────────────────────────────
+        return self.land_system.rename_sub_land(sub_land_id, new_name)
 
     def get_player_land_count(self, xuid: str) -> int:
-        """
-        获取玩家拥有的领地数量
-        :param xuid: 玩家XUID
-        :return: 领地数量
-        """
-        try:
-            result = self.database_manager.query_one(
-                "SELECT COUNT(*) as count FROM lands WHERE owner_xuid = ?",
-                (xuid,)
-            )
-            return result['count'] if result else 0
-        except Exception as e:
-            self.logger.error(f"Get player land count error: {str(e)}")
-            return 0
+        return self.land_system.get_player_land_count(xuid)
 
-    def get_player_lands(self, xuid: str) -> dict[int, dict]:
-        """
-        获取玩家拥有的所有领地信息
-        :param xuid: 玩家XUID
-        :return: 字典 {领地ID: {
-            'land_name': 领地名称,
-            'dimension': 维度,
-            'min_x': 最小X坐标,
-            'max_x': 最大X坐标,
-            'min_z': 最小Z坐标,
-            'max_z': 最大Z坐标,
-            'tp_x': 传送点X坐标,
-            'tp_y': 传送点Y坐标,
-            'tp_z': 传送点Z坐标,
-            'shared_users': 共享玩家XUID列表
-        }}
-        """
-        try:
-            results = self.database_manager.query_all(
-                "SELECT * FROM lands WHERE owner_xuid = ?",
-                (xuid,)
-            )
-
-            lands_info = {}
-            for land in results:
-                lands_info[land['land_id']] = {
-                    'land_name': land['land_name'],
-                    'dimension': land['dimension'],
-                    'min_x': land['min_x'],
-                    'max_x': land['max_x'],
-                    'min_y': land.get('min_y', 0),
-                    'max_y': land.get('max_y', 255),
-                    'min_z': land['min_z'],
-                    'max_z': land['max_z'],
-                    'tp_x': land['tp_x'],
-                    'tp_y': land['tp_y'],
-                    'tp_z': land['tp_z'],
-                    'shared_users': json.loads(land['shared_users']),
-                    'allow_explosion': bool(land.get('allow_explosion', 0)),
-                    'allow_public_interact': bool(land.get('allow_public_interact', 0)),
-                    'allow_actor_interaction': bool(land.get('allow_actor_interaction', 0)),
-                    'allow_actor_damage': bool(land.get('allow_actor_damage', 0)),
-                    'allow_non_public_land': bool(land.get('allow_non_public_land', 0))
-                }
-
-            return lands_info
-
-        except Exception as e:
-            self.logger.error(f"Get player lands error: {str(e)}")
-            return {}
+    def get_player_lands(self, xuid: str) -> dict:
+        return self.land_system.get_player_lands(xuid)
 
     def get_all_lands(self) -> Dict[int, dict]:
-        """
-        获取全服务器所有领地
-        :return: {land_id: land_info} 格式的字典，land_info 与 get_land_info 返回结构一致（含 owner_xuid）
-        """
-        try:
-            results = self.database_manager.query_all(
-                "SELECT * FROM lands ORDER BY land_id"
-            )
-            lands_info = {}
-            for land in results:
-                lands_info[land['land_id']] = {
-                    'land_name': land['land_name'],
-                    'dimension': land['dimension'],
-                    'min_x': land['min_x'],
-                    'max_x': land['max_x'],
-                    'min_y': land.get('min_y', 0),
-                    'max_y': land.get('max_y', 255),
-                    'min_z': land['min_z'],
-                    'max_z': land['max_z'],
-                    'tp_x': land['tp_x'],
-                    'tp_y': land['tp_y'],
-                    'tp_z': land['tp_z'],
-                    'shared_users': json.loads(land['shared_users']),
-                    'owner_xuid': land['owner_xuid'],
-                    'allow_explosion': bool(land.get('allow_explosion', 0)),
-                    'allow_public_interact': bool(land.get('allow_public_interact', 0)),
-                    'allow_actor_interaction': bool(land.get('allow_actor_interaction', 0)),
-                    'allow_actor_damage': bool(land.get('allow_actor_damage', 0)),
-                    'allow_non_public_land': bool(land.get('allow_non_public_land', 0))
-                }
-            return lands_info
-        except Exception as e:
-            self.logger.error(f"Get all lands error: {str(e)}")
-            return {}
+        return self.land_system.get_all_lands()
 
     def get_land_info(self, land_id: int) -> dict:
-        """
-        根据领地ID获取领地信息
-        :param land_id: 领地ID
-        :return: 领地信息字典 {
-            'land_name': 领地名称,
-            'dimension': 维度,
-            'min_x': 最小X坐标,
-            'max_x': 最大X坐标,
-            'min_z': 最小Z坐标,
-            'max_z': 最大Z坐标,
-            'tp_x': 传送点X坐标,
-            'tp_y': 传送点Y坐标,
-            'tp_z': 传送点Z坐标,
-            'shared_users': 共享玩家XUID列表,
-            'owner_xuid': 拥有者XUID
-        } 不存在则返回空字典
-        """
-        try:
-            result = self.database_manager.query_one(
-                "SELECT * FROM lands WHERE land_id = ?",
-                (land_id,)
-            )
+        return self.land_system.get_land_info(land_id)
 
-            if result:
-                return {
-                    'land_name': result['land_name'],
-                    'dimension': result['dimension'],
-                    'min_x': result['min_x'],
-                    'max_x': result['max_x'],
-                    'min_y': result.get('min_y', 0),
-                    'max_y': result.get('max_y', 255),
-                    'min_z': result['min_z'],
-                    'max_z': result['max_z'],
-                    'tp_x': result['tp_x'],
-                    'tp_y': result['tp_y'],
-                    'tp_z': result['tp_z'],
-                    'shared_users': json.loads(result['shared_users']),
-                    'owner_xuid': result['owner_xuid'],
-                    'allow_explosion': bool(result.get('allow_explosion', 0)),
-                    'allow_public_interact': bool(result.get('allow_public_interact', 0)),
-                    'allow_actor_interaction': bool(result.get('allow_actor_interaction', 0)),
-                    'allow_actor_damage': bool(result.get('allow_actor_damage', 0)),
-                    'allow_non_public_land': bool(result.get('allow_non_public_land', 0))
-                }
-            return {}
+    PUBLIC_LAND_OWNER_XUID = LandSystem.PUBLIC_LAND_OWNER_XUID
 
-        except Exception as e:
-            self.logger.error(f"Get land info error: {str(e)}")
-            return {}
-
-    PUBLIC_LAND_OWNER_XUID = "0"  # 公共领地的 owner_xuid 固定为 "0"
-    
     def is_public_land(self, land_id: int) -> bool:
-        """判断领地是否为公共领地"""
-        return self.get_land_owner(land_id) == self.PUBLIC_LAND_OWNER_XUID
+        return self.land_system.is_public_land(land_id)
 
     def _get_public_land_protected_entities(self) -> Set[str]:
-        """获取公共领地白名单保护生物类型集合（配置 PUBLIC_LAND_PROTECTED_ENTITIES，逗号分隔）"""
-        raw = self.setting_manager.GetSetting('PUBLIC_LAND_PROTECTED_ENTITIES')
-        if not raw or not str(raw).strip():
-            return set()
-        return {s.strip() for s in str(raw).split(',') if s.strip()}
-    
+        return self.land_system.get_public_land_protected_entities()
+
     def get_land_display_owner_name(self, land_id: int) -> str:
-        """获取领地显示的所有者名称：公共领地显示翻译后的「公共领地」，否则显示玩家名"""
-        owner_xuid = self.get_land_owner(land_id)
-        if owner_xuid == self.PUBLIC_LAND_OWNER_XUID:
+        owner_xuid = self.land_system.get_land_owner(land_id)
+        if owner_xuid == LandSystem.PUBLIC_LAND_OWNER_XUID:
             return self.language_manager.GetText('PUBLIC_LAND_NAME')
         return self.get_player_name_by_xuid(owner_xuid) or owner_xuid or ''
-    
-    def get_land_owner(self, land_id: int) -> str:
-        """
-        获取领地拥有者的XUID
-        :param land_id: 领地ID
-        :return: 拥有者XUID，不存在则返回空字符串
-        """
-        try:
-            result = self.database_manager.query_one(
-                "SELECT owner_xuid FROM lands WHERE land_id = ?",
-                (land_id,)
-            )
-            return result['owner_xuid'] if result else ""
 
-        except Exception as e:
-            self.logger.error(f"Get land owner error: {str(e)}")
-            return ""
+    def get_land_owner(self, land_id: int) -> str:
+        return self.land_system.get_land_owner(land_id)
 
     def set_land_as_public(self, land_id: int) -> bool:
-        """
-        将领地设为公共领地（owner_xuid 设为 "0"），并默认开放方块互动、生物互动、生物伤害
-        :param land_id: 领地ID
-        :return: 是否成功
-        """
-        try:
-            if not self.get_land_info(land_id):
-                return False
-            return self.database_manager.execute(
-                "UPDATE lands SET owner_xuid = ?, owner_paid_money = 0, allow_public_interact = 1, allow_actor_interaction = 1, allow_actor_damage = 1 WHERE land_id = ?",
-                (self.PUBLIC_LAND_OWNER_XUID, land_id)
-            )
-        except Exception as e:
-            self.logger.error(f"Set land as public error: {str(e)}")
-            return False
-    
-    def rename_land(self, land_id: int, new_name: str) -> tuple[bool, str]:
-        """
-        修改领地名称
-        :param land_id: 领地ID
-        :param new_name: 新的领地名称
-        :return: (是否成功, 消息)
-        """
-        try:
-            # 检查领地是否存在
-            if not self.get_land_info(land_id):
-                return False, "领地不存在"
+        return self.land_system.set_land_as_public(land_id)
 
-            # 更新领地名称
-            self.database_manager.execute(
-                "UPDATE lands SET land_name = ? WHERE land_id = ?",
-                (new_name, land_id)
-            )
-
+    def rename_land(self, land_id: int, new_name: str) -> tuple:
+        success, err = self.land_system.rename_land(land_id, new_name)
+        if success:
             return True, "领地名称修改成功"
+        return False, err or "修改领地名称时发生错误"
 
-        except Exception as e:
-            self.logger.error(f"Rename land error: {str(e)}")
-            return False, f"修改领地名称时发生错误: {str(e)}"
-
-    def set_land_teleport_point(self, land_id: int, x: int, y: int, z: int) -> tuple[bool, str]:
-        """
-        设置领地传送点
-        :param land_id: 领地ID
-        :param x: 传送点X坐标
-        :param y: 传送点Y坐标
-        :param z: 传送点Z坐标
-        :return: (是否成功, 消息)
-        """
-        try:
-            # 获取领地信息检查是否存在
-            land_info = self.get_land_info(land_id)
-            if not land_info:
-                return False, "领地不存在"
-
-            # 检查传送点是否在领地范围内
-            if not (land_info['min_x'] <= x <= land_info['max_x'] and
-                    land_info['min_z'] <= z <= land_info['max_z']):
-                return False, "传送点必须在领地范围内"
-
-            # 更新传送点坐标
-            self.database_manager.execute(
-                "UPDATE lands SET tp_x = ?, tp_y = ?, tp_z = ? WHERE land_id = ?",
-                (x, y, z, land_id)
-            )
-
+    def set_land_teleport_point(self, land_id: int, x: int, y: int, z: int) -> tuple:
+        success, err = self.land_system.set_land_teleport_point(land_id, x, y, z)
+        if success:
             return True, "领地传送点设置成功"
+        if err == "LAND_NOT_FOUND":
+            return False, "领地不存在"
+        if err == "TP_POINT_OUT_OF_LAND":
+            return False, "传送点必须在领地范围内"
+        return False, f"设置传送点时发生错误: {err}"
 
-        except Exception as e:
-            self.logger.error(f"Set land teleport point error: {str(e)}")
-            return False, f"设置传送点时发生错误: {str(e)}"
-
-    def get_land_teleport_point(self, land_id: int) -> tuple[int, int, int] | None:
-        """
-        获取领地传送点坐标
-        :param land_id: 领地ID
-        :return: (x, y, z)坐标元组, 如果领地不存在则返回None
-        """
-        try:
-            result = self.database_manager.query_one(
-                "SELECT tp_x, tp_y, tp_z FROM lands WHERE land_id = ?",
-                (land_id,)
-            )
-
-            if result:
-                return (result['tp_x'], result['tp_y'], result['tp_z'])
-            return None
-
-        except Exception as e:
-            self.logger.error(f"Get land teleport point error: {str(e)}")
-            return None
+    def get_land_teleport_point(self, land_id: int) -> Optional[tuple]:
+        return self.land_system.get_land_teleport_point(land_id)
 
     def get_land_dimension(self, land_id: int) -> str:
-        """
-        获取领地所在维度
-        :param land_id: 领地ID
-        :return: 维度字符串 ('minecraft:overworld'/'minecraft:nether'/'minecraft:the_end')
-                如果领地不存在则返回空字符串
-        """
-        try:
-            result = self.database_manager.query_one(
-                "SELECT dimension FROM lands WHERE land_id = ?",
-                (land_id,)
-            )
-            return result['dimension'] if result else ""
-
-        except Exception as e:
-            self.logger.error(f"Get land dimension error: {str(e)}")
-            return ""
+        return self.land_system.get_land_dimension(land_id)
 
     def get_land_name(self, land_id: int) -> str:
-        """
-        获取领地名称
-        :param land_id: 领地ID
-        :return: 领地名称，如果领地不存在则返回空字符串
-        """
-        try:
-            result = self.database_manager.query_one(
-                "SELECT land_name FROM lands WHERE land_id = ?",
-                (land_id,)
-            )
-            return result['land_name'] if result else ""
-
-        except Exception as e:
-            self.logger.error(f"Get land name error: {str(e)}")
-            return ""
+        return self.land_system.get_land_name(land_id)
 
     # Land System UI
     def show_land_main_menu(self, player: Player):
@@ -4087,28 +3253,7 @@ class ARCCorePlugin(Plugin):
         player.send_form(confirm_panel)
 
     def transfer_land(self, land_id: int, new_owner_xuid: str) -> bool:
-        """
-        移交领地给新的拥有者
-        :param land_id: 领地ID
-        :param new_owner_xuid: 新拥有者的XUID
-        :return: 是否成功
-        """
-        try:
-            # 检查领地是否存在
-            if not self.get_land_info(land_id):
-                return False
-
-            # 更新领地拥有者
-            self.database_manager.execute(
-                "UPDATE lands SET owner_xuid = ? WHERE land_id = ?",
-                (new_owner_xuid, land_id)
-            )
-
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Transfer land error: {str(e)}")
-            return False
+        return self.land_system.transfer_land(land_id, new_owner_xuid)
 
     def try_transfer_land(self, player: Player, land_id: int, target_player: Player):
         """尝试移交领地"""
@@ -4227,24 +3372,12 @@ class ARCCorePlugin(Plugin):
             if not land_info:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
                 return
-
             target_xuid = str(target_player.xuid)
-            
-            # 检查是否已经授权
             if target_xuid in land_info['shared_users']:
                 player.send_message(self.language_manager.GetText('LAND_AUTH_ALREADY_EXISTS').format(target_player.name))
                 self.show_land_auth_manage_panel(player, land_id)
                 return
-
-            # 添加授权
-            shared_users = land_info['shared_users']
-            shared_users.append(target_xuid)
-            
-            success = self.database_manager.execute(
-                "UPDATE lands SET shared_users = ? WHERE land_id = ?",
-                (json.dumps(shared_users), land_id)
-            )
-            
+            success = self.land_system.add_land_shared_user(land_id, target_xuid)
             if success:
                 player.send_message(self.language_manager.GetText('LAND_AUTH_SUCCESS_ADD').format(land_id, target_player.name))
                 target_player.send_message(self.language_manager.GetText('LAND_AUTH_NOTIFICATION').format(
@@ -4252,11 +3385,9 @@ class ARCCorePlugin(Plugin):
                 ))
             else:
                 player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_ADD'))
-                
         except Exception as e:
             self.logger.error(f"Add land auth error: {str(e)}")
             player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_ADD'))
-        
         self.show_land_auth_manage_panel(player, land_id)
 
     def remove_land_auth(self, player: Player, land_id: int, target_uuid: str, target_name: str):
@@ -4266,25 +3397,13 @@ class ARCCorePlugin(Plugin):
             if not land_info:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
                 return
-
-            # 检查是否存在授权
             if target_uuid not in land_info['shared_users']:
                 player.send_message(self.language_manager.GetText('LAND_AUTH_NOT_EXISTS').format(target_name))
                 self.show_land_auth_manage_panel(player, land_id)
                 return
-
-            # 移除授权
-            shared_users = land_info['shared_users']
-            shared_users.remove(target_uuid)
-            
-            success = self.database_manager.execute(
-                "UPDATE lands SET shared_users = ? WHERE land_id = ?",
-                (json.dumps(shared_users), land_id)
-            )
-            
+            success = self.land_system.remove_land_shared_user(land_id, target_uuid)
             if success:
                 player.send_message(self.language_manager.GetText('LAND_AUTH_SUCCESS_REMOVE').format(target_name, land_id))
-                # 通知被移除授权的玩家（如果在线）
                 target_player = self.server.get_player(target_name)
                 if target_player:
                     target_player.send_message(self.language_manager.GetText('LAND_AUTH_REMOVE_NOTIFICATION').format(
@@ -4292,11 +3411,9 @@ class ARCCorePlugin(Plugin):
                     ))
             else:
                 player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_REMOVE'))
-                
         except Exception as e:
             self.logger.error(f"Remove land auth error: {str(e)}")
             player.send_message(self.language_manager.GetText('LAND_AUTH_FAILED_REMOVE'))
-        
         self.show_land_auth_manage_panel(player, land_id)
 
     def show_land_explosion_setting_panel(self, player: Player, land_id: int):
@@ -4364,23 +3481,14 @@ class ARCCorePlugin(Plugin):
     def toggle_land_public_interact_setting(self, player: Player, land_id: int, allow_public_interact: bool):
         """切换领地方块互动开放设置"""
         try:
-            success = self.database_manager.execute(
-                "UPDATE lands SET allow_public_interact = ? WHERE land_id = ?",
-                (1 if allow_public_interact else 0, land_id)
-            )
-            
+            success = self.land_system.set_land_allow_public_interact(land_id, allow_public_interact)
             if success:
-                if allow_public_interact:
-                    player.send_message(self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_UPDATED_ENABLE').format(land_id))
-                else:
-                    player.send_message(self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_UPDATED_DISABLE').format(land_id))
+                key = 'LAND_PUBLIC_INTERACT_SETTING_UPDATED_ENABLE' if allow_public_interact else 'LAND_PUBLIC_INTERACT_SETTING_UPDATED_DISABLE'
+                player.send_message(self.language_manager.GetText(key).format(land_id))
             else:
                 player.send_message(self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_FAILED'))
-                
-            # 返回领地详情面板
             land_info = self.get_land_info(land_id)
             self.show_own_land_detail_panel(player, land_id, land_info)
-            
         except Exception as e:
             self.logger.error(f"Update land public interact setting error: {str(e)}")
             player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
@@ -4388,24 +3496,15 @@ class ARCCorePlugin(Plugin):
     def toggle_land_explosion_setting(self, player: Player, land_id: int, allow_explosion: bool):
         """切换领地爆炸保护设置"""
         try:
-            success = self.database_manager.execute(
-                "UPDATE lands SET allow_explosion = ? WHERE land_id = ?",
-                (1 if allow_explosion else 0, land_id)
-            )
-            
+            success = self.land_system.set_land_allow_explosion(land_id, allow_explosion)
             if success:
-                if allow_explosion:
-                    player.send_message(self.language_manager.GetText('LAND_EXPLOSION_SETTING_UPDATED_ENABLE').format(land_id))
-                else:
-                    player.send_message(self.language_manager.GetText('LAND_EXPLOSION_SETTING_UPDATED_DISABLE').format(land_id))
+                key = 'LAND_EXPLOSION_SETTING_UPDATED_ENABLE' if allow_explosion else 'LAND_EXPLOSION_SETTING_UPDATED_DISABLE'
+                player.send_message(self.language_manager.GetText(key).format(land_id))
             else:
                 player.send_message(self.language_manager.GetText('LAND_EXPLOSION_SETTING_FAILED'))
-                
         except Exception as e:
             self.logger.error(f"Toggle land explosion setting error: {str(e)}")
             player.send_message(self.language_manager.GetText('LAND_EXPLOSION_SETTING_FAILED'))
-        
-        # 返回领地详情页面
         land_info = self.get_land_info(land_id)
         if land_info:
             self.show_own_land_detail_panel(player, land_id, land_info)
@@ -4475,24 +3574,15 @@ class ARCCorePlugin(Plugin):
     def toggle_land_actor_interaction_setting(self, player: Player, land_id: int, allow_actor_interaction: bool):
         """切换领地生物互动设置"""
         try:
-            success = self.database_manager.execute(
-                "UPDATE lands SET allow_actor_interaction = ? WHERE land_id = ?",
-                (1 if allow_actor_interaction else 0, land_id)
-            )
-            
+            success = self.land_system.set_land_allow_actor_interaction(land_id, allow_actor_interaction)
             if success:
-                if allow_actor_interaction:
-                    player.send_message(self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_UPDATED_ENABLE').format(land_id))
-                else:
-                    player.send_message(self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_UPDATED_DISABLE').format(land_id))
+                key = 'LAND_ACTOR_INTERACTION_SETTING_UPDATED_ENABLE' if allow_actor_interaction else 'LAND_ACTOR_INTERACTION_SETTING_UPDATED_DISABLE'
+                player.send_message(self.language_manager.GetText(key).format(land_id))
             else:
                 player.send_message(self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_FAILED'))
-                
         except Exception as e:
             self.logger.error(f"Toggle land actor interaction setting error: {str(e)}")
             player.send_message(self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_FAILED'))
-        
-        # 返回领地详情页面
         land_info = self.get_land_info(land_id)
         if land_info:
             self.show_own_land_detail_panel(player, land_id, land_info)
@@ -4500,24 +3590,15 @@ class ARCCorePlugin(Plugin):
     def toggle_land_actor_damage_setting(self, player: Player, land_id: int, allow_actor_damage: bool):
         """切换领地生物攻击设置"""
         try:
-            success = self.database_manager.execute(
-                "UPDATE lands SET allow_actor_damage = ? WHERE land_id = ?",
-                (1 if allow_actor_damage else 0, land_id)
-            )
-            
+            success = self.land_system.set_land_allow_actor_damage(land_id, allow_actor_damage)
             if success:
-                if allow_actor_damage:
-                    player.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_UPDATED_ENABLE').format(land_id))
-                else:
-                    player.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_UPDATED_DISABLE').format(land_id))
+                key = 'LAND_ACTOR_DAMAGE_SETTING_UPDATED_ENABLE' if allow_actor_damage else 'LAND_ACTOR_DAMAGE_SETTING_UPDATED_DISABLE'
+                player.send_message(self.language_manager.GetText(key).format(land_id))
             else:
                 player.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_FAILED'))
-                
         except Exception as e:
             self.logger.error(f"Toggle land actor damage setting error: {str(e)}")
             player.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_FAILED'))
-        
-        # 返回领地详情页面
         land_info = self.get_land_info(land_id)
         if land_info:
             self.show_own_land_detail_panel(player, land_id, land_info)
@@ -4589,17 +3670,17 @@ class ARCCorePlugin(Plugin):
     def show_current_land_info(self, player: Player):
         """显示玩家当前位置的领地信息并绘制粒子边界"""
         try:
-            # 获取玩家当前位置
+            # 获取玩家当前位置（与位置线程、权限检测使用同一套维度和坐标逻辑）
             pos = self.get_player_position_vector(player)
             if not pos:
                 player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
                 return
             
             x, y, z = pos
-            dimension = player.dimension.name.lower()
+            dimension = player.location.dimension.name
             
-            # 获取当前位置的领地ID
-            land_id = self.get_land_at_pos(dimension, x, z)
+            # 获取当前位置的领地ID（传入 y 做三维判断，与进入领地提示一致）
+            land_id = self.get_land_at_pos(dimension, x, z, y)
             
             if not land_id:
                 player.send_message(self.language_manager.GetText('LAND_CURRENT_POSITION_NO_LAND'))
@@ -5205,7 +4286,7 @@ class ARCCorePlugin(Plugin):
         x = math.floor(player.location.x)
         y = math.floor(player.location.y)
         z = math.floor(player.location.z)
-        dimension = player.dimension.name.lower()
+        dimension = player.location.dimension.name
 
         # 查找该位置的私人领地（get_land_at_pos 已优先返回非公共领地）
         land_id = self.get_land_at_pos(dimension, x, z, y)
@@ -5371,6 +4452,7 @@ class ARCCorePlugin(Plugin):
             except (ValueError, TypeError):
                 self.land_min_distance = 0
             self.teleport_system.reload_config()
+            self.land_system.reload_config()
             self.hide_op_in_money_ranking = self.setting_manager.GetSetting('HIDE_OP_IN_MONEY_RANKING')
             if self.hide_op_in_money_ranking is None:
                 self.hide_op_in_money_ranking = True
@@ -5910,12 +4992,7 @@ class ARCCorePlugin(Plugin):
                 player.send_message(self.language_manager.GetText('LAND_AUTH_ALREADY_EXISTS').format(target_player.name))
                 self.show_op_land_auth_manage_panel(player, land_id, from_page)
                 return
-            shared_users = list(land_info['shared_users'])
-            shared_users.append(target_xuid)
-            success = self.database_manager.execute(
-                "UPDATE lands SET shared_users = ? WHERE land_id = ?",
-                (json.dumps(shared_users), land_id)
-            )
+            success = self.land_system.add_land_shared_user(land_id, target_xuid)
             if success:
                 player.send_message(self.language_manager.GetText('LAND_AUTH_SUCCESS_ADD').format(land_id, target_player.name))
                 target_player.send_message(self.language_manager.GetText('LAND_AUTH_NOTIFICATION').format(
@@ -5940,12 +5017,7 @@ class ARCCorePlugin(Plugin):
                 player.send_message(self.language_manager.GetText('LAND_AUTH_NOT_EXISTS').format(target_name))
                 self.show_op_land_auth_manage_panel(player, land_id, from_page)
                 return
-            shared_users = list(land_info['shared_users'])
-            shared_users.remove(target_xuid)
-            success = self.database_manager.execute(
-                "UPDATE lands SET shared_users = ? WHERE land_id = ?",
-                (json.dumps(shared_users), land_id)
-            )
+            success = self.land_system.remove_land_shared_user(land_id, target_xuid)
             if success:
                 player.send_message(self.language_manager.GetText('LAND_AUTH_SUCCESS_REMOVE').format(target_name, land_id))
                 target_player = self.server.get_player(target_name)
@@ -6050,22 +5122,25 @@ class ARCCorePlugin(Plugin):
     
     def op_toggle_land_setting(self, player: Player, land_id: int, setting_key: str, enable: bool, from_page: int):
         """OP 切换公共领地某项设置并返回设置面板"""
-        column_map = {
-            'allow_public_interact': ('allow_public_interact', 'LAND_PUBLIC_INTERACT_SETTING_UPDATED_ENABLE', 'LAND_PUBLIC_INTERACT_SETTING_UPDATED_DISABLE', 'LAND_PUBLIC_INTERACT_SETTING_FAILED'),
-            'allow_explosion': ('allow_explosion', 'LAND_EXPLOSION_SETTING_UPDATED_ENABLE', 'LAND_EXPLOSION_SETTING_UPDATED_DISABLE', 'LAND_EXPLOSION_SETTING_FAILED'),
-            'allow_actor_interaction': ('allow_actor_interaction', 'LAND_ACTOR_INTERACTION_SETTING_UPDATED_ENABLE', 'LAND_ACTOR_INTERACTION_SETTING_UPDATED_DISABLE', 'LAND_ACTOR_INTERACTION_SETTING_FAILED'),
-            'allow_actor_damage': ('allow_actor_damage', 'LAND_ACTOR_DAMAGE_SETTING_UPDATED_ENABLE', 'LAND_ACTOR_DAMAGE_SETTING_UPDATED_DISABLE', 'LAND_ACTOR_DAMAGE_SETTING_FAILED'),
-            'allow_non_public_land': ('allow_non_public_land', 'ALLOW_NON_PUBLIC_LAND_UPDATED_ENABLE', 'ALLOW_NON_PUBLIC_LAND_UPDATED_DISABLE', 'ALLOW_NON_PUBLIC_LAND_FAILED'),
+        setter_map = {
+            'allow_public_interact': self.land_system.set_land_allow_public_interact,
+            'allow_explosion': self.land_system.set_land_allow_explosion,
+            'allow_actor_interaction': self.land_system.set_land_allow_actor_interaction,
+            'allow_actor_damage': self.land_system.set_land_allow_actor_damage,
+            'allow_non_public_land': self.land_system.set_land_allow_non_public_land,
         }
-        col, msg_enable, msg_disable, msg_fail = column_map[setting_key]
+        msg_map = {
+            'allow_public_interact': ('LAND_PUBLIC_INTERACT_SETTING_UPDATED_ENABLE', 'LAND_PUBLIC_INTERACT_SETTING_UPDATED_DISABLE', 'LAND_PUBLIC_INTERACT_SETTING_FAILED'),
+            'allow_explosion': ('LAND_EXPLOSION_SETTING_UPDATED_ENABLE', 'LAND_EXPLOSION_SETTING_UPDATED_DISABLE', 'LAND_EXPLOSION_SETTING_FAILED'),
+            'allow_actor_interaction': ('LAND_ACTOR_INTERACTION_SETTING_UPDATED_ENABLE', 'LAND_ACTOR_INTERACTION_SETTING_UPDATED_DISABLE', 'LAND_ACTOR_INTERACTION_SETTING_FAILED'),
+            'allow_actor_damage': ('LAND_ACTOR_DAMAGE_SETTING_UPDATED_ENABLE', 'LAND_ACTOR_DAMAGE_SETTING_UPDATED_DISABLE', 'LAND_ACTOR_DAMAGE_SETTING_FAILED'),
+            'allow_non_public_land': ('ALLOW_NON_PUBLIC_LAND_UPDATED_ENABLE', 'ALLOW_NON_PUBLIC_LAND_UPDATED_DISABLE', 'ALLOW_NON_PUBLIC_LAND_FAILED'),
+        }
+        msg_enable, msg_disable, msg_fail = msg_map[setting_key]
         try:
-            success = self.database_manager.execute(
-                f"UPDATE lands SET {col} = ? WHERE land_id = ?",
-                (1 if enable else 0, land_id)
-            )
+            success = setter_map[setting_key](land_id, enable)
             if success:
-                msg_key = msg_enable if enable else msg_disable
-                player.send_message(self.language_manager.GetText(msg_key).format(land_id))
+                player.send_message(self.language_manager.GetText(msg_enable if enable else msg_disable).format(land_id))
             else:
                 player.send_message(self.language_manager.GetText(msg_fail))
             self.show_op_public_land_settings_panel(player, land_id, from_page)
