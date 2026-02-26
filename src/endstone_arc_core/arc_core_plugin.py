@@ -4282,15 +4282,16 @@ class ARCCorePlugin(Plugin):
         player.send_form(op_main_panel)
 
     def show_op_land_at_pos(self, player: Player):
-        """OP 直接获取脚下私人领地并进入管理面板"""
-        x = math.floor(player.location.x)
-        y = math.floor(player.location.y)
-        z = math.floor(player.location.z)
+        """OP 直接获取脚下领地（含公共领地）并进入管理面板"""
+        pos = self.get_player_position_vector(player)
+        if not pos:
+            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            return
+        x, y, z = pos
         dimension = player.location.dimension.name
 
-        # 查找该位置的私人领地（get_land_at_pos 已优先返回非公共领地）
         land_id = self.get_land_at_pos(dimension, x, z, y)
-        if land_id is None or self.is_public_land(land_id):
+        if land_id is None:
             result_panel = ActionForm(
                 title=self.language_manager.GetText('OP_LAND_AT_POS_TITLE'),
                 content=self.language_manager.GetText('OP_LAND_AT_POS_NOT_FOUND').format(x, y, z),

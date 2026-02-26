@@ -309,13 +309,16 @@ class LandSystem:
                 land = self.db.query_one(
                     "SELECT * FROM lands WHERE land_id = ?", (land_id,)
                 )
-                if land and land["min_x"] <= x <= land["max_x"] and land["min_z"] <= z <= land["max_z"]:
-                    if y is not None:
-                        if not (land.get("min_y", 0) <= int(y) <= land.get("max_y", 255)):
-                            continue
-                    if land["owner_xuid"] != self.PUBLIC_LAND_OWNER_XUID:
-                        return land_id
-                    public_land_id = land_id
+                if not land:
+                    continue
+                if not (land["min_x"] <= x <= land["max_x"] and land["min_z"] <= z <= land["max_z"]):
+                    continue
+                if y is not None:
+                    if not (land.get("min_y", 0) <= int(y) <= land.get("max_y", 255)):
+                        continue
+                if land["owner_xuid"] != self.PUBLIC_LAND_OWNER_XUID:
+                    return land_id
+                public_land_id = land_id
             return public_land_id
         except Exception as e:
             self._log("error", f"Get land at pos error: {str(e)}")
