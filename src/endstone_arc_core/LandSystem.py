@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """领地系统：建表、区块索引、CRUD、子领地、权限设置的全部数据/逻辑层"""
 import json
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Optional, Set
 
 
 class LandSystem:
@@ -143,6 +143,7 @@ class LandSystem:
                 "allow_public_interact": "INTEGER DEFAULT 0",
                 "allow_actor_interaction": "INTEGER DEFAULT 0",
                 "allow_actor_damage": "INTEGER DEFAULT 0",
+                "allow_frame": "INTEGER DEFAULT 0",
                 "owner_paid_money": "REAL DEFAULT 0",
                 "allow_non_public_land": "INTEGER DEFAULT 0",
             }
@@ -171,6 +172,7 @@ class LandSystem:
             _add_col("allow_public_interact", "INTEGER DEFAULT 0")
             _add_col("allow_actor_interaction", "INTEGER DEFAULT 0")
             _add_col("allow_actor_damage", "INTEGER DEFAULT 0")
+            _add_col("allow_frame", "INTEGER DEFAULT 0")
 
             if not self._column_exists("lands", "owner_paid_money"):
                 ok = self.db.execute(
@@ -191,7 +193,6 @@ class LandSystem:
             _add_col("allow_non_public_land", "INTEGER DEFAULT 0")
             _add_col("min_y", "INTEGER NOT NULL DEFAULT 0")
             _add_col("max_y", "INTEGER NOT NULL DEFAULT 255")
-            _add_col("allow_sub_land", "INTEGER DEFAULT 0")  # 已废弃，保留兼容
             return True
         except Exception as e:
             print(f"[ARC Core]Upgrade land table error: {str(e)}")
@@ -224,7 +225,7 @@ class LandSystem:
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'chunk_lands_%'"
             )
             for row in tables:
-                self.db.execute(f"DROP TABLE IF EXISTS \"{row['name']}\"")
+                self.db.execute(f"DROP TABLE IF EXISTS {row['name']}")
 
             lands = self.db.query_all(
                 "SELECT land_id, dimension, min_x, max_x, min_z, max_z FROM lands"
@@ -436,6 +437,7 @@ class LandSystem:
             "allow_public_interact": bool(row.get("allow_public_interact", 0)),
             "allow_actor_interaction": bool(row.get("allow_actor_interaction", 0)),
             "allow_actor_damage": bool(row.get("allow_actor_damage", 0)),
+            "allow_frame": bool(row.get("allow_frame", 0)),
             "allow_non_public_land": bool(row.get("allow_non_public_land", 0)),
             "owner_paid_money": row.get("owner_paid_money", 0),
         }
@@ -591,6 +593,9 @@ class LandSystem:
 
     def set_land_allow_actor_damage(self, land_id: int, allow: bool) -> bool:
         return self._set_land_flag(land_id, "allow_actor_damage", allow)
+
+    def set_land_allow_frame(self, land_id: int, allow: bool) -> bool:
+        return self._set_land_flag(land_id, "allow_frame", allow)
 
     def set_land_allow_non_public_land(self, land_id: int, allow: bool) -> bool:
         return self._set_land_flag(land_id, "allow_non_public_land", allow)

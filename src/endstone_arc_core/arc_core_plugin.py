@@ -10,7 +10,7 @@ from typing import Dict, Any, Optional, Set
 from endstone import ColorFormat, Player, GameMode
 from endstone.form import ActionForm, TextInput, ModalForm, Label
 from endstone.command import Command, CommandSender
-from endstone.event import event_handler, PlayerJoinEvent, PlayerQuitEvent, BlockBreakEvent, BlockPlaceEvent, PlayerDeathEvent, PlayerInteractEvent, ActorExplodeEvent, PlayerInteractActorEvent, ActorDamageEvent 
+from endstone.event import event_handler, PlayerJoinEvent, PlayerQuitEvent, PlayerRespawnEvent, BlockBreakEvent, BlockPlaceEvent, PlayerDeathEvent, PlayerInteractEvent, ActorExplodeEvent, PlayerInteractActorEvent, ActorDamageEvent, PlayerChatEvent 
 from endstone.plugin import Plugin
 
 from endstone_arc_core.DatabaseManager import DatabaseManager
@@ -19,6 +19,8 @@ from endstone_arc_core.LanguageManager import LanguageManager
 from endstone_arc_core.SettingManager import SettingManager
 from endstone_arc_core.TeleportSystem import TeleportSystem, generate_tp_command_to_position
 from endstone_arc_core.LandSystem import LandSystem
+from endstone_arc_core.TitleSystem import TitleSystem
+from endstone_arc_core.EntityDisplayNameManager import EntityDisplayNameManager
 
 MAIN_PATH = 'plugins/ARCCore'
 
@@ -30,8 +32,8 @@ class ARCCorePlugin(Plugin):
             "usages": ["/updatespawnpos"]
         },
         "arc": {
-            "description": "ARC Core menu command.",
-            "usages": ["/arc"],
+            "description": "ARC Core menu command. Use /arc op to open OP panel (OP only).",
+            "usages": ["/arc", "/arc op"],
             "permissions": ["arc_core.command.arc"],
         },
         "suicide":
@@ -60,6 +62,16 @@ class ARCCorePlugin(Plugin):
             "description": "Buy the pending new land.",
             "usages": ["/landbuy"],
             "permissions": ["arc_core.command.set_land_corner"],
+        },
+        "pos1": {
+            "description": "OP only: record current position as coordinate 1.",
+            "usages": ["/pos1"],
+            "permissions": ["arc_core.command.op"],
+        },
+        "pos2": {
+            "description": "OP only: record current position as coordinate 2 and open OP panel.",
+            "usages": ["/pos2"],
+            "permissions": ["arc_core.command.op"],
         }
     }
     permissions = {
@@ -78,6 +90,10 @@ class ARCCorePlugin(Plugin):
         "arc_core.command.set_land_corner": {
             "description": "Can used by everyone.",
             "default": True,
+        },
+        "arc_core.command.op": {
+            "description": "OP only commands: pos1, pos2, arc op.",
+            "default": "op",
         }
     }
 
@@ -91,6 +107,8 @@ class ARCCorePlugin(Plugin):
         self.economy = Economy(self.database_manager, self.setting_manager)
         self.teleport_system = TeleportSystem(self.database_manager, self.setting_manager)
         self.land_system = LandSystem(self.database_manager, self.setting_manager)
+        self.title_system = TitleSystem(self.database_manager, self.setting_manager)
+        self.entity_display_name_manager = EntityDisplayNameManager(Path(MAIN_PATH), logger=None)
         self.init_database()
 
         self.if_protect_spawn = self.setting_manager.GetSetting('IF_PROTECT_SPAWN')
@@ -139,6 +157,9 @@ class ARCCorePlugin(Plugin):
         self.op_coordinate2_dict = {}
         self.op_last_command_dict = {}
 
+        # OP 调试模式（开启后触发方块/生物相关事件时向该 OP 发送调试信息）
+        self.op_debug_mode = set()
+
         # 玩家出入领地
         self.player_in_land_id_dict = {}
         
@@ -172,6 +193,16 @@ class ARCCorePlugin(Plugin):
                 self.hide_op_in_money_ranking = self.hide_op_in_money_ranking.lower() in ['true', '1', 'yes']
             except (ValueError, AttributeError):
                 self.hide_op_in_money_ranking = True
+
+        # 强制登录
+        self.force_login = self.setting_manager.GetSetting('FORCE_LOGIN')
+        if self.force_login is None:
+            self.force_login = False
+        else:
+            try:
+                self.force_login = str(self.force_login).lower() in ['true', '1', 'yes']
+            except (ValueError, AttributeError):
+                self.force_login = False
 
         # 清道夫系统变量初始化
         self.enable_cleaner = False
@@ -281,6 +312,7 @@ class ARCCorePlugin(Plugin):
         self.teleport_system.set_logger(self.logger)
         self.land_system.set_logger(self.logger)
         self.land_system.reload_config()
+        self.entity_display_name_manager.logger = self.logger
 
         # 初始化公告系统和清道夫系统
         self._load_broadcast_messages()
@@ -331,6 +363,12 @@ class ARCCorePlugin(Plugin):
         if command.name == "arc":
             if not isinstance(sender, Player):
                 sender.send_message(f'[ARC Core]This command only works for players.')
+                return True
+            if args and len(args) >= 1 and args[0].lower() == 'op':
+                if not sender.is_op:
+                    sender.send_message(self.language_manager.GetText('OP_PANEL_NO_PERMISSION'))
+                    return True
+                self.show_op_main_panel(sender)
                 return True
             self.show_main_menu(sender)
             return True
@@ -413,6 +451,25 @@ class ARCCorePlugin(Plugin):
                 return True
             self._execute_land_buy(sender)
             return True
+        if command.name == 'pos1':
+            if not isinstance(sender, Player):
+                sender.send_message(f'[ARC Core]This command only works for players.')
+                return True
+            if not sender.is_op:
+                sender.send_message(self.language_manager.GetText('OP_PANEL_NO_PERMISSION'))
+                return True
+            self.record_coordinate_1(sender)
+            sender.send_message(self.language_manager.GetText('POS1_RECORDED'))
+            return True
+        if command.name == 'pos2':
+            if not isinstance(sender, Player):
+                sender.send_message(f'[ARC Core]This command only works for players.')
+                return True
+            if not sender.is_op:
+                sender.send_message(self.language_manager.GetText('OP_PANEL_NO_PERMISSION'))
+                return True
+            self.record_coordinate_2(sender)
+            return True
         return False
 
     # Event handlers
@@ -451,6 +508,40 @@ class ARCCorePlugin(Plugin):
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Check pending invite rewards on join error: {str(e)}")
 
+        self.title_system.on_player_join(event.player)
+        self._update_player_name_tag(event.player)
+
+        if self.force_login and not self.if_player_logined(event.player):
+            self.show_main_menu(event.player)
+
+    @event_handler
+    def on_player_respawn(self, event: PlayerRespawnEvent):
+        """玩家重生后重新设置 name_tag 为 [头衔]名字，防止重生后头顶名被重置。"""
+        self._update_player_name_tag(event.player)
+
+    @event_handler
+    def on_player_chat(self, event: PlayerChatEvent):
+        """远古 QQ 风格：首行 [头衔]玩家名(年.月.日-时:分)：，下一行消息内容。取消原事件并自行广播。"""
+        try:
+            raw_message = event.message
+            now = datetime.now()
+            time_str = f"{now.year}.{now.month}.{now.day}-{now.hour}:{now.minute:02d}"
+            equipped = self.title_system.get_equipped_title(event.player)
+            name = event.player.name
+            player_prefix = self.language_manager.GetText('TITLE_CHAT_PLAYER_PREFIX')
+            # §l 加粗 "[头衔]玩家名" 部分，头衔按稀有度上色，§r 重置后时间为细体
+            rarity_color = self.title_system.get_title_rarity_color(equipped) if equipped else "§f"
+            if equipped:
+                line1 = f"§l{rarity_color}[{equipped}]{player_prefix}{name}§r({time_str})："
+            else:
+                line1 = f"§l{player_prefix}{name}§r({time_str})："
+            formatted = line1 + "\n" + raw_message
+            event.is_cancelled = True
+            self.server.broadcast_message(formatted)
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[ARC Core]Chat title format error: {e}")
+
     @event_handler
     def on_player_quit(self, event: PlayerQuitEvent):
         self.server.broadcast_message(self.language_manager.GetText('PLAYER_QUIT_MESSAGE').format(event.player.name))
@@ -466,6 +557,12 @@ class ARCCorePlugin(Plugin):
 
     @event_handler
     def on_block_break(self, event: BlockBreakEvent):
+        block_loc = event.block.location
+        target_desc = getattr(event.block, 'identifier', getattr(event.block, 'type', 'block'))
+        self._send_op_debug_message(
+            event.player, 'BlockBreak', str(target_desc),
+            block_loc.dimension.name, block_loc.x, block_loc.y, block_loc.z
+        )
         if event.player.is_op:
             return
 
@@ -476,16 +573,37 @@ class ARCCorePlugin(Plugin):
         if not self.land_operation_check(event.player, event.block.location.dimension.name,
                                     (event.block.location.x, event.block.location.y, event.block.location.z)):
             event.is_cancelled = True
+        if not event.is_cancelled and self._is_frame_block(event.block):
+            land_id = self.get_land_at_pos(
+                event.block.location.dimension.name,
+                int(event.block.location.x), int(event.block.location.z),
+                int(event.block.location.y)
+            )
+            if land_id is not None:
+                land_info = self.get_land_info(land_id)
+                if land_info and not land_info.get('allow_frame', False):
+                    event.is_cancelled = True
+                    event.player.send_message(self.language_manager.GetText('LAND_FRAME_PROTECT_HINT'))
         if not self.spawn_protect_check(event.player, event.block.location.dimension.name,
                                     (event.block.location.x, event.block.location.y, event.block.location.z)):
             event.is_cancelled = True
         return
 
+    def _is_frame_block(self, block) -> bool:
+        """是否为展示框或发光展示框（minecraft:frame / minecraft:glow_frame）"""
+        bid = (getattr(block, 'identifier', None) or getattr(block, 'type', None) or '')
+        return str(bid).lower() in ('minecraft:frame', 'minecraft:glow_frame')
+
     @event_handler
     def on_block_place(self, event: BlockPlaceEvent):
+        block_loc = event.block.location
+        target_desc = getattr(event.block, 'identifier', getattr(event.block, 'type', 'block'))
+        self._send_op_debug_message(
+            event.player, 'BlockPlace', str(target_desc),
+            block_loc.dimension.name, block_loc.x, block_loc.y, block_loc.z
+        )
         if event.player.is_op:
             return
-        print(event.player.name, event.block.location.x, event.block.location.y, event.block.location.z, event.block.dimension.name)
         if not self.land_operation_check(event.player, event.block.location.dimension.name,
                                     (event.block.location.x, event.block.location.y, event.block.location.z)):
             event.is_cancelled = True
@@ -516,6 +634,14 @@ class ARCCorePlugin(Plugin):
             # 玩家或OP判定
             if not hasattr(event, 'player') or event.player is None:
                 return
+            # 调试模式：有方块时发送方块交互信息
+            if getattr(event, 'has_block', False):
+                block = getattr(event, 'block', None)
+                if block is not None and hasattr(block, 'location') and block.location is not None:
+                    bl = block.location
+                    target_desc = getattr(block, 'identifier', getattr(block, 'type', 'block'))
+                    dim_name = bl.dimension.name if hasattr(bl, 'dimension') and bl.dimension else getattr(event.player.location.dimension, 'name', '')
+                    self._send_op_debug_message(event.player, 'BlockInteract', str(target_desc), dim_name, bl.x, bl.y, bl.z)
             if getattr(event.player, 'is_op', False):
                 return
 
@@ -553,6 +679,13 @@ class ARCCorePlugin(Plugin):
             # 检查是否在领地内且不是领地主人
             if not self.land_interact_check(event.player, dimension, pos):
                 event.is_cancelled = True
+            elif self._is_frame_block(block):
+                land_id = self.get_land_at_pos(dimension, int(block_location.x), int(block_location.z), int(block_location.y))
+                if land_id is not None:
+                    land_info = self.get_land_info(land_id)
+                    if land_info and not land_info.get('allow_frame', False):
+                        event.is_cancelled = True
+                        event.player.send_message(self.language_manager.GetText('LAND_FRAME_PROTECT_HINT'))
         except Exception as e:
             pass
             # self.logger.error(f"[ARC Core] on_player_interact error: {str(e)}")
@@ -596,10 +729,16 @@ class ARCCorePlugin(Plugin):
     @event_handler
     def on_player_interact_actor(self, event: PlayerInteractActorEvent):
         """处理玩家与生物交互事件，保护领地内生物免受非法交互"""
+        actor_location = event.actor.location
+        target_desc = getattr(event.actor, 'identifier', getattr(event.actor, 'type', 'actor'))
+        self._send_op_debug_message(
+            event.player, 'ActorInteract', str(target_desc),
+            actor_location.dimension.name, actor_location.x, actor_location.y, actor_location.z
+        )
         # OP玩家跳过检查
         if event.player.is_op:
             return
-        
+
         # 获取生物位置
         actor_location = event.actor.location
         dimension = actor_location.dimension.name
@@ -631,6 +770,12 @@ class ARCCorePlugin(Plugin):
         if attacker is None or attacker.type != "minecraft:player":
             return
 
+        actor_location = event.actor.location
+        target_desc = getattr(event.actor, 'identifier', getattr(event.actor, 'type', 'actor'))
+        self._send_op_debug_message(
+            attacker, 'ActorDamage', str(target_desc),
+            actor_location.dimension.name, actor_location.x, actor_location.y, actor_location.z
+        )
         # 如果玩家是op则不判断
         if attacker.is_op:
             return
@@ -913,6 +1058,7 @@ class ARCCorePlugin(Plugin):
         self.land_system.init_land_tables()
         self.land_system.init_sub_land_table()
         self.teleport_system.init_teleport_tables()
+        self.title_system.ensure_tables()
 
     # Player basic info
     def _column_exists(self, table: str, column: str) -> bool:
@@ -1383,6 +1529,7 @@ class ARCCorePlugin(Plugin):
             arc_menu = ActionForm(
                 title=self.language_manager.GetText('MAIN_MENU_TITLE'),
             )
+            arc_menu.add_button(self.language_manager.GetText('NEWBIE_GUIDE_BUTTON'), on_click=self.show_newbie_welcome_panel)
             arc_menu.add_button(self.language_manager.GetText('BANK_MENU_NAME'), on_click=self.show_bank_main_menu)
             arc_menu.add_button(self.language_manager.GetText('TELEPORT_MENU_NAME'), on_click=self.show_teleport_menu)
             arc_menu.add_button(self.language_manager.GetText('LAND_MENU_NAME'), on_click=self.show_land_main_menu)
@@ -1403,6 +1550,26 @@ class ARCCorePlugin(Plugin):
     
     def execute_suicide(self, player: Player):
         player.perform_command('suicide')
+
+    def show_newbie_welcome_panel(self, player: Player):
+        """显示新手引导面板，内容来自 newbie_welcome.txt"""
+        try:
+            if self.newbie_welcome_file.exists():
+                welcome_content = self.newbie_welcome_file.read_text(encoding='utf-8')
+            else:
+                welcome_content = self.language_manager.GetText('NEWBIE_GUIDE_PANEL_TITLE') + "\n\n（引导文件暂未配置）"
+        except Exception:
+            welcome_content = self.language_manager.GetText('NEWBIE_GUIDE_PANEL_TITLE') + "\n\n（读取引导内容失败）"
+        newbie_form = ActionForm(
+            title=self.language_manager.GetText('NEWBIE_GUIDE_PANEL_TITLE'),
+            content=welcome_content,
+            on_close=self.show_main_menu
+        )
+        newbie_form.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=self.show_main_menu
+        )
+        player.send_form(newbie_form)
 
     # Player info & invite system UI
     def show_my_info_panel(self, player: Player):
@@ -1465,6 +1632,12 @@ class ARCCorePlugin(Plugin):
                 on_click=self.claim_invite_rewards
             )
 
+        # 头衔管理
+        my_info_panel.add_button(
+            self.language_manager.GetText('TITLE_MANAGE_BUTTON'),
+            on_click=self.show_title_manage_panel
+        )
+
         # 返回主菜单
         my_info_panel.add_button(
             self.language_manager.GetText('RETURN_BUTTON_TEXT'),
@@ -1472,6 +1645,84 @@ class ARCCorePlugin(Plugin):
         )
 
         player.send_form(my_info_panel)
+
+    def show_title_manage_panel(self, player: Player):
+        """头衔管理：选择佩戴的头衔或取消佩戴"""
+        unlocked = self.title_system.get_unlocked_titles(player)
+        equipped = self.title_system.get_equipped_title(player)
+        equipped_display = equipped if equipped else self.language_manager.GetText('TITLE_NONE')
+        content = self.language_manager.GetText('TITLE_MANAGE_CONTENT').format(equipped_display)
+        panel = ActionForm(
+            title=self.language_manager.GetText('TITLE_MANAGE_TITLE'),
+            content=content,
+            on_close=self.show_my_info_panel
+        )
+        panel.add_button(self.language_manager.GetText('TITLE_UNEQUIP_BUTTON'), on_click=lambda p: self._title_set_equipped_and_back(p, None))
+        for t in unlocked:
+            label = self._format_title_button_label(t, t == equipped)
+            panel.add_button(label, on_click=lambda pl, title=t: self._title_set_equipped_and_back(pl, title))
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_my_info_panel)
+        player.send_form(panel)
+
+    def _format_title_button_label(self, title_name: str, is_equipped: bool) -> str:
+        """头衔按钮两行显示：第一行名称（按稀有度颜色+加粗），第二行介绍（若有）。"""
+        color = self.title_system.get_title_rarity_color(title_name)
+        defn = self.title_system.get_title_definition(title_name)
+        desc = (defn.get("description") or "").strip() if defn else ""
+        prefix = ("§a" + self.language_manager.GetText('TITLE_EQUIPPED_CURRENT').format("") + "§r ") if is_equipped else ""
+        line1 = prefix + "§l" + color + title_name + "§r"
+        if desc:
+            return line1 + "\n§r§f" + desc
+        return line1
+
+    def _update_player_name_tag(self, player: Player) -> None:
+        """将玩家 name_tag 设为 [头衔]名字 或 名字（未佩戴时）。进服与头衔变动时调用。"""
+        try:
+            equipped = self.title_system.get_equipped_title(player)
+            name = player.name or ""
+            if equipped and name:
+                player.name_tag = f"[{equipped}]{name}"
+            else:
+                player.name_tag = name
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[ARC Core]Update player name_tag error: {str(e)}")
+
+    def _title_set_equipped_and_back(self, player: Player, title: Optional[str]):
+        if title is None:
+            self.title_system.set_equipped_title(player, None)
+        else:
+            self.title_system.set_equipped_title(player, title)
+        self._update_player_name_tag(player)
+        self.show_title_manage_panel(player)
+
+    def api_unlock_title(self, player: Player, title: str) -> bool:
+        """供其他插件调用的接口：为玩家解锁头衔，并发放解锁奖励（若在线）。"""
+        ok = self.title_system.unlock_title(player, title)
+        if ok:
+            self._grant_title_unlock_reward(player, title)
+        return ok
+
+    def _grant_title_unlock_reward(self, player: Player, title: str) -> None:
+        """若头衔定义中有解锁奖励，则给该玩家发放金钱与物品（仅当玩家在线时）。"""
+        defn = self.title_system.get_title_definition(title)
+        if not defn:
+            return
+        money = defn.get("reward_money") or 0
+        if money > 0:
+            try:
+                self.increase_player_money(player, money)
+            except Exception:
+                pass
+        items = defn.get("reward_items") or []
+        for it in items:
+            item_name = it.get("item_name") or it.get("id") or ""
+            count = int(it.get("count", 1))
+            if item_name and count > 0:
+                try:
+                    self.server.dispatch_command(self.server.command_sender, f"give {player.name} {item_name} {count}")
+                except Exception:
+                    pass
 
     def show_fill_inviter_panel(self, player: Player, hint_message: Optional[str] = None):
         """显示填写邀请人面板"""
@@ -1609,29 +1860,53 @@ class ARCCorePlugin(Plugin):
         self.player_authentication_state[player.name] = True
         self.show_main_menu(player) # 登录成功后自动弹出主菜单
 
+    def _on_login_form_closed(self, player: Player, is_register: bool):
+        """登录/注册表单被关闭时的回调；若未登录且开启强制登录则再次执行 /arc 逻辑强制打开菜单"""
+        if self.if_player_logined(player):
+            return
+        if self.force_login:
+            self.show_main_menu(player)
+        else:
+            if is_register:
+                self.show_register_panel(player)
+            else:
+                self.show_login_panel(player)
+
     def show_register_panel(self, player: Player, hint_message=None):
         password_input = TextInput(
             label=self.language_manager.GetText('REGISTER_PANEL_PASSWORD_INPUT_LABEL'),
             placeholder=self.language_manager.GetText('REGISTER_PANEL_PASSWORD_INPUT_PLACEHOLDER')
         )
+        confirm_password_input = TextInput(
+            label=self.language_manager.GetText('REGISTER_PANEL_CONFIRM_PASSWORD_LABEL'),
+            placeholder=self.language_manager.GetText('REGISTER_PANEL_CONFIRM_PASSWORD_PLACEHOLDER')
+        )
         panel_title = self.language_manager.GetText('REGISTER_PANEL_TITLE') if hint_message is None else hint_message
 
         def try_register(player: Player, json_str: str):
             data = json.loads(json_str)
-            if len(data) == 0:
+            if len(data) < 2:
                 self.show_register_panel(player, self.language_manager.GetText('REGISTER_FAIL_PASSWORD_NOT_INPUT'))
+                return
+            password = data[0]
+            confirm_password = data[1]
+            if not password:
+                self.show_register_panel(player, self.language_manager.GetText('REGISTER_FAIL_PASSWORD_NOT_INPUT'))
+                return
+            if password != confirm_password:
+                self.show_register_panel(player, self.language_manager.GetText('REGISTER_FAIL_PASSWORD_MISMATCH'))
+                return
+            r = self.set_player_password(player, password)
+            if r:
+                player.send_message(self.language_manager.GetText('REGISTER_SUCCESS'))
+                self.login_successfully(player)
             else:
-                r = self.set_player_password(player, data[0])
-                if r:
-                    player.send_message(self.language_manager.GetText('REGISTER_SUCCESS'))
-                    self.login_successfully(player)
-                else:
-                    player.send_message(self.language_manager.GetText('REGISTER_FAIL'))
+                player.send_message(self.language_manager.GetText('REGISTER_FAIL'))
 
         register_panel = ModalForm(
             title=panel_title,
-            controls=[password_input],
-            on_close=self.show_register_panel,
+            controls=[password_input, confirm_password_input],
+            on_close=lambda p: self._on_login_form_closed(p, True),
             on_submit=try_register
         )
         player.send_form(register_panel)
@@ -1660,7 +1935,7 @@ class ARCCorePlugin(Plugin):
         login_panel = ModalForm(
             title=panel_title,
             controls=[password_input],
-            on_close=self.show_login_panel,
+            on_close=lambda p: self._on_login_form_closed(p, False),
             on_submit=try_login
         )
         player.send_form(login_panel)
@@ -3092,6 +3367,9 @@ class ARCCorePlugin(Plugin):
         land_detail_panel.add_button(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.show_land_actor_damage_setting_panel(p, l_id)
                                      )
+        land_detail_panel.add_button(self.language_manager.GetText('LAND_FRAME_SETTING_BUTTON_TEXT'),
+                                     on_click=lambda p=player, l_id=land_id: self.show_land_frame_setting_panel(p, l_id)
+                                     )
         land_detail_panel.add_button(self.language_manager.GetText('LAND_PUBLIC_INTERACT_SETTING_BUTTON_TEXT'),
                                      on_click=lambda p=player, l_id=land_id: self.show_land_public_interact_setting_panel(p, l_id)
                                      )
@@ -3599,6 +3877,42 @@ class ARCCorePlugin(Plugin):
         except Exception as e:
             self.logger.error(f"Toggle land actor damage setting error: {str(e)}")
             player.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_FAILED'))
+        land_info = self.get_land_info(land_id)
+        if land_info:
+            self.show_own_land_detail_panel(player, land_id, land_info)
+
+    def show_land_frame_setting_panel(self, player: Player, land_id: int):
+        """领地展示框权限设置：为 False 时禁止对展示框/发光展示框进行互动与破坏。"""
+        land_info = self.get_land_info(land_id)
+        if not land_info:
+            self.show_own_land_menu(player)
+            return
+        current_allow_frame = land_info.get('allow_frame', False)
+        status_text = self.language_manager.GetText('LAND_FRAME_STATUS_ENABLED') if current_allow_frame else self.language_manager.GetText('LAND_FRAME_STATUS_DISABLED')
+        panel = ActionForm(
+            title=self.language_manager.GetText('LAND_FRAME_SETTING_TITLE'),
+            content=self.language_manager.GetText('LAND_FRAME_CURRENT_STATUS').format(status_text),
+            on_close=lambda p=player, l_id=land_id, linfo=self.get_land_info(land_id): self.show_own_land_detail_panel(p, l_id, linfo)
+        )
+        panel.add_button(self.language_manager.GetText('LAND_FRAME_TOGGLE_ENABLE_BUTTON'),
+                         on_click=lambda p=player, l_id=land_id: self.toggle_land_frame_setting(p, l_id, True))
+        panel.add_button(self.language_manager.GetText('LAND_FRAME_TOGGLE_DISABLE_BUTTON'),
+                         on_click=lambda p=player, l_id=land_id: self.toggle_land_frame_setting(p, l_id, False))
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+                         on_click=lambda p=player, l_id=land_id, linfo=self.get_land_info(land_id): self.show_own_land_detail_panel(p, l_id, linfo))
+        player.send_form(panel)
+
+    def toggle_land_frame_setting(self, player: Player, land_id: int, allow_frame: bool):
+        try:
+            success = self.land_system.set_land_allow_frame(land_id, allow_frame)
+            if success:
+                key = 'LAND_FRAME_SETTING_UPDATED_ENABLE' if allow_frame else 'LAND_FRAME_SETTING_UPDATED_DISABLE'
+                player.send_message(self.language_manager.GetText(key).format(land_id))
+            else:
+                player.send_message(self.language_manager.GetText('LAND_FRAME_SETTING_FAILED'))
+        except Exception as e:
+            self.logger.error(f"Toggle land frame setting error: {str(e)}")
+            player.send_message(self.language_manager.GetText('LAND_FRAME_SETTING_FAILED'))
         land_info = self.get_land_info(land_id)
         if land_info:
             self.show_own_land_detail_panel(player, land_id, land_info)
@@ -4268,18 +4582,281 @@ class ARCCorePlugin(Plugin):
                                  on_click=self.show_op_rebuild_chunk_mapping_confirm)
         op_main_panel.add_button(self.language_manager.GetText('INVITE_REWARD_CONFIG_BUTTON'),
                                  on_click=self.show_invite_reward_config_panel)
+        op_main_panel.add_button(self.language_manager.GetText('OP_TITLE_MANAGE_BUTTON'),
+                                 on_click=self.show_op_title_manage_panel)
         op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_RELOAD_CONFIG_BUTTON'),
                                  on_click=self.op_reload_config)
         op_main_panel.add_button(self.language_manager.GetText('RECORD_COOR_1'),
                                  on_click=self.record_coordinate_1)
         op_main_panel.add_button(self.language_manager.GetText('RECORD_COOR_2'),
                                  on_click=self.record_coordinate_2)
+        debug_btn_text = self.language_manager.GetText('OP_DEBUG_MODE_BUTTON_ON') if player.name in self.op_debug_mode else self.language_manager.GetText('OP_DEBUG_MODE_BUTTON_OFF')
+        op_main_panel.add_button(debug_btn_text, on_click=self.toggle_op_debug_mode)
         op_main_panel.add_button(self.language_manager.GetText('RUN_COMMAND'),
                                  on_click=self.run_command_as_self)
         # 返回
         op_main_panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
                                   on_click=self.show_main_menu)
         player.send_form(op_main_panel)
+
+    def show_op_title_manage_panel(self, player: Player):
+        """OP 头衔管理子菜单：头衔属性管理、创建新头衔、给全体添加、给单独玩家添加。"""
+        panel = ActionForm(
+            title=self.language_manager.GetText('OP_TITLE_MANAGE_TITLE'),
+            content=self.language_manager.GetText('OP_TITLE_MANAGE_CONTENT'),
+            on_close=self.show_op_main_panel
+        )
+        panel.add_button(self.language_manager.GetText('OP_TITLE_ATTR_MANAGE_BUTTON'),
+                         on_click=self.show_op_title_attr_list_panel)
+        panel.add_button(self.language_manager.GetText('OP_TITLE_CREATE_BUTTON'),
+                         on_click=self.show_op_title_create_panel)
+        panel.add_button(self.language_manager.GetText('OP_TITLE_GRANT_TO_ALL_BUTTON'),
+                         on_click=self.show_op_grant_title_to_all_panel)
+        panel.add_button(self.language_manager.GetText('OP_TITLE_GRANT_TO_SINGLE_BUTTON'),
+                         on_click=self.show_op_grant_title_to_single_player_input)
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+                         on_click=self.show_op_main_panel)
+        player.send_form(panel)
+
+    def show_op_title_attr_list_panel(self, player: Player):
+        """OP 头衔属性管理：列出所有头衔，点击编辑。"""
+        titles = self.title_system.get_all_title_names()
+        if not titles:
+            player.send_message(self.language_manager.GetText('OP_TITLE_NO_TITLES'))
+            self.show_op_title_manage_panel(player)
+            return
+        panel = ActionForm(
+            title=self.language_manager.GetText('OP_TITLE_ATTR_MANAGE_TITLE'),
+            content=self.language_manager.GetText('OP_TITLE_ATTR_MANAGE_CONTENT'),
+            on_close=self.show_op_title_manage_panel
+        )
+        for t in titles:
+            defn = self.title_system.get_title_definition(t)
+            rarity = (defn.get('rarity') or '普通') if defn else '普通'
+            panel.add_button(f"{t} ({rarity})", on_click=lambda p, title=t: self.show_op_title_edit_panel(p, title))
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_title_manage_panel)
+        player.send_form(panel)
+
+    def show_op_title_edit_panel(self, player: Player, title_name: str):
+        """OP 编辑头衔属性：稀有度、介绍、解锁奖励。"""
+        defn = self.title_system.get_title_definition(title_name)
+        if not defn:
+            defn = {"rarity": "普通", "description": "", "reward_money": 0.0, "reward_items": []}
+        reward_items_str = "; ".join(f"{x.get('item_name', x.get('id', ''))} {x.get('count', 0)}" for x in (defn.get("reward_items") or []))
+        rarity_input = TextInput(
+            label=self.language_manager.GetText('OP_TITLE_ATTR_RARITY_LABEL'),
+            placeholder="普通/稀有/史诗/传奇/神话",
+            default_value=defn.get("rarity", "普通")
+        )
+        desc_input = TextInput(
+            label=self.language_manager.GetText('OP_TITLE_ATTR_DESC_LABEL'),
+            placeholder=self.language_manager.GetText('OP_TITLE_ATTR_DESC_PLACEHOLDER'),
+            default_value=defn.get("description", "")
+        )
+        money_input = TextInput(
+            label=self.language_manager.GetText('OP_TITLE_ATTR_REWARD_MONEY_LABEL'),
+            placeholder="0",
+            default_value=str(defn.get("reward_money", 0))
+        )
+        items_input = TextInput(
+            label=self.language_manager.GetText('OP_TITLE_ATTR_REWARD_ITEMS_LABEL'),
+            placeholder="minecraft:diamond 2; minecraft:emerald 1",
+            default_value=reward_items_str
+        )
+        form = ModalForm(
+            title=self.language_manager.GetText('OP_TITLE_ATTR_EDIT_TITLE').format(title_name),
+            controls=[rarity_input, desc_input, money_input, items_input],
+            on_close=self.show_op_title_attr_list_panel,
+            on_submit=lambda p, json_str: self._do_op_title_save_attr(p, json_str, title_name)
+        )
+        player.send_form(form)
+
+    def _parse_reward_items(self, text: str) -> list:
+        """解析 '物品ID 数量; 物品ID 数量' 为 [{"item_name": id, "count": n}, ...]"""
+        result = []
+        for part in (text or "").split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            tokens = part.split()
+            if len(tokens) >= 2:
+                try:
+                    result.append({"item_name": tokens[0], "count": int(tokens[1])})
+                except ValueError:
+                    pass
+            elif len(tokens) == 1:
+                result.append({"item_name": tokens[0], "count": 1})
+        return result
+
+    def _do_op_title_save_attr(self, player: Player, json_str: str, title_name: str):
+        try:
+            data = json.loads(json_str)
+            if len(data) < 4:
+                self.show_op_title_attr_list_panel(player)
+                return
+            rarity = str(data[0]).strip() if data[0] else "普通"
+            if rarity not in ("普通", "稀有", "史诗", "传奇", "神话"):
+                rarity = "普通"
+            description = str(data[1]).strip() if data[1] else ""
+            try:
+                reward_money = float(data[2]) if data[2] is not None and str(data[2]).strip() else 0.0
+            except (ValueError, TypeError):
+                reward_money = 0.0
+            reward_items = self._parse_reward_items(str(data[3]) if data[3] else "")
+            self.title_system.set_title_definition(title_name, rarity, description, reward_money, reward_items)
+            player.send_message(self.language_manager.GetText('OP_TITLE_ATTR_SAVED'))
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[ARC Core]Save title attr error: {e}")
+        self.show_op_title_attr_list_panel(player)
+
+    def show_op_title_create_panel(self, player: Player):
+        """OP 创建新头衔：名称、稀有度、介绍、解锁奖励。"""
+        name_input = TextInput(
+            label=self.language_manager.GetText('OP_TITLE_CREATE_NAME_LABEL'),
+            placeholder=self.language_manager.GetText('OP_TITLE_CREATE_NAME_PLACEHOLDER')
+        )
+        rarity_input = TextInput(
+            label=self.language_manager.GetText('OP_TITLE_ATTR_RARITY_LABEL'),
+            placeholder="普通/稀有/史诗/传奇/神话",
+            default_value="普通"
+        )
+        desc_input = TextInput(
+            label=self.language_manager.GetText('OP_TITLE_ATTR_DESC_LABEL'),
+            placeholder=self.language_manager.GetText('OP_TITLE_ATTR_DESC_PLACEHOLDER')
+        )
+        money_input = TextInput(label=self.language_manager.GetText('OP_TITLE_ATTR_REWARD_MONEY_LABEL'), placeholder="0")
+        items_input = TextInput(
+            label=self.language_manager.GetText('OP_TITLE_ATTR_REWARD_ITEMS_LABEL'),
+            placeholder="minecraft:diamond 2; minecraft:emerald 1"
+        )
+        form = ModalForm(
+            title=self.language_manager.GetText('OP_TITLE_CREATE_TITLE'),
+            controls=[name_input, rarity_input, desc_input, money_input, items_input],
+            on_close=self.show_op_title_manage_panel,
+            on_submit=lambda p, json_str: self._do_op_title_create(p, json_str)
+        )
+        player.send_form(form)
+
+    def _do_op_title_create(self, player: Player, json_str: str):
+        try:
+            data = json.loads(json_str)
+            if not data or not str(data[0]).strip():
+                player.send_message(self.language_manager.GetText('OP_TITLE_CREATE_FAIL_EMPTY'))
+                self.show_op_title_manage_panel(player)
+                return
+            title_name = str(data[0]).strip()
+            rarity = str(data[1]).strip() if len(data) > 1 and data[1] else "普通"
+            if rarity not in ("普通", "稀有", "史诗", "传奇", "神话"):
+                rarity = "普通"
+            description = str(data[2]).strip() if len(data) > 2 and data[2] else ""
+            try:
+                reward_money = float(data[3]) if len(data) > 3 and data[3] is not None and str(data[3]).strip() else 0.0
+            except (ValueError, TypeError):
+                reward_money = 0.0
+            reward_items = self._parse_reward_items(str(data[4]) if len(data) > 4 and data[4] else "")
+            self.title_system.set_title_definition(title_name, rarity, description, reward_money, reward_items)
+            player.send_message(self.language_manager.GetText('OP_TITLE_CREATE_SUCCESS').format(title_name))
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[ARC Core]Create title error: {e}")
+            player.send_message(self.language_manager.GetText('OP_TITLE_CREATE_FAIL'))
+        self.show_op_title_manage_panel(player)
+
+    def show_op_grant_title_to_all_panel(self, player: Player):
+        """OP 给所有玩家添加头衔：选择已有头衔（按钮列表）。"""
+        titles = self.title_system.get_all_title_names()
+        if not titles:
+            player.send_message(self.language_manager.GetText('OP_TITLE_NO_TITLES'))
+            self.show_op_title_manage_panel(player)
+            return
+        panel = ActionForm(
+            title=self.language_manager.GetText('OP_TITLE_GRANT_TO_ALL_TITLE'),
+            content=self.language_manager.GetText('OP_TITLE_GRANT_TO_ALL_SELECT_HINT'),
+            on_close=self.show_op_title_manage_panel
+        )
+        for t in titles:
+            panel.add_button(t, on_click=lambda p, title=t: self._do_op_grant_title_to_all(p, title))
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_title_manage_panel)
+        player.send_form(panel)
+
+    def _do_op_grant_title_to_all(self, player: Player, title: str):
+        """为当前数据库内所有玩家添加指定头衔（新人不会自动获得，需再次添加）。"""
+        try:
+            rows = self.database_manager.query_all("SELECT xuid FROM player_basic_info", ())
+            count = 0
+            for row in rows:
+                xuid = row.get('xuid')
+                if xuid and self.title_system.unlock_title_by_xuid(xuid, title):
+                    count += 1
+            player.send_message(self.language_manager.GetText('OP_TITLE_GRANT_TO_ALL_SUCCESS').format(count, title))
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[ARC Core]Grant title to all error: {e}")
+            player.send_message(self.language_manager.GetText('OP_TITLE_GRANT_TO_ALL_FAIL'))
+        self.show_op_title_manage_panel(player)
+
+    def show_op_grant_title_to_single_player_input(self, player: Player):
+        """OP 给单独玩家添加头衔：先输入玩家名。"""
+        player_input = TextInput(
+            label=self.language_manager.GetText('OP_TITLE_GRANT_TO_SINGLE_PLAYER_LABEL'),
+            placeholder=self.language_manager.GetText('OP_TITLE_GRANT_TO_SINGLE_PLAYER_PLACEHOLDER')
+        )
+        form = ModalForm(
+            title=self.language_manager.GetText('OP_TITLE_GRANT_TO_SINGLE_TITLE'),
+            controls=[player_input],
+            on_close=self.show_op_title_manage_panel,
+            on_submit=lambda p, json_str: self._op_grant_single_on_player_entered(p, json_str)
+        )
+        player.send_form(form)
+
+    def _op_grant_single_on_player_entered(self, player: Player, json_str: str):
+        try:
+            data = json.loads(json_str)
+            if not data or not str(data[0]).strip():
+                player.send_message(self.language_manager.GetText('OP_TITLE_GRANT_TO_SINGLE_FAIL_EMPTY'))
+                self.show_op_title_manage_panel(player)
+                return
+            target_name = str(data[0]).strip()
+            xuid = self.get_player_xuid_by_name(target_name)
+            if not xuid:
+                player.send_message(self.language_manager.GetText('OP_TITLE_GRANT_TO_SINGLE_FAIL_NOT_FOUND').format(target_name))
+                self.show_op_title_manage_panel(player)
+                return
+            self.show_op_grant_title_to_single_select_title(player, target_name, xuid)
+        except Exception:
+            self.show_op_title_manage_panel(player)
+
+    def show_op_grant_title_to_single_select_title(self, player: Player, target_name: str, target_xuid: str):
+        """选择要授予的头衔（按钮列表）。"""
+        titles = self.title_system.get_all_title_names()
+        if not titles:
+            player.send_message(self.language_manager.GetText('OP_TITLE_NO_TITLES'))
+            self.show_op_title_manage_panel(player)
+            return
+        panel = ActionForm(
+            title=self.language_manager.GetText('OP_TITLE_GRANT_TO_SINGLE_TITLE'),
+            content=self.language_manager.GetText('OP_TITLE_GRANT_TO_SINGLE_SELECT_HINT').format(target_name),
+            on_close=self.show_op_title_manage_panel
+        )
+        for t in titles:
+            panel.add_button(t, on_click=lambda p, title=t, name=target_name, xuid=target_xuid: self._do_op_grant_title_to_single(p, name, xuid, title))
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_title_manage_panel)
+        player.send_form(panel)
+
+    def _do_op_grant_title_to_single(self, player: Player, target_name: str, target_xuid: str, title: str):
+        if self.title_system.unlock_title_by_xuid(target_xuid, title):
+            target_online = None
+            for p in (self.server.online_players or []):
+                if str(p.xuid) == target_xuid:
+                    target_online = p
+                    break
+            if target_online:
+                self._grant_title_unlock_reward(target_online, title)
+            player.send_message(self.language_manager.GetText('OP_TITLE_GRANT_TO_SINGLE_SUCCESS').format(target_name, title))
+        else:
+            player.send_message(self.language_manager.GetText('OP_TITLE_GRANT_TO_SINGLE_FAIL'))
+        self.show_op_title_manage_panel(player)
 
     def show_op_land_at_pos(self, player: Player):
         """OP 直接获取脚下领地（含公共领地）并进入管理面板"""
@@ -4462,6 +5039,14 @@ class ARCCorePlugin(Plugin):
                     self.hide_op_in_money_ranking = str(self.hide_op_in_money_ranking).lower() in ['true', '1', 'yes']
                 except (ValueError, AttributeError):
                     self.hide_op_in_money_ranking = True
+            self.force_login = self.setting_manager.GetSetting('FORCE_LOGIN')
+            if self.force_login is None:
+                self.force_login = False
+            else:
+                try:
+                    self.force_login = str(self.force_login).lower() in ['true', '1', 'yes']
+                except (ValueError, AttributeError):
+                    self.force_login = False
             self._init_cleaner_system()
         except Exception as e:
             self.logger.error(f"[ARC Core]Reapply cached settings error: {str(e)}")
@@ -4553,6 +5138,31 @@ class ARCCorePlugin(Plugin):
 
     def delay_drop_item(self):
         self.execute_cleaner()
+
+    def _send_op_debug_message(self, player: Optional[Player], event_type: str, target_desc: str, dimension: str, x: float, y: float, z: float):
+        """若该玩家开启了 OP 调试模式，则发送一条调试聊天消息"""
+        if player is None or player.name not in self.op_debug_mode:
+            return
+        try:
+            msg = self.language_manager.GetText('OP_DEBUG_MSG').format(
+                event_type, target_desc, dimension,
+                int(x) if x == math.floor(x) else x,
+                int(y) if y == math.floor(y) else y,
+                int(z) if z == math.floor(z) else z
+            )
+            player.send_message(msg)
+        except Exception:
+            pass
+
+    def toggle_op_debug_mode(self, player: Player):
+        """切换 OP 调试模式：开启后会在方块破坏/放置、方块交互、生物攻击、生物交互时向该玩家发送调试消息"""
+        if player.name in self.op_debug_mode:
+            self.op_debug_mode.discard(player.name)
+            player.send_message(self.language_manager.GetText('OP_DEBUG_MODE_TOGGLED_OFF'))
+        else:
+            self.op_debug_mode.add(player.name)
+            player.send_message(self.language_manager.GetText('OP_DEBUG_MODE_TOGGLED_ON'))
+        self.show_op_main_panel(player)
 
     def record_coordinate_1(self, player: Player):
         if not player.name in self.op_coordinate1_dict:
@@ -5044,6 +5654,7 @@ class ARCCorePlugin(Plugin):
         status_lines.append('开放方块互动: ' + (self.language_manager.GetText('LAND_PUBLIC_INTERACT_STATUS_ENABLED') if land_info.get('allow_public_interact') else self.language_manager.GetText('LAND_PUBLIC_INTERACT_STATUS_DISABLED')))
         status_lines.append('开放爆炸: ' + (self.language_manager.GetText('LAND_EXPLOSION_STATUS_ENABLED') if land_info.get('allow_explosion') else self.language_manager.GetText('LAND_EXPLOSION_STATUS_DISABLED')))
         status_lines.append('开放生物互动: ' + (self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_ENABLED') if land_info.get('allow_actor_interaction') else self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_DISABLED')))
+        status_lines.append('展示框: ' + (self.language_manager.GetText('LAND_FRAME_STATUS_ENABLED') if land_info.get('allow_frame') else self.language_manager.GetText('LAND_FRAME_STATUS_DISABLED')))
         status_lines.append('开放生物伤害: ' + (self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_ENABLED') if land_info.get('allow_actor_damage') else self.language_manager.GetText('LAND_ACTOR_DAMAGE_STATUS_DISABLED')))
         anpl_enabled = self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_STATUS_ENABLED') if land_info.get('allow_non_public_land') else self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_STATUS_DISABLED')
         status_lines.append(self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_CURRENT_STATUS').format(anpl_enabled))
@@ -5064,6 +5675,10 @@ class ARCCorePlugin(Plugin):
         settings_panel.add_button(
             self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_BUTTON_TEXT'),
             on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_toggle_panel(p, l_id, 'allow_actor_interaction', pg)
+        )
+        settings_panel.add_button(
+            self.language_manager.GetText('LAND_FRAME_SETTING_BUTTON_TEXT'),
+            on_click=lambda p=player, l_id=land_id, pg=from_page: self.show_op_public_land_toggle_panel(p, l_id, 'allow_frame', pg)
         )
         settings_panel.add_button(
             self.language_manager.GetText('LAND_ACTOR_DAMAGE_SETTING_BUTTON_TEXT'),
@@ -5096,6 +5711,9 @@ class ARCCorePlugin(Plugin):
         elif setting_key == 'allow_actor_interaction':
             status_text = self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_ENABLED') if current else self.language_manager.GetText('LAND_ACTOR_INTERACTION_STATUS_DISABLED')
             title = self.language_manager.GetText('LAND_ACTOR_INTERACTION_SETTING_TITLE')
+        elif setting_key == 'allow_frame':
+            status_text = self.language_manager.GetText('LAND_FRAME_STATUS_ENABLED') if current else self.language_manager.GetText('LAND_FRAME_STATUS_DISABLED')
+            title = self.language_manager.GetText('LAND_FRAME_SETTING_TITLE')
         elif setting_key == 'allow_non_public_land':
             status_text = self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_STATUS_ENABLED') if current else self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_STATUS_DISABLED')
             title = self.language_manager.GetText('ALLOW_NON_PUBLIC_LAND_SETTING_BUTTON_TEXT')
@@ -5111,6 +5729,7 @@ class ARCCorePlugin(Plugin):
             'allow_public_interact': ('LAND_PUBLIC_INTERACT_TOGGLE_ENABLE_BUTTON', 'LAND_PUBLIC_INTERACT_TOGGLE_DISABLE_BUTTON'),
             'allow_explosion': ('LAND_EXPLOSION_TOGGLE_ENABLE_BUTTON', 'LAND_EXPLOSION_TOGGLE_DISABLE_BUTTON'),
             'allow_actor_interaction': ('LAND_ACTOR_INTERACTION_TOGGLE_ENABLE_BUTTON', 'LAND_ACTOR_INTERACTION_TOGGLE_DISABLE_BUTTON'),
+            'allow_frame': ('LAND_FRAME_TOGGLE_ENABLE_BUTTON', 'LAND_FRAME_TOGGLE_DISABLE_BUTTON'),
             'allow_actor_damage': ('LAND_ACTOR_DAMAGE_TOGGLE_ENABLE_BUTTON', 'LAND_ACTOR_DAMAGE_TOGGLE_DISABLE_BUTTON'),
             'allow_non_public_land': ('ALLOW_NON_PUBLIC_LAND_TOGGLE_ENABLE_BUTTON', 'ALLOW_NON_PUBLIC_LAND_TOGGLE_DISABLE_BUTTON'),
         }[setting_key]
@@ -5127,6 +5746,7 @@ class ARCCorePlugin(Plugin):
             'allow_public_interact': self.land_system.set_land_allow_public_interact,
             'allow_explosion': self.land_system.set_land_allow_explosion,
             'allow_actor_interaction': self.land_system.set_land_allow_actor_interaction,
+            'allow_frame': self.land_system.set_land_allow_frame,
             'allow_actor_damage': self.land_system.set_land_allow_actor_damage,
             'allow_non_public_land': self.land_system.set_land_allow_non_public_land,
         }
@@ -5134,6 +5754,7 @@ class ARCCorePlugin(Plugin):
             'allow_public_interact': ('LAND_PUBLIC_INTERACT_SETTING_UPDATED_ENABLE', 'LAND_PUBLIC_INTERACT_SETTING_UPDATED_DISABLE', 'LAND_PUBLIC_INTERACT_SETTING_FAILED'),
             'allow_explosion': ('LAND_EXPLOSION_SETTING_UPDATED_ENABLE', 'LAND_EXPLOSION_SETTING_UPDATED_DISABLE', 'LAND_EXPLOSION_SETTING_FAILED'),
             'allow_actor_interaction': ('LAND_ACTOR_INTERACTION_SETTING_UPDATED_ENABLE', 'LAND_ACTOR_INTERACTION_SETTING_UPDATED_DISABLE', 'LAND_ACTOR_INTERACTION_SETTING_FAILED'),
+            'allow_frame': ('LAND_FRAME_SETTING_UPDATED_ENABLE', 'LAND_FRAME_SETTING_UPDATED_DISABLE', 'LAND_FRAME_SETTING_FAILED'),
             'allow_actor_damage': ('LAND_ACTOR_DAMAGE_SETTING_UPDATED_ENABLE', 'LAND_ACTOR_DAMAGE_SETTING_UPDATED_DISABLE', 'LAND_ACTOR_DAMAGE_SETTING_FAILED'),
             'allow_non_public_land': ('ALLOW_NON_PUBLIC_LAND_UPDATED_ENABLE', 'ALLOW_NON_PUBLIC_LAND_UPDATED_DISABLE', 'ALLOW_NON_PUBLIC_LAND_FAILED'),
         }
@@ -5448,20 +6069,22 @@ class ARCCorePlugin(Plugin):
             return ""
 
     def _translate_entity_name(self, entity) -> str:
-        """翻译生物名称"""
+        """翻译生物名称。若名称为 MC 未翻译键（含 ':'，如 entity.ns_ab:vfx_dragon_fire.name），则用 EntityDisplayNameManager 从 entity_display_name.txt 读取。"""
         try:
             if not entity:
                 return ""
-            
-            # 尝试获取实体的名称
-            if hasattr(entity, 'name') and entity.name:
-                return str(entity.name).strip()
-            
-            # 如果没有名称，返回实体类型
-            return str(type(entity).__name__)
-            
+            raw = (
+                getattr(entity, "name_tag", None)
+                or getattr(entity, "type", None)
+                or getattr(entity, "name", None)
+            )
+            raw = str(raw).strip() if raw else str(type(entity).__name__)
+            if ":" in raw:
+                return self.entity_display_name_manager.get_display_name(raw)
+            return raw
         except Exception as e:
-            self.logger.error(f"[ARC Core] 翻译生物名称错误: {str(e)}")
+            if self.logger:
+                self.logger.error(f"[ARC Core] 翻译生物名称错误: {str(e)}")
             return str(entity) if entity else ""
 
     def _translate_dimension_name(self, dimension_name: str) -> str:

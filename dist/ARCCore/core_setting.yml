@@ -1,6 +1,9 @@
 DEFAULT_LANGUAGE_CODE=ZH-CN
 DATABASE_PATH=ARCCore.db
 
+# 强制登录（为 True 时，玩家进入游戏强制打开 /arc 菜单登录或注册；关闭登录/注册界面且未正确输入密码时会再次强制打开）
+FORCE_LOGIN=False
+
 # 玩家经济
 PLAYER_INIT_MONEY_NUM=2000
 HIDE_OP_IN_MONEY_RANKING=True
@@ -46,3 +49,9 @@ INVITE_REWARD_FREE_LAND_BLOCKS=10
 
 # 公共领地内白名单保护生物（逗号分隔，在此列表中的生物在公共领地内不可被伤害）
 PUBLIC_LAND_PROTECTED_ENTITIES=minecraft:villager_v2,minecraft:iron_golem,minecraft:snow_golem
+
+# 头衔系统（聊天前显示佩戴的头衔，如 [管理员]玩家名: 消息）
+# 默认头衔（逗号分隔，所有玩家拥有）
+DEFAULT_TITLE=见习冒险家
+# OP 专属头衔（仅一个，仅 OP 拥有；非 OP 进服时若正佩戴则自动解除）
+OP_TITLE=管理员
