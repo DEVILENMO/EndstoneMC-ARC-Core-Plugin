@@ -1681,7 +1681,8 @@ class ARCCorePlugin(Plugin):
             equipped = self.title_system.get_equipped_title(player)
             name = player.name or ""
             if equipped and name:
-                player.name_tag = f"[{equipped}]{name}"
+                rarity_color = self.title_system.get_title_rarity_color(equipped)
+                player.name_tag = f"{rarity_color}[{equipped}]§r{name}"
             else:
                 player.name_tag = name
         except Exception as e:
