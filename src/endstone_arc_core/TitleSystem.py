@@ -109,6 +109,61 @@ class TitleSystem:
         except Exception:
             return False
 
+    def rename_title(self, old_title: str, new_title: str) -> bool:
+        """重命名头衔：同时更新定义/解锁记录/佩戴记录。"""
+        try:
+            old_title = (old_title or "").strip()
+            new_title = (new_title or "").strip()
+            if not old_title or not new_title:
+                return False
+            if old_title == new_title:
+                return True
+
+            old_defn = self.get_title_definition(old_title)
+            if not old_defn:
+                return False
+
+            # 新名字已存在则不允许（防止覆盖/数据冲突）
+            if self.get_title_definition(new_title):
+                return False
+
+            # 复制旧定义到新定义
+            ok = self.set_title_definition(
+                new_title,
+                old_defn.get("rarity") or DEFAULT_RARITY,
+                old_defn.get("description") or "",
+                float(old_defn.get("reward_money") or 0.0),
+                old_defn.get("reward_items") or [],
+            )
+            if not ok:
+                return False
+
+            # 同步玩家解锁记录
+            self.database_manager.execute(
+                f"UPDATE {self._table_unlock_time} SET title = ? WHERE title = ?",
+                (new_title, old_title),
+            )
+            self.database_manager.execute(
+                f"UPDATE {self._table_extra} SET title = ? WHERE title = ?",
+                (new_title, old_title),
+            )
+
+            # 同步玩家佩戴记录
+            self.database_manager.execute(
+                f"UPDATE {self._table_equipped} SET title = ? WHERE title = ?",
+                (new_title, old_title),
+            )
+
+            # 删除旧定义（玩家记录已迁移到新名字）
+            self.database_manager.execute(
+                f"DELETE FROM {self._table_def} WHERE title = ?",
+                (old_title,),
+            )
+
+            return True
+        except Exception:
+            return False
+
     def get_all_title_names(self) -> List[str]:
         """所有头衔名：配置默认 + OP 头衔 + 数据库中自定义头衔（去重）。"""
         default = self.get_default_titles()

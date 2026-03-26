@@ -4639,38 +4639,120 @@ class ARCCorePlugin(Plugin):
         player.send_form(panel)
 
     def show_op_title_edit_panel(self, player: Player, title_name: str):
+        """OP 头衔管理：编辑属性 / 重命名。"""
+        menu = ActionForm(
+            title=self.language_manager.GetText('OP_TITLE_ATTR_EDIT_TITLE').format(title_name),
+            on_close=self.show_op_title_attr_list_panel,
+        )
+        menu.add_button(
+            self.language_manager.GetText('OP_TITLE_ATTR_EDIT_ATTR_BUTTON'),
+            on_click=lambda p=player, t=title_name: self._show_op_title_attr_edit_modal(p, t)
+        )
+        menu.add_button(
+            self.language_manager.GetText('OP_TITLE_RENAME_BUTTON'),
+            on_click=lambda p=player, t=title_name: self.show_op_title_rename_panel(p, t)
+        )
+        menu.add_button(
+            self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+            on_click=self.show_op_title_attr_list_panel
+        )
+        player.send_form(menu)
+
+    def _show_op_title_attr_edit_modal(self, player: Player, title_name: str):
         """OP 编辑头衔属性：稀有度、介绍、解锁奖励。"""
         defn = self.title_system.get_title_definition(title_name)
         if not defn:
             defn = {"rarity": "普通", "description": "", "reward_money": 0.0, "reward_items": []}
-        reward_items_str = "; ".join(f"{x.get('item_name', x.get('id', ''))} {x.get('count', 0)}" for x in (defn.get("reward_items") or []))
+        reward_items_str = "; ".join(
+            f"{x.get('item_name', x.get('id', ''))} {x.get('count', 0)}"
+            for x in (defn.get("reward_items") or [])
+        )
         rarity_input = TextInput(
             label=self.language_manager.GetText('OP_TITLE_ATTR_RARITY_LABEL'),
             placeholder="普通/稀有/史诗/传奇/神话",
-            default_value=defn.get("rarity", "普通")
+            default_value=defn.get("rarity", "普通"),
         )
         desc_input = TextInput(
             label=self.language_manager.GetText('OP_TITLE_ATTR_DESC_LABEL'),
             placeholder=self.language_manager.GetText('OP_TITLE_ATTR_DESC_PLACEHOLDER'),
-            default_value=defn.get("description", "")
+            default_value=defn.get("description", ""),
         )
         money_input = TextInput(
             label=self.language_manager.GetText('OP_TITLE_ATTR_REWARD_MONEY_LABEL'),
             placeholder="0",
-            default_value=str(defn.get("reward_money", 0))
+            default_value=str(defn.get("reward_money", 0)),
         )
         items_input = TextInput(
             label=self.language_manager.GetText('OP_TITLE_ATTR_REWARD_ITEMS_LABEL'),
             placeholder="minecraft:diamond 2; minecraft:emerald 1",
-            default_value=reward_items_str
+            default_value=reward_items_str,
         )
         form = ModalForm(
             title=self.language_manager.GetText('OP_TITLE_ATTR_EDIT_TITLE').format(title_name),
             controls=[rarity_input, desc_input, money_input, items_input],
             on_close=self.show_op_title_attr_list_panel,
-            on_submit=lambda p, json_str: self._do_op_title_save_attr(p, json_str, title_name)
+            on_submit=lambda p, json_str: self._do_op_title_save_attr(p, json_str, title_name),
         )
         player.send_form(form)
+
+    def show_op_title_rename_panel(self, player: Player, title_name: str):
+        """OP 头衔重命名：将旧头衔名迁移为新头衔名。"""
+        rename_input = TextInput(
+            label=self.language_manager.GetText('OP_TITLE_RENAME_INPUT_LABEL'),
+            placeholder=self.language_manager.GetText('OP_TITLE_RENAME_INPUT_PLACEHOLDER'),
+            default_value="",
+        )
+        form = ModalForm(
+            title=self.language_manager.GetText('OP_TITLE_RENAME_PANEL_TITLE').format(title_name),
+            controls=[rename_input],
+            on_close=self.show_op_title_attr_list_panel,
+            on_submit=lambda p, json_str: self._do_op_title_rename(p, json_str, title_name),
+        )
+        player.send_form(form)
+
+    def _do_op_title_rename(self, player: Player, json_str: str, title_name: str):
+        """执行头衔重命名：校验冲突 + 更新配置（管理员头衔）+ 同步数据库。"""
+        try:
+            data = json.loads(json_str)
+            if not data or not str(data[0]).strip():
+                player.send_message(self.language_manager.GetText('OP_TITLE_RENAME_FAIL_EMPTY'))
+                return self.show_op_title_attr_list_panel(player)
+
+            old_title = str(title_name).strip()
+            new_title = str(data[0]).strip()
+
+            if old_title == new_title:
+                player.send_message(self.language_manager.GetText('OP_TITLE_RENAME_FAIL_SAME'))
+                return self.show_op_title_attr_list_panel(player)
+
+            # 新名字冲突校验
+            if self.title_system.get_title_definition(new_title):
+                player.send_message(self.language_manager.GetText('OP_TITLE_RENAME_FAIL_CONFLICT').format(new_title))
+                return self.show_op_title_attr_list_panel(player)
+
+            ok = self.title_system.rename_title(old_title, new_title)
+            if not ok:
+                player.send_message(self.language_manager.GetText('OP_TITLE_RENAME_FAIL'))
+                return self.show_op_title_attr_list_panel(player)
+
+            # 同步管理员头衔配置（OP_TITLE）
+            current_op_title = self.setting_manager.GetSetting('OP_TITLE')
+            if current_op_title and str(current_op_title).strip() == old_title:
+                self.setting_manager.SetSetting('OP_TITLE', new_title)
+
+            # 同步默认头衔配置（DEFAULT_TITLE），避免列表仍显示旧名字
+            default_raw = self.setting_manager.GetSetting('DEFAULT_TITLE') or ""
+            default_list = [t.strip() for t in str(default_raw).split(",") if t.strip()]
+            if old_title in default_list:
+                default_list = [new_title if t == old_title else t for t in default_list]
+                self.setting_manager.SetSetting('DEFAULT_TITLE', ",".join(default_list))
+
+            player.send_message(self.language_manager.GetText('OP_TITLE_RENAME_SUCCESS').format(old_title, new_title))
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[ARC Core]Rename title error: {e}")
+            player.send_message(self.language_manager.GetText('OP_TITLE_RENAME_FAIL'))
+        self.show_op_title_attr_list_panel(player)
 
     def _parse_reward_items(self, text: str) -> list:
         """解析 '物品ID 数量; 物品ID 数量' 为 [{"item_name": id, "count": n}, ...]"""
@@ -5939,14 +6021,17 @@ class ARCCorePlugin(Plugin):
             
             # 尝试获取攻击者信息
             attacker_name = self._get_entity_name_from_damage_source(event)
+            # 由生物/玩家造成的死亡原因（原始类型，用于判断是否显示攻击者；与语言文件“生物殴打”等对应）
+            is_entity_cause = self._is_entity_attack_death_cause(death_cause_raw)
             
             # 根据死亡原因和攻击者信息选择消息格式
-            if attacker_name and death_cause_translated in ['生物攻击', '玩家攻击']:
-                # 被生物或玩家杀死的情况
-                game_message = self.language_manager.GetText('DEATH_BROADCAST_MESSAGE_WITH_CAUSE').format(
-                    player_name, dimension, x, y, z, f"{death_cause_translated}({attacker_name})"
+            if attacker_name and is_entity_cause:
+                # 被生物或玩家杀死：根据死因使用更有梗的文案
+                game_key, qq_key = self._pick_entity_kill_message_keys(death_cause_raw)
+                game_message = self.language_manager.GetText(game_key).format(
+                    player_name, dimension, x, y, z, attacker_name
                 )
-                qq_message = self.language_manager.GetText('DEATH_QQ_MESSAGE_WITH_ENTITY').format(
+                qq_message = self.language_manager.GetText(qq_key).format(
                     player_name, dimension, x, y, z, attacker_name
                 )
             elif death_cause_translated:
@@ -6001,6 +6086,36 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"[ARC Core]Get death cause error: {str(e)}")
             return ""
 
+    def _is_entity_attack_death_cause(self, death_cause_raw: str) -> bool:
+        """判断是否为生物/玩家攻击类死亡原因（有明确攻击者时可显示“被xx殴打致死”）。"""
+        if not death_cause_raw or not str(death_cause_raw).strip():
+            return False
+        cause = str(death_cause_raw).strip().lower()
+        if ":" in cause:
+            cause = cause.split(":")[-1]
+        entity_attack_causes = {
+            "entity_attack", "mob_attack", "player_attack",
+            "arrow", "trident", "thrown", "mob_projectile", "projectile",
+            "entity_explosion", "mob_explosion", "entity_explosion",
+            "ram_attack", "spit", "sting", "sweep_attack",
+        }
+        return cause in entity_attack_causes
+
+    def _pick_entity_kill_message_keys(self, death_cause_raw: str) -> tuple[str, str]:
+        """根据死因选择“带击杀者”的播报文案 key。"""
+        cause = str(death_cause_raw or "").strip().lower()
+        if ":" in cause:
+            cause = cause.split(":")[-1]
+
+        if cause in {"entity_explosion", "mob_explosion"}:
+            return "DEATH_BROADCAST_BY_ENTITY_EXPLOSION", "DEATH_QQ_BY_ENTITY_EXPLOSION"
+
+        if cause in {"arrow", "trident", "thrown", "mob_projectile", "projectile"}:
+            return "DEATH_BROADCAST_BY_ENTITY_PROJECTILE", "DEATH_QQ_BY_ENTITY_PROJECTILE"
+
+        # 默认近战/其他可归因到实体的情况
+        return "DEATH_BROADCAST_BY_ENTITY", "DEATH_QQ_BY_ENTITY"
+
     def _translate_death_cause(self, death_cause: str) -> str:
         """翻译死亡原因"""
         try:
@@ -6034,36 +6149,40 @@ class ARCCorePlugin(Plugin):
             return death_cause
 
     def _get_entity_name_from_damage_source(self, event: PlayerDeathEvent) -> str:
-        """从伤害源获取生物名称"""
+        """从伤害源获取生物/玩家名称（用于“被xx殴打致死”播报）。"""
         try:
-            if hasattr(event, 'damage_source') and event.damage_source:
+            # 先尝试事件自身的攻击者属性（部分引擎把 killer/damager 放在 event 上）
+            if hasattr(event, "killer") and event.killer:
+                name = self._translate_entity_name(event.killer)
+                if name:
+                    return name
+            if hasattr(event, "damager") and event.damager:
+                name = self._translate_entity_name(event.damager)
+                if name:
+                    return name
+            if hasattr(event, "damage_source") and event.damage_source:
                 damage_source = event.damage_source
-                
-                # 优先尝试从 damage_source 的 actor 属性获取名称
-                if hasattr(damage_source, 'actor') and damage_source.actor:
-                    return self._translate_entity_name(damage_source.actor)
-                
-                # 尝试 damaging_actor 属性
-                if hasattr(damage_source, 'damaging_actor') and damage_source.damaging_actor:
-                    return self._translate_entity_name(damage_source.damaging_actor)
-                
-                # 尝试获取攻击者实体对象
-                if hasattr(damage_source, 'damaging_entity'):
-                    entity = damage_source.damaging_entity
-                    if entity:
-                        return self._translate_entity_name(entity)
-                
-                # 尝试其他可能的属性
-                if hasattr(damage_source, 'entity'):
-                    entity = damage_source.entity
-                    if entity:
-                        return self._translate_entity_name(entity)
-                
-                if hasattr(damage_source, 'attacker'):
-                    entity = damage_source.attacker
-                    if entity:
-                        return self._translate_entity_name(entity)
-            
+                # 优先 actor（造成伤害的实体，近战为生物本身）
+                if hasattr(damage_source, "actor") and damage_source.actor:
+                    name = self._translate_entity_name(damage_source.actor)
+                    if name:
+                        return name
+                if hasattr(damage_source, "damaging_actor") and damage_source.damaging_actor:
+                    name = self._translate_entity_name(damage_source.damaging_actor)
+                    if name:
+                        return name
+                if hasattr(damage_source, "damaging_entity") and damage_source.damaging_entity:
+                    name = self._translate_entity_name(damage_source.damaging_entity)
+                    if name:
+                        return name
+                if hasattr(damage_source, "entity") and damage_source.entity:
+                    name = self._translate_entity_name(damage_source.entity)
+                    if name:
+                        return name
+                if hasattr(damage_source, "attacker") and damage_source.attacker:
+                    name = self._translate_entity_name(damage_source.attacker)
+                    if name:
+                        return name
             return ""
         except Exception as e:
             self.logger.error(f"[ARC Core] 获取生物名称错误: {str(e)}")
