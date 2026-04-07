@@ -25,6 +25,8 @@ CREATE_NEW_LAND_POS2_SET_FAIL_POS1_NOT_SET=[弧光核心]你需要先使用 /lan
 
 PLAYER_NOT_FOUND=[弧光核心]没有找到名为{0}的玩家
 SYSTEM_ERROR=[弧光核心]系统错误，请联系服务器管理员！
+SYSTEM_ERROR_WITH_CODE=[弧光核心]系统异常（错误代码：{0}）。请将代码告知管理员；管理员请查看 plugins/ARCCore/error_log.txt 并将对应记录发给弧光核心作者。
+TRANSFER_FAIL_DB_TEXT=[弧光核心]转账未完成（错误代码：{0}）。详情已写入 error_log.txt，请联系管理员。
 
 # 主面板
 REGISTER_PANEL_TITLE=注册

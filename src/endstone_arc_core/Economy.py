@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """经济系统逻辑：金钱存储、增减、排行等（基于 XUID，精确到分）"""
-from typing import Optional, List, Dict, Any
+from typing import Any, Callable, Dict, List, Optional
 
 
 class Economy:
@@ -10,6 +10,22 @@ class Economy:
         self.db = database_manager
         self.setting_manager = setting_manager
         self.logger = logger
+        self._persistent_error_cb: Optional[Callable[[str, str, Optional[BaseException]], None]] = None
+
+    def set_persistent_error_callback(
+        self, callback: Optional[Callable[[str, str, Optional[BaseException]], None]]
+    ) -> None:
+        """由插件注册：仅写入 error_log / 控制台，不向玩家发消息。"""
+        self._persistent_error_cb = callback
+
+    def _emit_persistent_error(
+        self, error_code: str, detail: str, exc: Optional[BaseException] = None
+    ) -> None:
+        if self._persistent_error_cb:
+            try:
+                self._persistent_error_cb(error_code, detail, exc)
+            except Exception:
+                pass
 
     def set_logger(self, logger):
         """设置日志记录器（插件 on_enable 后调用）"""
@@ -68,6 +84,9 @@ class Economy:
             return True
         except Exception as e:
             print(f"[ARC Core]Upgrade player_economy to float error: {str(e)}")
+            self._emit_persistent_error(
+                "BANK09", f"upgrade_player_economy_table_to_float: {e}", e
+            )
             return False
 
     def _get_init_money(self) -> float:
@@ -94,20 +113,37 @@ class Economy:
             return self.round_money(result["money"])
         except Exception as e:
             self._log("error", f"[ARC Core]Get player money error: {str(e)}")
+            self._emit_persistent_error(
+                "BANK01", f"get_player_money_by_xuid xuid={xuid!r}: {e}", e
+            )
             return 0.0
 
     def set_player_money_by_xuid(self, xuid: str, amount: float) -> bool:
         """按 XUID 设置玩家金钱（仅数据，不通知）"""
         try:
             amount = self.round_money(amount)
-            return self.db.update(
+            ok = self.db.update(
                 table="player_economy",
                 data={"money": amount},
                 where="xuid = ?",
                 params=(xuid,),
             )
+            if not ok:
+                self._log(
+                    "error",
+                    f"[ARC Core]Set player money failed (db returned False) xuid={xuid}",
+                )
+                self._emit_persistent_error(
+                    "BANK02",
+                    f"set_player_money_by_xuid xuid={xuid!r} amount={amount} db update returned False",
+                    None,
+                )
+            return ok
         except Exception as e:
             self._log("error", f"[ARC Core]Set player money error: {str(e)}")
+            self._emit_persistent_error(
+                "BANK02", f"set_player_money_by_xuid xuid={xuid!r}: {e}", e
+            )
             return False
 
     def increase_player_money_by_xuid(self, xuid: str, amount: float) -> bool:
@@ -156,6 +192,7 @@ class Economy:
             )
         except Exception as e:
             self._log("error", f"[ARC Core]Get top richest players error: {str(e)}")
+            self._emit_persistent_error("BANK03", f"get_top_richest_xuids: {e}", e)
             return []
 
     def get_player_money_rank_by_xuid(self, xuid: str) -> Optional[int]:
@@ -177,6 +214,9 @@ class Economy:
             self._log(
                 "error", f"[ARC Core]Get player money rank error: {str(e)}"
             )
+            self._emit_persistent_error(
+                "BANK04", f"get_player_money_rank_by_xuid xuid={xuid!r}: {e}", e
+            )
             return None
 
     def init_player_economy_by_xuid(self, xuid: str) -> bool:
@@ -196,6 +236,9 @@ class Economy:
                 "error",
                 f"[ARC Core]Init player economy info error: {str(e)}",
             )
+            self._emit_persistent_error(
+                "BANK05", f"init_player_economy_by_xuid xuid={xuid!r}: {e}", e
+            )
             return False
 
     def get_richest_one(self) -> Optional[Dict[str, Any]]:
@@ -208,6 +251,7 @@ class Economy:
             self._log(
                 "error", f"[ARC Core]Get richest player error: {str(e)}"
             )
+            self._emit_persistent_error("BANK06", f"get_richest_one: {e}", e)
             return None
 
     def get_poorest_one(self) -> Optional[Dict[str, Any]]:
@@ -220,6 +264,7 @@ class Economy:
             self._log(
                 "error", f"[ARC Core]Get poorest player error: {str(e)}"
             )
+            self._emit_persistent_error("BANK07", f"get_poorest_one: {e}", e)
             return None
 
     def get_all_money_raw(self) -> List[Dict[str, Any]]:
@@ -230,4 +275,5 @@ class Economy:
             )
         except Exception as e:
             self._log("error", f"[ARC Core]Get all money data error: {str(e)}")
+            self._emit_persistent_error("BANK08", f"get_all_money_raw: {e}", e)
             return []

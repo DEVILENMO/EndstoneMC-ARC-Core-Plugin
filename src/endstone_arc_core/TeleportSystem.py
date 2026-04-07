@@ -387,7 +387,7 @@ class TeleportSystem:
         try:
             self.server.dispatch_command(
                 self.server.command_sender,
-                f'effect "{player_name}" slow_falling 10 255 true',
+                f'effect "{player_name}" slow_falling 30 255 true',
             )
         except Exception as e:
             self._log("error", f"Failed to apply slow falling effect: {str(e)}")

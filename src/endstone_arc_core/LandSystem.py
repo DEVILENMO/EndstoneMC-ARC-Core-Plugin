@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """领地系统：建表、区块索引、CRUD、子领地、权限设置的全部数据/逻辑层"""
 import json
-from typing import Dict, Optional, Set
+from typing import Callable, Dict, Optional, Set
 
 
 class LandSystem:
@@ -13,7 +13,24 @@ class LandSystem:
         self.db = database_manager
         self.setting_manager = setting_manager
         self.logger = logger
+        self._persistent_error_cb: Optional[
+            Callable[[str, str, Optional[BaseException]], None]
+        ] = None
         self._load_config()
+
+    def set_persistent_error_callback(
+        self, callback: Optional[Callable[[str, str, Optional[BaseException]], None]]
+    ) -> None:
+        self._persistent_error_cb = callback
+
+    def _emit_persistent_error(
+        self, error_code: str, detail: str, exc: Optional[BaseException] = None
+    ) -> None:
+        if self._persistent_error_cb:
+            try:
+                self._persistent_error_cb(error_code, detail, exc)
+            except Exception:
+                pass
 
     def _load_config(self):
         self.land_min_distance = self._parse_int("MIN_LAND_DISTANCE", 0)
@@ -373,6 +390,11 @@ class LandSystem:
             check_min_z, check_max_z = min_z - d, max_z + d
             affected = self._get_affected_chunks(check_min_x, check_max_x, check_min_z, check_max_z)
             if not self._ensure_dimension_table(dimension):
+                self._emit_persistent_error(
+                    "LAND_SYS1",
+                    f"check_land_availability _ensure_dimension_table failed dimension={dimension!r}",
+                    None,
+                )
                 return False, "SYSTEM_ERROR", None
             table = self._get_dimension_table(dimension)
             nearby_ids: Set[int] = set()
@@ -411,6 +433,7 @@ class LandSystem:
             return True, None, None
         except Exception as e:
             self._log("error", f"Check land availability error: {str(e)}")
+            self._emit_persistent_error("LAND_SYS2", f"check_land_availability: {e}", e)
             return False, "SYSTEM_ERROR", None
 
     # ─── 领地属性读写 ────────────────────────────────────────────────────────
@@ -756,6 +779,11 @@ class LandSystem:
         try:
             parent = self.get_land_info(parent_land_id)
             if not parent:
+                self._emit_persistent_error(
+                    "LAND_SYS3",
+                    f"check_sub_land_availability parent_land_id={parent_land_id} not found",
+                    None,
+                )
                 return False, "SYSTEM_ERROR"
             if (
                 min_x < parent["min_x"] or max_x > parent["max_x"]
@@ -780,6 +808,11 @@ class LandSystem:
             return True, None
         except Exception as e:
             self._log("error", f"Check sub land availability error: {str(e)}")
+            self._emit_persistent_error(
+                "LAND_SYS4",
+                f"check_sub_land_availability parent_land_id={parent_land_id}: {e}",
+                e,
+            )
             return False, "SYSTEM_ERROR"
 
     def add_sub_land_shared_user(self, sub_land_id: int, xuid: str) -> bool:

@@ -24,6 +24,7 @@ from endstone_arc_core.TitleSystem import TitleSystem
 from endstone_arc_core.AchievementSystem import AchievementSystem
 from endstone_arc_core.EntityDisplayNameManager import EntityDisplayNameManager
 from endstone_arc_core.KillRewardConfig import KillRewardConfig, normalize_entity_type_id
+from endstone_arc_core.arc_error_log import append_arc_error_log, format_context_lines
 
 MAIN_PATH = 'plugins/ARCCore'
 
@@ -120,6 +121,7 @@ class ARCCorePlugin(Plugin):
         self.entity_display_name_manager = EntityDisplayNameManager(Path(MAIN_PATH), logger=None)
         self.kill_reward_config = KillRewardConfig(Path(MAIN_PATH), logger=None)
         self.init_database()
+        self._arc_error_log_path = str(Path(MAIN_PATH) / "error_log.txt")
 
         # 首富头衔：缓存当前首富 xuid，避免每次都重复发放
         self.current_richest_xuid = None
@@ -321,6 +323,12 @@ class ARCCorePlugin(Plugin):
         self.register_events(self)
         self.logger.info(f"{ColorFormat.YELLOW}[ARC Core]Plugin enabled!")
         self.economy.set_logger(self.logger)
+
+        def _on_arc_persistent_error(error_code: str, detail: str, exc):
+            self._arc_persistent_error(error_code, detail, exc)
+
+        self.economy.set_persistent_error_callback(_on_arc_persistent_error)
+        self.land_system.set_persistent_error_callback(_on_arc_persistent_error)
         self.teleport_system.set_server(self.server)
         self.teleport_system.set_logger(self.logger)
         self.land_system.set_logger(self.logger)
@@ -367,6 +375,50 @@ class ARCCorePlugin(Plugin):
         # 停止位置检测线程
         self.stop_position_thread()
         self.logger.info(f"{ColorFormat.YELLOW}[ARC Core]Plugin disabled!")
+
+    def _arc_persistent_error(
+        self,
+        error_code: str,
+        detail: str,
+        exception=None,
+        extra_context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """写入 error_log.txt 并打 logger（不向玩家发消息）。"""
+        append_arc_error_log(
+            self._arc_error_log_path,
+            error_code,
+            detail,
+            exception,
+            format_context_lines(extra_context),
+        )
+        if self.logger:
+            suffix = f" | {exception}" if exception else ""
+            self.logger.error(
+                f"{ColorFormat.RED}[ARC Core][{error_code}] {detail}{suffix}"
+            )
+
+    def report_arc_error(
+        self,
+        error_code: str,
+        detail: str,
+        player_for_notify=None,
+        exception=None,
+        **extra_context,
+    ) -> None:
+        """恶性错误：落盘 + 控制台 + 可选通知在线玩家（带错误代码）。"""
+        ctx = extra_context if extra_context else None
+        self._arc_persistent_error(error_code, detail, exception, ctx)
+        if player_for_notify is not None:
+            try:
+                msg = self.language_manager.GetText("SYSTEM_ERROR_WITH_CODE")
+                if not msg or not str(msg).strip():
+                    msg = (
+                        "[弧光核心]系统异常 ({0})，请将错误代码告知管理员，"
+                        "并将 plugins/ARCCore/error_log.txt 中的对应记录发给弧光核心作者。"
+                    )
+                player_for_notify.send_message(msg.format(error_code))
+            except Exception:
+                pass
 
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
         if command.name == 'updatespawnpos':
@@ -1564,13 +1616,10 @@ class ARCCorePlugin(Plugin):
         :return: OP状态，如果玩家不存在则返回None
         """
         try:
-            result = self.database_manager.query_one(
-                "SELECT is_op FROM player_basic_info WHERE name = ?",
-                (player_name,)
-            )
-            if result is not None:
-                return bool(result['is_op'])
-            return None
+            player_xuid = self.get_player_xuid_by_name(player_name)
+            if not player_xuid:
+                return None
+            return self.get_offline_player_op_status_by_xuid(player_xuid)
         except Exception as e:
             self._safe_log('error', f"{ColorFormat.RED}[ARC Core]Get offline player OP status error: {str(e)}")
             return None
@@ -1629,16 +1678,36 @@ class ARCCorePlugin(Plugin):
     
     def get_player_xuid_by_name(self, player_name: str) -> Optional[str]:
         """
-        通过玩家名称获取XUID
-        :param player_name: 玩家名称
-        :return: 玩家XUID字符串，如果未找到则返回None
+        通过玩家名称获取 XUID。
+        使用在线玩家列表 + 大小写不敏感、去空白的 DB 查询，避免 name 与调用方字符串仅差大小写/空格时查不到。
         """
+        if player_name is None:
+            return None
+        normalized_name = str(player_name).strip()
+        if not normalized_name:
+            return None
         try:
+            # 1) 在线玩家优先：与运行时 player.name 一致，可规避 DB 未及时同步或第三方传入名与库不完全一致
+            server = getattr(self, "server", None)
+            if server is not None:
+                try:
+                    online_players = server.online_players
+                    if online_players:
+                        key_lower = normalized_name.lower()
+                        for online_player in online_players:
+                            on_name = (online_player.name or "").strip()
+                            if on_name.lower() == key_lower:
+                                return str(online_player.xuid)
+                except Exception:
+                    pass
+            # 2) 数据库：TRIM + 大小写不敏感（SQLite 默认 BINARY 下 name = ? 对英文大小写敏感）
             result = self.database_manager.query_one(
-                "SELECT xuid FROM player_basic_info WHERE name = ?",
-                (player_name,)
+                "SELECT xuid FROM player_basic_info WHERE LOWER(TRIM(name)) = LOWER(?)",
+                (normalized_name,),
             )
-            return result['xuid'] if result else None
+            if not result or result.get("xuid") is None:
+                return None
+            return str(result["xuid"])
         except Exception as e:
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player XUID by name error: {str(e)}")
             return None
@@ -1700,7 +1769,11 @@ class ARCCorePlugin(Plugin):
         if not self.if_player_logined(player):
             player_basic_info = self.get_player_basic_info(player)
             if player_basic_info is None:
-                player.send_message('[ARC Core]An error occured, please contact server hoster!')
+                self.report_arc_error(
+                    "INFO0",
+                    f"show_main_menu (pre-login) get_player_basic_info returned None player={player.name!r}",
+                    player,
+                )
                 return
             self.update_player_name(player)
             if player_basic_info['password'] is None:
@@ -1759,7 +1832,11 @@ class ARCCorePlugin(Plugin):
         """显示玩家自己的信息面板"""
         player_basic_info = self.get_player_basic_info(player)
         if player_basic_info is None:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "INFO1",
+                f"show_my_info_panel get_player_basic_info returned None player={player.name!r}",
+                player,
+            )
             return
 
         player_name = player.name
@@ -1932,7 +2009,13 @@ class ARCCorePlugin(Plugin):
         def try_set_inviter(player: Player, json_str: str):
             try:
                 data = json.loads(json_str)
-            except Exception:
+            except Exception as parse_exc:
+                self.report_arc_error(
+                    "INV1",
+                    "fill_inviter json.loads failed",
+                    player,
+                    exception=parse_exc,
+                )
                 self.show_fill_inviter_panel(player, self.language_manager.GetText('FILL_INVITER_FAIL_SYSTEM_ERROR'))
                 return
 
@@ -1949,7 +2032,11 @@ class ARCCorePlugin(Plugin):
                 (player_xuid,)
             )
             if basic_info is None:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "INV2",
+                    f"fill_inviter SELECT inviter_xuid returned None xuid={player_xuid!r}",
+                    player,
+                )
                 self.show_my_info_panel(player)
                 return
 
@@ -1979,7 +2066,11 @@ class ARCCorePlugin(Plugin):
                 update_success = False
 
             if not update_success:
-                player.send_message(self.language_manager.GetText('FILL_INVITER_FAIL_SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "INV3",
+                    f"fill_inviter UPDATE inviter_xuid failed xuid={player_xuid!r}",
+                    player,
+                )
                 self.show_my_info_panel(player)
                 return
 
@@ -2175,8 +2266,21 @@ class ARCCorePlugin(Plugin):
     def increase_player_money_by_name(self, player_name: str, amount: float, notify: bool = True) -> bool:
         player_xuid = self.get_player_xuid_by_name(player_name)
         if not player_xuid:
+            online_player = self.server.get_player(player_name)
+            self.report_arc_error(
+                "BANK15",
+                f"increase_player_money_by_name cannot resolve xuid for name={player_name!r}",
+                online_player,
+            )
             return False
         success = self.economy.increase_player_money_by_xuid(player_xuid, amount)
+        if not success:
+            online_player = self.server.get_player(player_name)
+            self.report_arc_error(
+                "BANK10",
+                f"increase_player_money_by_name failed name={player_name!r} amount={amount!r}",
+                online_player,
+            )
         if success and notify:
             online_player = self.server.get_player(player_name)
             if online_player is not None:
@@ -2197,8 +2301,21 @@ class ARCCorePlugin(Plugin):
     def decrease_player_money_by_name(self, player_name: str, amount: float, notify: bool = True) -> bool:
         player_xuid = self.get_player_xuid_by_name(player_name)
         if not player_xuid:
+            online_player = self.server.get_player(player_name)
+            self.report_arc_error(
+                "BANK16",
+                f"decrease_player_money_by_name cannot resolve xuid for name={player_name!r}",
+                online_player,
+            )
             return False
         success = self.economy.decrease_player_money_by_xuid(player_xuid, amount)
+        if not success:
+            online_player = self.server.get_player(player_name)
+            self.report_arc_error(
+                "BANK11",
+                f"decrease_player_money_by_name failed name={player_name!r} amount={amount!r}",
+                online_player,
+            )
         if success and notify:
             online_player = self.server.get_player(player_name)
             if online_player is not None:
@@ -2356,7 +2473,11 @@ class ARCCorePlugin(Plugin):
             params=(player_xuid,),
         )
         if not ok:
-            player.send_message(self.language_manager.GetText("SYSTEM_ERROR"))
+            self.report_arc_error(
+                "CHK1",
+                f"checkin update last_checkin_date failed xuid={player_xuid!r} date={today!r}",
+                player,
+            )
 
         if daily_money > 0:
             money_line = self.language_manager.GetText("CHECKIN_SUCCESS_MONEY_LINE").format(
@@ -2672,17 +2793,38 @@ class ARCCorePlugin(Plugin):
             # 直接使用目标玩家对象和金额进行转账
             error_code, receive_player, amount = self._validate_transfer_data_new(sender, target_player, data[1])
             if error_code == 0:
-                self.decrease_player_money(sender, amount)
-                self.increase_player_money(receive_player, amount)
-                receive_player.send_message(self.language_manager.GetText('RECEIVE_PLAYER_TRANSFER_MESSAGE').format(
-                    sender.name,
-                    self._format_money_display(amount),
-                    self._format_money_display(self.get_player_money(receive_player))))
-                result_str = self.language_manager.GetText('TRANSFER_COMPLETED_HINT_TEXT').format(
-                    receive_player.name,
-                    self._format_money_display(amount),
-                    self._format_money_display(self.get_player_money(sender))
-                )
+                if not self.decrease_player_money(sender, amount):
+                    self.report_arc_error(
+                        "BANK12",
+                        f"bank transfer decrease failed sender={sender.name!r} receiver={receive_player.name!r} amount={amount!r}",
+                        sender,
+                    )
+                    result_str = self.language_manager.GetText("TRANSFER_FAIL_DB_TEXT").format("BANK12")
+                elif not self.increase_player_money(receive_player, amount):
+                    self.report_arc_error(
+                        "BANK13",
+                        f"bank transfer increase failed after decrease; attempting rollback sender={sender.name!r} receiver={receive_player.name!r} amount={amount!r}",
+                        sender,
+                    )
+                    if not self.increase_player_money(sender, amount):
+                        self.report_arc_error(
+                            "BANK14",
+                            f"bank transfer rollback to sender FAILED sender={sender.name!r} amount={amount!r}",
+                            sender,
+                        )
+                        result_str = self.language_manager.GetText("TRANSFER_FAIL_DB_TEXT").format("BANK14")
+                    else:
+                        result_str = self.language_manager.GetText("TRANSFER_FAIL_DB_TEXT").format("BANK13")
+                else:
+                    receive_player.send_message(self.language_manager.GetText('RECEIVE_PLAYER_TRANSFER_MESSAGE').format(
+                        sender.name,
+                        self._format_money_display(amount),
+                        self._format_money_display(self.get_player_money(receive_player))))
+                    result_str = self.language_manager.GetText('TRANSFER_COMPLETED_HINT_TEXT').format(
+                        receive_player.name,
+                        self._format_money_display(amount),
+                        self._format_money_display(self.get_player_money(sender))
+                    )
             else:
                 result_str = self.language_manager.GetText(f'TRANSFER_ERROR_{error_code}_TEXT')
                 if error_code == 2:
@@ -3071,7 +3213,11 @@ class ARCCorePlugin(Plugin):
                     self._format_money_display(self.get_player_money(player))
                 ))
             else:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "TP1",
+                    f"teleport_to_public_warp decrease failed warp={warp_name!r} cost={self.teleport_system.teleport_cost_public_warp!r}",
+                    player,
+                )
                 return
         
         self.start_teleport_to_position_countdown(player, warp_name, (warp_info['x'], warp_info['y'], warp_info['z']), 'PUBLIC_WARP', warp_info['dimension'])
@@ -3095,7 +3241,11 @@ class ARCCorePlugin(Plugin):
                     self._format_money_display(self.get_player_money(player))
                 ))
             else:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "TP2",
+                    f"teleport_to_home decrease failed home={home_name!r} cost={self.teleport_system.teleport_cost_home!r}",
+                    player,
+                )
                 return
         
         self.start_teleport_to_position_countdown(player, home_name, (home_info['x'], home_info['y'], home_info['z']), 'HOME', home_info['dimension'])
@@ -3171,7 +3321,11 @@ class ARCCorePlugin(Plugin):
                     self._format_money_display(self.get_player_money(player))
                 ))
             else:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "TP3",
+                    f"teleport_to_death_location decrease failed cost={self.teleport_system.teleport_cost_death_location!r}",
+                    player,
+                )
                 return
         
         death_location = self.teleport_system.get_death_location(player.name)
@@ -3222,7 +3376,11 @@ class ARCCorePlugin(Plugin):
                     self._format_money_display(self.get_player_money(player))
                 ))
             else:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "TP4",
+                    f"start_random_teleport decrease failed cost={self.teleport_system.teleport_cost_random!r}",
+                    player,
+                )
                 return
         
         # 发送倒计时消息
@@ -3354,7 +3512,11 @@ class ARCCorePlugin(Plugin):
                     self._format_money_display(self.get_player_money(sender))
                 ))
             else:
-                sender.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "TP5",
+                    f"send_tpa_request decrease failed target={target.name!r} cost={self.teleport_system.teleport_cost_player!r}",
+                    sender,
+                )
                 return
         
         if not self.teleport_system.add_request(target.name, 'tpa', sender.name):
@@ -3384,7 +3546,11 @@ class ARCCorePlugin(Plugin):
                     self._format_money_display(self.get_player_money(sender))
                 ))
             else:
-                sender.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "TP6",
+                    f"send_tphere_request decrease failed target={target.name!r} cost={self.teleport_system.teleport_cost_player!r}",
+                    sender,
+                )
                 return
         
         if not self.teleport_system.add_request(target.name, 'tphere', sender.name):
@@ -4018,7 +4184,11 @@ class ARCCorePlugin(Plugin):
                     self._format_money_display(self.get_player_money(player))
                 ))
             else:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "TP7",
+                    f"teleport_to_land decrease failed land_id={land_id!r} cost={self.teleport_system.teleport_cost_land!r}",
+                    player,
+                )
                 return
         
         tp_target_pos = self.get_land_teleport_point(land_id)
@@ -4053,11 +4223,17 @@ class ARCCorePlugin(Plugin):
     def try_delete_land(self, player: Player, land_id: int, return_money: int):
         r = self.delete_land(land_id)
         if r:
-            self.increase_player_money(player, return_money)
+            if return_money and return_money > 0:
+                if not self.increase_player_money(player, return_money):
+                    self.report_arc_error(
+                        "LAND_PAY2",
+                        f"try_delete_land land_id={land_id} deleted but refund increase failed amount={return_money!r}",
+                        player,
+                    )
             player.send_message(self.language_manager.GetText('DELETE_LAND_SUCCESS').format(
-            land_id,
-            self._format_money_display(return_money),
-            self._format_money_display(self.get_player_money(player))))
+                land_id,
+                self._format_money_display(return_money),
+                self._format_money_display(self.get_player_money(player))))
         else:
             player.send_message(self.language_manager.GetText('DELETE_LAND_FAILED').format(land_id))
         self.show_own_land_menu(player)
@@ -4092,7 +4268,11 @@ class ARCCorePlugin(Plugin):
         """显示确认移交领地的面板"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND10",
+                f"confirm_transfer_land get_land_info empty land_id={land_id!r}",
+                player,
+            )
             return
 
         confirm_panel = ActionForm(
@@ -4117,7 +4297,11 @@ class ARCCorePlugin(Plugin):
         """尝试移交领地"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND11",
+                f"try_transfer_land get_land_info empty land_id={land_id!r}",
+                player,
+            )
             return
 
         # 检查目标玩家是否还在线
@@ -4148,7 +4332,11 @@ class ARCCorePlugin(Plugin):
         """显示领地授权管理面板"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND12",
+                f"show_land_auth_manage_panel get_land_info empty land_id={land_id!r}",
+                player,
+            )
             return
 
         auth_panel = ActionForm(
@@ -4228,7 +4416,11 @@ class ARCCorePlugin(Plugin):
         try:
             land_info = self.get_land_info(land_id)
             if not land_info:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "LAND13",
+                    f"add_land_auth get_land_info empty land_id={land_id!r}",
+                    player,
+                )
                 return
             target_xuid = str(target_player.xuid)
             if target_xuid in land_info['shared_users']:
@@ -4253,7 +4445,11 @@ class ARCCorePlugin(Plugin):
         try:
             land_info = self.get_land_info(land_id)
             if not land_info:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "LAND14",
+                    f"remove_land_auth get_land_info empty land_id={land_id!r}",
+                    player,
+                )
                 return
             if target_uuid not in land_info['shared_users']:
                 player.send_message(self.language_manager.GetText('LAND_AUTH_NOT_EXISTS').format(target_name))
@@ -4278,7 +4474,11 @@ class ARCCorePlugin(Plugin):
         """显示领地爆炸保护设置面板"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND15",
+                f"show_land_explosion_setting_panel get_land_info empty land_id={land_id!r}",
+                player,
+            )
             return
 
         current_allow_explosion = land_info.get('allow_explosion', False)
@@ -4309,7 +4509,11 @@ class ARCCorePlugin(Plugin):
         """显示领地方块互动开放设置面板"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND16",
+                f"show_land_public_interact_setting_panel get_land_info empty land_id={land_id!r}",
+                player,
+            )
             return
 
         current_allow_public_interact = land_info.get('allow_public_interact', False)
@@ -4349,7 +4553,12 @@ class ARCCorePlugin(Plugin):
             self.show_own_land_detail_panel(player, land_id, land_info)
         except Exception as e:
             self.logger.error(f"Update land public interact setting error: {str(e)}")
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND17",
+                f"toggle_land_public_interact_setting exception land_id={land_id!r}",
+                player,
+                exception=e,
+            )
 
     def toggle_land_explosion_setting(self, player: Player, land_id: int, allow_explosion: bool):
         """切换领地爆炸保护设置"""
@@ -4371,7 +4580,11 @@ class ARCCorePlugin(Plugin):
         """显示领地生物互动设置面板"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND18",
+                f"show_land_actor_interaction_setting_panel get_land_info empty land_id={land_id!r}",
+                player,
+            )
             return
 
         current_allow_actor_interaction = land_info.get('allow_actor_interaction', False)
@@ -4402,7 +4615,11 @@ class ARCCorePlugin(Plugin):
         """显示领地生物攻击设置面板"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND19",
+                f"show_land_actor_damage_setting_panel get_land_info empty land_id={land_id!r}",
+                player,
+            )
             return
 
         current_allow_actor_damage = land_info.get('allow_actor_damage', False)
@@ -4551,7 +4768,12 @@ class ARCCorePlugin(Plugin):
                 self.show_new_land_info(p)
             except Exception as e:
                 self.logger.error(f"Create land form submit error: {str(e)}")
-                p.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "LAND20",
+                    "show_create_new_land_guide on_submit exception",
+                    p,
+                    exception=e,
+                )
 
         form = ModalForm(
             title=self.language_manager.GetText('CREATE_LAND_FORM_TITLE'),
@@ -4567,7 +4789,11 @@ class ARCCorePlugin(Plugin):
             # 获取玩家当前位置（与位置线程、权限检测使用同一套维度和坐标逻辑）
             pos = self.get_player_position_vector(player)
             if not pos:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "LAND21",
+                    f"show_current_land_info get_player_position_vector None player={player.name!r}",
+                    player,
+                )
                 return
             
             x, y, z = pos
@@ -4583,7 +4809,11 @@ class ARCCorePlugin(Plugin):
             # 获取领地详细信息
             land_info = self.get_land_info(land_id)
             if not land_info:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "LAND22",
+                    f"show_current_land_info get_land_info empty land_id={land_id!r}",
+                    player,
+                )
                 return
             
             # 获取领地拥有者名称（公共领地显示「公共领地」）
@@ -4635,7 +4865,12 @@ class ARCCorePlugin(Plugin):
             
         except Exception as e:
             self.logger.error(f"Show current land info error: {str(e)}")
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND23",
+                "show_current_land_info outer exception",
+                player,
+                exception=e,
+            )
 
     def display_land_particle_boundary(self, player: Player, land_info: dict, y_coord: float = None):
         """显示三维领地粒子边界（立方体12条棱）"""
@@ -4694,13 +4929,22 @@ class ARCCorePlugin(Plugin):
 
         except Exception as e:
             self.logger.error(f"Display land particle boundary error: {str(e)}")
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND24",
+                "display_land_particle_boundary exception",
+                player,
+                exception=e,
+            )
 
     def show_new_land_info(self, player: Player):
         """显示待购买领地的预览信息面板（含购买按钮和/landbuy提示）"""
         info = self.player_new_land_creation_info.get(player.name)
         if not info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND25",
+                f"show_new_land_info no player_new_land_creation_info player={player.name!r}",
+                player,
+            )
             return
 
         dimension = info['dimension']
@@ -4710,6 +4954,12 @@ class ARCCorePlugin(Plugin):
 
         if_allowed, reason, overlap_ids = self.check_land_availability(dimension, min_x, max_x, min_y, max_y, min_z, max_z)
         if not if_allowed:
+            if reason == "SYSTEM_ERROR":
+                self.report_arc_error(
+                    "LAND0",
+                    f"show_new_land_info check_land_availability SYSTEM_ERROR dim={dimension!r} overlap_ids={overlap_ids!r}",
+                    player,
+                )
             msg = self.language_manager.GetText(f'CHECK_NEW_LAND_AVAILABILITY_FAIL_{reason}')
             if overlap_ids:
                 land_parts = [f"#{lid} {self.get_land_name(lid) or ''}".strip() for lid in overlap_ids]
@@ -4775,6 +5025,12 @@ class ARCCorePlugin(Plugin):
 
         if_allowed, reason, overlap_ids = self.check_land_availability(dimension, min_x, max_x, min_y, max_y, min_z, max_z)
         if not if_allowed:
+            if reason == "SYSTEM_ERROR":
+                self.report_arc_error(
+                    "LAND0B",
+                    f"_execute_land_buy check_land_availability SYSTEM_ERROR dim={dimension!r} overlap_ids={overlap_ids!r}",
+                    player,
+                )
             msg = self.language_manager.GetText(f'CHECK_NEW_LAND_AVAILABILITY_FAIL_{reason}')
             if overlap_ids:
                 land_parts = [f"#{lid} {self.get_land_name(lid) or ''}".strip() for lid in overlap_ids]
@@ -4823,10 +5079,16 @@ class ARCCorePlugin(Plugin):
             if land_id is not None:
                 if not player.is_op:
                     if money_cost > 0:
-                        self.decrease_player_money(player, money_cost)
-                        player.send_message(self.language_manager.GetText('PAY_SUCCESS_HINT').format(
-                            self._format_money_display(money_cost),
-                            self._format_money_display(self.get_player_money(player))))
+                        if self.decrease_player_money(player, money_cost):
+                            player.send_message(self.language_manager.GetText('PAY_SUCCESS_HINT').format(
+                                self._format_money_display(money_cost),
+                                self._format_money_display(self.get_player_money(player))))
+                        else:
+                            self.report_arc_error(
+                                "LAND_PAY1",
+                                f"player_buy_new_land land_id={land_id} created but decrease_money failed cost={money_cost!r}",
+                                player,
+                            )
 
                     if used_free_blocks > 0:
                         current_free_blocks = self.get_player_free_land_blocks(player)
@@ -4837,7 +5099,11 @@ class ARCCorePlugin(Plugin):
                 self.clear_new_land_creation_info_memory(player)
                 self.show_own_land_detail_panel(player, land_id, self.get_land_info(land_id))
             else:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "LAND26",
+                    f"player_buy_new_land create_land returned None player={player.name!r} dim={dimension!r}",
+                    player,
+                )
         else:
             player.send_message(self.language_manager.GetText('PAY_FAIL_NO_ENOUGH_MONEY').format(
                 self._format_money_display(money_cost),
@@ -4850,7 +5116,11 @@ class ARCCorePlugin(Plugin):
         sub_lands = self.get_sub_lands_by_parent(land_id)
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND27",
+                f"show_sub_land_manage_panel get_land_info empty land_id={land_id!r}",
+                player,
+            )
             return
         panel = ActionForm(
             title=self.language_manager.GetText('SUB_LAND_MANAGE_PANEL_TITLE'),
@@ -4877,7 +5147,11 @@ class ARCCorePlugin(Plugin):
         """显示创建子领地的 XYZ 输入表单"""
         parent_info = self.get_land_info(land_id)
         if not parent_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND28",
+                f"show_create_sub_land_form get_land_info empty land_id={land_id!r}",
+                player,
+            )
             return
 
         p_min_x, p_max_x = parent_info['min_x'], parent_info['max_x']
@@ -4927,6 +5201,12 @@ class ARCCorePlugin(Plugin):
 
                 ok, reason = self.check_sub_land_availability(land_id, min_x, max_x, min_y, max_y, min_z, max_z)
                 if not ok:
+                    if reason == "SYSTEM_ERROR":
+                        self.report_arc_error(
+                            "LAND0C",
+                            f"create_sub_land form check_sub_land_availability SYSTEM_ERROR parent_land_id={land_id!r}",
+                            p,
+                        )
                     p.send_message(self.language_manager.GetText(f'CHECK_SUB_LAND_FAIL_{reason}'))
                     return
 
@@ -4936,10 +5216,19 @@ class ARCCorePlugin(Plugin):
                     self.display_land_particle_boundary(p, {'min_x': min_x, 'max_x': max_x, 'min_y': min_y, 'max_y': max_y, 'min_z': min_z, 'max_z': max_z})
                     self.show_sub_land_detail_panel(p, sl_id)
                 else:
-                    p.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                    self.report_arc_error(
+                        "LAND29",
+                        f"create_sub_land returned None parent_land_id={land_id!r} player={p.name!r}",
+                        p,
+                    )
             except Exception as e:
                 self.logger.error(f"Create sub land form submit error: {str(e)}")
-                p.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "LAND30",
+                    "show_create_sub_land_form on_submit exception",
+                    p,
+                    exception=e,
+                )
 
         form = ModalForm(
             title=self.language_manager.GetText('SUB_LAND_CREATE_FORM_TITLE'),
@@ -4953,7 +5242,11 @@ class ARCCorePlugin(Plugin):
         """显示子领地详情面板"""
         sl_info = self.get_sub_land_info(sub_land_id)
         if not sl_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND31",
+                f"show_sub_land_detail_panel get_sub_land_info empty sub_land_id={sub_land_id!r}",
+                player,
+            )
             return
 
         parent_land_id = sl_info['parent_land_id']
@@ -5002,7 +5295,11 @@ class ARCCorePlugin(Plugin):
     def show_rename_sub_land_panel(self, player: Player, sub_land_id: int):
         sl_info = self.get_sub_land_info(sub_land_id)
         if not sl_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND32",
+                f"show_rename_sub_land_panel get_sub_land_info empty sub_land_id={sub_land_id!r}",
+                player,
+            )
             return
 
         def on_submit(p: Player, json_str: str):
@@ -5029,7 +5326,11 @@ class ARCCorePlugin(Plugin):
     def confirm_delete_sub_land(self, player: Player, sub_land_id: int):
         sl_info = self.get_sub_land_info(sub_land_id)
         if not sl_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND33",
+                f"confirm_delete_sub_land get_sub_land_info empty sub_land_id={sub_land_id!r}",
+                player,
+            )
             return
 
         parent_land_id = sl_info['parent_land_id']
@@ -5063,7 +5364,11 @@ class ARCCorePlugin(Plugin):
         """管理子领地授权"""
         sl_info = self.get_sub_land_info(sub_land_id)
         if not sl_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND34",
+                f"show_sub_land_auth_manage_panel get_sub_land_info empty sub_land_id={sub_land_id!r}",
+                player,
+            )
             return
 
         panel = ActionForm(
@@ -5089,7 +5394,11 @@ class ARCCorePlugin(Plugin):
     def show_add_sub_land_auth_panel(self, player: Player, sub_land_id: int):
         sl_info = self.get_sub_land_info(sub_land_id)
         if not sl_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "LAND35",
+                f"show_add_sub_land_auth_panel get_sub_land_info empty sub_land_id={sub_land_id!r}",
+                player,
+            )
             return
         online_players = [p for p in self.server.online_players if str(p.xuid) != str(player.xuid) and str(p.xuid) != sl_info['owner_xuid'] and str(p.xuid) not in sl_info['shared_users']]
         if not online_players:
@@ -5790,7 +6099,11 @@ class ARCCorePlugin(Plugin):
         """OP 直接获取脚下领地（含公共领地）并进入管理面板"""
         pos = self.get_player_position_vector(player)
         if not pos:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "OP1",
+                f"show_op_land_at_pos get_player_position_vector None player={player.name!r}",
+                player,
+            )
             return
         x, y, z = pos
         dimension = player.location.dimension.name
@@ -5843,7 +6156,11 @@ class ARCCorePlugin(Plugin):
         """OP 强制删除领地确认面板（私人领地全额退款给主人，公共领地不退款）"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "OP2",
+                f"show_op_force_delete_land_confirm get_land_info empty land_id={land_id!r}",
+                player,
+            )
             self.show_op_land_detail_panel(player, land_id, from_page)
             return
 
@@ -6009,7 +6326,13 @@ class ARCCorePlugin(Plugin):
         def try_save_reward_config(p: Player, json_str: str):
             try:
                 data = json.loads(json_str)
-            except Exception:
+            except Exception as parse_exc:
+                self.report_arc_error(
+                    "OP_INV1",
+                    "show_invite_reward_config_panel json.loads failed",
+                    p,
+                    exception=parse_exc,
+                )
                 result_panel = ActionForm(
                     title=self.language_manager.GetText('INVITE_REWARD_CONFIG_TITLE'),
                     content=self.language_manager.GetText('FILL_INVITER_FAIL_SYSTEM_ERROR'),
@@ -6421,7 +6744,11 @@ class ARCCorePlugin(Plugin):
         """OP 查看单个领地详情（可传送前往）"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "OP3",
+                f"show_op_land_detail_panel get_land_info empty land_id={land_id!r}",
+                player,
+            )
             self.show_op_all_lands_panel(player, from_page)
             return
         
@@ -6488,7 +6815,11 @@ class ARCCorePlugin(Plugin):
         """OP 传送到领地（不扣费）"""
         tp_target_pos = self.get_land_teleport_point(land_id)
         if tp_target_pos is None:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "OP4",
+                f"op_teleport_to_land get_land_teleport_point None land_id={land_id!r}",
+                player,
+            )
             return
         self.server.scheduler.run_task(
             self,
@@ -6501,7 +6832,11 @@ class ARCCorePlugin(Plugin):
         """OP 确认设为公共领地面板"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "OP5",
+                f"show_op_confirm_set_land_public get_land_info empty land_id={land_id!r}",
+                player,
+            )
             self.show_op_all_lands_panel(player, from_page)
             return
         confirm_panel = ActionForm(
@@ -6532,7 +6867,11 @@ class ARCCorePlugin(Plugin):
         """OP 修改领地名称面板（用于公共领地等）"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "OP6",
+                f"show_op_rename_land_panel get_land_info empty land_id={land_id!r}",
+                player,
+            )
             self.show_op_all_lands_panel(player, from_page)
             return
         current_name = land_info['land_name']
@@ -6563,7 +6902,11 @@ class ARCCorePlugin(Plugin):
         """OP 领地授权管理面板（添加/移除授权玩家）"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "OP7",
+                f"show_op_land_auth_manage_panel get_land_info empty land_id={land_id!r}",
+                player,
+            )
             self.show_op_all_lands_panel(player, from_page)
             return
         auth_panel = ActionForm(
@@ -6639,7 +6982,11 @@ class ARCCorePlugin(Plugin):
         try:
             land_info = self.get_land_info(land_id)
             if not land_info:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "OP8",
+                    f"op_add_land_auth get_land_info empty land_id={land_id!r}",
+                    player,
+                )
                 self.show_op_land_auth_manage_panel(player, land_id, from_page)
                 return
             target_xuid = str(target_player.xuid)
@@ -6665,7 +7012,11 @@ class ARCCorePlugin(Plugin):
         try:
             land_info = self.get_land_info(land_id)
             if not land_info:
-                player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+                self.report_arc_error(
+                    "OP9",
+                    f"op_remove_land_auth get_land_info empty land_id={land_id!r}",
+                    player,
+                )
                 self.show_op_land_auth_manage_panel(player, land_id, from_page)
                 return
             if target_xuid not in land_info['shared_users']:
@@ -6691,7 +7042,11 @@ class ARCCorePlugin(Plugin):
         """OP 公共领地设置面板：开放互动/开放爆炸/开放生物互动/开放生物伤害"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "OP10",
+                f"show_op_public_land_settings_panel get_land_info empty land_id={land_id!r}",
+                player,
+            )
             self.show_op_all_lands_panel(player, from_page)
             return
         status_lines = []
@@ -6742,7 +7097,11 @@ class ARCCorePlugin(Plugin):
         """OP 公共领地单项设置切换面板"""
         land_info = self.get_land_info(land_id)
         if not land_info:
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "OP11",
+                f"show_op_public_land_toggle_panel get_land_info empty land_id={land_id!r} key={setting_key!r}",
+                player,
+            )
             self.show_op_all_lands_panel(player, from_page)
             return
         current = land_info.get(setting_key, False)
@@ -6812,7 +7171,12 @@ class ARCCorePlugin(Plugin):
             self.show_op_public_land_settings_panel(player, land_id, from_page)
         except Exception as e:
             self.logger.error(f"OP toggle land setting error: {str(e)}")
-            player.send_message(self.language_manager.GetText('SYSTEM_ERROR'))
+            self.report_arc_error(
+                "OP12",
+                f"op_toggle_land_setting exception land_id={land_id!r} setting_key={setting_key!r}",
+                player,
+                exception=e,
+            )
             self.show_op_public_land_settings_panel(player, land_id, from_page)
     
     # DTWT Plugin related functions
