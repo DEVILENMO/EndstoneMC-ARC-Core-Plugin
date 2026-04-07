@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import random
 import threading
 import time
 from datetime import datetime
@@ -10,7 +11,7 @@ from typing import Dict, Any, Optional, Set
 from endstone import ColorFormat, Player, GameMode
 from endstone.form import ActionForm, TextInput, ModalForm, Label
 from endstone.command import Command, CommandSender
-from endstone.event import event_handler, PlayerJoinEvent, PlayerQuitEvent, PlayerRespawnEvent, BlockBreakEvent, BlockPlaceEvent, PlayerDeathEvent, PlayerInteractEvent, ActorExplodeEvent, PlayerInteractActorEvent, ActorDamageEvent, PlayerChatEvent 
+from endstone.event import event_handler, PlayerJoinEvent, PlayerQuitEvent, PlayerRespawnEvent, BlockBreakEvent, BlockPlaceEvent, PlayerDeathEvent, PlayerInteractEvent, ActorExplodeEvent, PlayerInteractActorEvent, ActorDamageEvent, ActorDeathEvent, PlayerChatEvent 
 from endstone.plugin import Plugin
 
 from endstone_arc_core.DatabaseManager import DatabaseManager
@@ -20,7 +21,9 @@ from endstone_arc_core.SettingManager import SettingManager
 from endstone_arc_core.TeleportSystem import TeleportSystem, generate_tp_command_to_position
 from endstone_arc_core.LandSystem import LandSystem
 from endstone_arc_core.TitleSystem import TitleSystem
+from endstone_arc_core.AchievementSystem import AchievementSystem
 from endstone_arc_core.EntityDisplayNameManager import EntityDisplayNameManager
+from endstone_arc_core.KillRewardConfig import KillRewardConfig, normalize_entity_type_id
 
 MAIN_PATH = 'plugins/ARCCore'
 
@@ -108,8 +111,18 @@ class ARCCorePlugin(Plugin):
         self.teleport_system = TeleportSystem(self.database_manager, self.setting_manager)
         self.land_system = LandSystem(self.database_manager, self.setting_manager)
         self.title_system = TitleSystem(self.database_manager, self.setting_manager)
+        self.achievement_system = AchievementSystem(
+            self.database_manager,
+            self.title_system,
+            self.language_manager,
+            self.api_unlock_title,
+        )
         self.entity_display_name_manager = EntityDisplayNameManager(Path(MAIN_PATH), logger=None)
+        self.kill_reward_config = KillRewardConfig(Path(MAIN_PATH), logger=None)
         self.init_database()
+
+        # 首富头衔：缓存当前首富 xuid，避免每次都重复发放
+        self.current_richest_xuid = None
 
         self.if_protect_spawn = self.setting_manager.GetSetting('IF_PROTECT_SPAWN')
         if self.if_protect_spawn is None:
@@ -313,6 +326,7 @@ class ARCCorePlugin(Plugin):
         self.land_system.set_logger(self.logger)
         self.land_system.reload_config()
         self.entity_display_name_manager.logger = self.logger
+        self.kill_reward_config.logger = self.logger
 
         # 初始化公告系统和清道夫系统
         self._load_broadcast_messages()
@@ -340,6 +354,14 @@ class ARCCorePlugin(Plugin):
         # 别踩白块接入
         self.dtwt_plugin = self.server.plugin_manager.get_plugin('arc_dtwt')
         print('[ARC Core]DTWT plugin loaded:', self.dtwt_plugin is not None)
+
+        # 首富头衔：启动时做一次同步
+        try:
+            self._ensure_richest_title_definition()
+            self._load_current_richest_xuid_from_db()
+            self._update_richest_title_if_needed(force=True)
+        except Exception:
+            pass
 
     def on_disable(self) -> None:
         # 停止位置检测线程
@@ -587,6 +609,13 @@ class ARCCorePlugin(Plugin):
         if not self.spawn_protect_check(event.player, event.block.location.dimension.name,
                                     (event.block.location.x, event.block.location.y, event.block.location.z)):
             event.is_cancelled = True
+
+        if not event.is_cancelled:
+            try:
+                block_id = getattr(event.block, 'identifier', getattr(event.block, 'type', 'block'))
+                self.achievement_system.record_block_break(event.player, str(block_id))
+            except Exception:
+                pass
         return
 
     def _is_frame_block(self, block) -> bool:
@@ -613,7 +642,7 @@ class ARCCorePlugin(Plugin):
         return
     
     @event_handler
-    def on_actor_death(self, event: PlayerDeathEvent):
+    def on_player_death(self, event: PlayerDeathEvent):
         # 记录玩家死亡位置
         self.teleport_system.record_death_location(
             event.player.name,
@@ -824,6 +853,43 @@ class ARCCorePlugin(Plugin):
                 if owner_xuid != attacker_xuid and attacker_xuid not in shared_users:
                     event.is_cancelled = True
                     attacker.send_message(self.language_manager.GetText('LAND_ACTOR_DAMAGE_DENIED'))
+
+    @event_handler
+    def on_actor_death(self, event: ActorDeathEvent):
+        """统计玩家击杀生物：击杀总数 + 按生物类型击杀数。"""
+        try:
+            damage_source = getattr(event, "damage_source", None)
+            killer = getattr(damage_source, "actor", None) if damage_source is not None else None
+            if killer is None:
+                return
+            if getattr(killer, "type", None) != "minecraft:player":
+                return
+
+            dead_actor = getattr(event, "actor", None)
+            if dead_actor is None:
+                return
+            if getattr(dead_actor, "type", None) == "minecraft:player":
+                return
+
+            dead_type = getattr(dead_actor, "type", None) or getattr(dead_actor, "identifier", None) or ""
+            if not dead_type:
+                return
+
+            dead_type_key = normalize_entity_type_id(str(dead_type))
+            self.achievement_system.record_kill(killer, dead_type_key)
+
+            reward = self.kill_reward_config.get_reward_and_ensure_key(dead_type_key)
+            if reward > 0:
+                if self.increase_player_money_by_name(killer.name, reward, notify=False):
+                    display_name = self.entity_display_name_manager.get_display_name_for_entity_type(dead_type_key)
+                    killer.send_message(
+                        self.language_manager.GetText("KILL_REWARD_MESSAGE").format(
+                            display_name,
+                            self._format_money_display(reward),
+                        )
+                    )
+        except Exception:
+            return
 
     def _check_sub_land_permission(self, player: Player, sub_land_info: dict) -> bool:
         """检查玩家是否拥有子领地权限（主人或授权用户）"""
@@ -1059,6 +1125,117 @@ class ARCCorePlugin(Plugin):
         self.land_system.init_sub_land_table()
         self.teleport_system.init_teleport_tables()
         self.title_system.ensure_tables()
+        self.achievement_system.ensure_tables()
+        self._init_richest_title_state_table()
+
+    def _get_richest_title_name(self) -> str:
+        name = self.setting_manager.GetSetting("RICHEST_TITLE_NAME")
+        name = (str(name).strip() if name is not None else "").strip()
+        return name if name else "首富"
+
+    def _ensure_richest_title_definition(self) -> None:
+        richest_title_name = self._get_richest_title_name()
+        # 默认：传奇头衔，描述固定，奖励为空
+        self.title_system.set_title_definition(
+            richest_title_name,
+            "传奇",
+            "服务器里最富有玩家",
+            0.0,
+            [],
+        )
+
+    def _init_richest_title_state_table(self) -> None:
+        try:
+            self.database_manager.execute(
+                "CREATE TABLE IF NOT EXISTS richest_title_state (k TEXT PRIMARY KEY, v TEXT)"
+            )
+            self.database_manager.execute(
+                "INSERT OR IGNORE INTO richest_title_state (k, v) VALUES ('current_xuid', '')"
+            )
+        except Exception:
+            pass
+
+    def _load_current_richest_xuid_from_db(self) -> None:
+        try:
+            row = self.database_manager.query_one(
+                "SELECT v FROM richest_title_state WHERE k = 'current_xuid'"
+            )
+            v = (row.get("v") if row else "") or ""
+            v = str(v).strip()
+            self.current_richest_xuid = v if v else None
+        except Exception:
+            self.current_richest_xuid = None
+
+    def _save_current_richest_xuid_to_db(self, xuid: Optional[str]) -> None:
+        try:
+            v = (str(xuid).strip() if xuid else "")
+            self.database_manager.execute(
+                "UPDATE richest_title_state SET v = ? WHERE k = 'current_xuid'",
+                (v,),
+            )
+        except Exception:
+            pass
+
+    def _query_current_richest_xuid(self) -> Optional[str]:
+        """按配置决定是否隐藏 OP，然后查询财富榜第一名 xuid。"""
+        try:
+            if self.hide_op_in_money_ranking:
+                row = self.database_manager.query_one(
+                    "SELECT e.xuid, e.money "
+                    "FROM player_economy e "
+                    "LEFT JOIN player_basic_info b ON e.xuid = b.xuid "
+                    "WHERE (b.is_op IS NULL OR b.is_op = 0) "
+                    "ORDER BY e.money DESC LIMIT 1"
+                )
+            else:
+                row = self.database_manager.query_one(
+                    "SELECT xuid, money FROM player_economy ORDER BY money DESC LIMIT 1"
+                )
+            if not row or not row.get("xuid"):
+                return None
+            return str(row["xuid"]).strip()
+        except Exception:
+            return None
+
+    def _update_richest_title_if_needed(self, force: bool = False) -> None:
+        """金钱变化后调用：首富变化才迁移头衔；不变化则不做任何事。"""
+        richest_title_name = self._get_richest_title_name()
+        if not richest_title_name:
+            return
+
+        self._ensure_richest_title_definition()
+        new_richest_xuid = self._query_current_richest_xuid()
+        old_richest_xuid = self.current_richest_xuid
+
+        if not force and new_richest_xuid == old_richest_xuid:
+            return
+
+        # 旧首富移除头衔（并取消佩戴）
+        if old_richest_xuid:
+            try:
+                self.title_system.revoke_title_by_xuid(old_richest_xuid, richest_title_name)
+                old_name = self.get_player_name_by_xuid(old_richest_xuid)
+                if old_name:
+                    old_online = self.server.get_player(old_name)
+                    if old_online is not None:
+                        self._update_player_name_tag(old_online)
+            except Exception:
+                pass
+
+        # 新首富发放头衔（在线则走 api_unlock_title 以便自动佩戴逻辑；离线则仅写入解锁记录）
+        if new_richest_xuid:
+            try:
+                new_name = self.get_player_name_by_xuid(new_richest_xuid)
+                new_online = self.server.get_player(new_name) if new_name else None
+                if new_online is not None:
+                    self.api_unlock_title(new_online, richest_title_name)
+                else:
+                    self.title_system.unlock_title_by_xuid(new_richest_xuid, richest_title_name)
+            except Exception:
+                pass
+
+        self.current_richest_xuid = new_richest_xuid
+        self._save_current_richest_xuid_to_db(new_richest_xuid)
 
     # Player basic info
     def _column_exists(self, table: str, column: str) -> bool:
@@ -1130,6 +1307,10 @@ class ARCCorePlugin(Plugin):
             # 检查并添加 pending_invite_reward_times 列（待领取邀请奖励次数，默认为 0）
             if not self._add_column_if_not_exists('player_basic_info', 'pending_invite_reward_times', 'INTEGER DEFAULT 0'):
                 success = False
+
+            # 每日签到：上次签到日期（YYYY-MM-DD，空表示从未签到）
+            if not self._add_column_if_not_exists('player_basic_info', 'last_checkin_date', 'TEXT'):
+                success = False
             
             return success
         except Exception as e:
@@ -1150,7 +1331,8 @@ class ARCCorePlugin(Plugin):
             'is_op': 'INTEGER DEFAULT 0',  # 玩家是否为OP，默认为0(false)
             'remaining_free_land_blocks': f'INTEGER DEFAULT {default_free_blocks}',  # 剩余免费领地格子数
             'inviter_xuid': 'TEXT',  # 邀请人 XUID，允许为空
-            'pending_invite_reward_times': 'INTEGER DEFAULT 0'  # 待领取邀请奖励次数
+            'pending_invite_reward_times': 'INTEGER DEFAULT 0',  # 待领取邀请奖励次数
+            'last_checkin_date': 'TEXT'  # 上次签到日期 YYYY-MM-DD
         }
         result = self.database_manager.create_table('player_basic_info', fields)
         
@@ -1534,6 +1716,7 @@ class ARCCorePlugin(Plugin):
             arc_menu.add_button(self.language_manager.GetText('TELEPORT_MENU_NAME'), on_click=self.show_teleport_menu)
             arc_menu.add_button(self.language_manager.GetText('LAND_MENU_NAME'), on_click=self.show_land_main_menu)
             arc_menu.add_button(self.language_manager.GetText('MAIN_MENU_MY_INFO_NAME'), on_click=self.show_my_info_panel)
+            arc_menu.add_button(self.language_manager.GetText('CHECKIN_MENU_BUTTON'), on_click=self.show_daily_checkin_panel)
             if self.server.plugin_manager.get_plugin('ushop'):
                 arc_menu.add_button(self.language_manager.GetText('SHOP_MENU_NAME'), on_click=self.show_shop_menu)
             if self.server.plugin_manager.get_plugin('arc_button_shop'):
@@ -1699,9 +1882,21 @@ class ARCCorePlugin(Plugin):
 
     def api_unlock_title(self, player: Player, title: str) -> bool:
         """供其他插件调用的接口：为玩家解锁头衔，并发放解锁奖励（若在线）。"""
+        equipped_before = None
+        try:
+            equipped_before = self.title_system.get_equipped_title(player)
+        except Exception:
+            equipped_before = None
         ok = self.title_system.unlock_title(player, title)
         if ok:
             self._grant_title_unlock_reward(player, title)
+            # 若玩家当前未佩戴任何头衔，则自动佩戴刚解锁的头衔
+            if not equipped_before:
+                try:
+                    self.title_system.set_equipped_title(player, title)
+                    self._update_player_name_tag(player)
+                except Exception:
+                    pass
         return ok
 
     def _grant_title_unlock_reward(self, player: Player, title: str) -> None:
@@ -1959,7 +2154,13 @@ class ARCCorePlugin(Plugin):
             if self.logger:
                 self.logger.error(f"{ColorFormat.RED}[ARC Core]Player {player_name} not found")
             return False
-        return self.economy.set_player_money_by_xuid(player_xuid, amount)
+        success = self.economy.set_player_money_by_xuid(player_xuid, amount)
+        if success:
+            try:
+                self._update_richest_title_if_needed()
+            except Exception:
+                pass
+        return success
 
     def _set_player_money(self, player: Player, amount: float) -> bool:
         return self._set_player_money_by_name(player.name, amount)
@@ -1986,6 +2187,11 @@ class ARCCorePlugin(Plugin):
                         self._format_money_display(new_money)
                     )
                 )
+        if success:
+            try:
+                self._update_richest_title_if_needed()
+            except Exception:
+                pass
         return success
 
     def decrease_player_money_by_name(self, player_name: str, amount: float, notify: bool = True) -> bool:
@@ -2003,6 +2209,11 @@ class ARCCorePlugin(Plugin):
                         self._format_money_display(new_money)
                     )
                 )
+        if success:
+            try:
+                self._update_richest_title_if_needed()
+            except Exception:
+                pass
         return success
 
     def change_player_money_by_name(self, player_name: str, money_to_change: float, notify: bool = True) -> bool:
@@ -2018,6 +2229,226 @@ class ARCCorePlugin(Plugin):
 
     def decrease_player_money(self, player: Player, amount: float) -> bool:
         return self.decrease_player_money_by_name(player.name, amount)
+
+    def _today_checkin_date_str(self) -> str:
+        return datetime.now().date().isoformat()
+
+    def _parse_checkin_reward_list_raw(self, raw: Optional[str]) -> list:
+        """解析配置中的 CHECKIN_REWARD_LIST（JSON 数组），每项 [物品ID, 数量, 权重]。"""
+        if raw is None or not str(raw).strip():
+            return []
+        try:
+            data = json.loads(str(raw).strip())
+        except Exception:
+            return []
+        if not isinstance(data, list):
+            return []
+        result = []
+        for row in data:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            item_id = str(row[0]).strip()
+            try:
+                item_count = int(row[1])
+            except (ValueError, TypeError):
+                continue
+            try:
+                weight = int(row[2])
+            except (ValueError, TypeError):
+                continue
+            if not item_id or item_count <= 0 or weight <= 0:
+                continue
+            result.append({"item_id": item_id, "item_count": item_count, "weight": weight})
+        return result
+
+    def get_checkin_config(self) -> Dict[str, Any]:
+        raw_money = self.setting_manager.GetSetting("CHECKIN_DAILY_MONEY")
+        try:
+            daily_money = float(raw_money)
+        except (ValueError, TypeError):
+            daily_money = 0.0
+        daily_money = self._round_money(daily_money)
+
+        raw_pick = self.setting_manager.GetSetting("CHECKIN_REWARD_PICK_COUNT")
+        try:
+            pick_count = int(raw_pick)
+        except (ValueError, TypeError):
+            pick_count = 0
+        if pick_count < 0:
+            pick_count = 0
+
+        reward_list = self._parse_checkin_reward_list_raw(self.setting_manager.GetSetting("CHECKIN_REWARD_LIST"))
+        return {"daily_money": daily_money, "pick_count": pick_count, "reward_list": reward_list}
+
+    @staticmethod
+    def _weighted_sample_checkin_rewards(entries: list, pick_count: int) -> list:
+        """按权重不放回抽取若干条奖励配置。"""
+        pool = [e for e in entries if int(e.get("weight", 0) or 0) > 0]
+        if not pool or pick_count <= 0:
+            return []
+        k = min(int(pick_count), len(pool))
+        chosen = []
+        for _ in range(k):
+            total_w = sum(int(x["weight"]) for x in pool)
+            if total_w <= 0:
+                break
+            r = random.uniform(0, total_w)
+            acc = 0.0
+            pick_idx = 0
+            for i, x in enumerate(pool):
+                acc += int(x["weight"])
+                if r <= acc:
+                    pick_idx = i
+                    break
+            chosen.append(pool.pop(pick_idx))
+        return chosen
+
+    def show_daily_checkin_panel(self, player: Player):
+        """每日签到：同一天仅一次，发放配置中的金钱与加权随机物品。"""
+        if not self.if_player_logined(player):
+            self.show_main_menu(player)
+            return
+        player_xuid = str(player.xuid)
+        today = self._today_checkin_date_str()
+        row = self.database_manager.query_one(
+            "SELECT last_checkin_date FROM player_basic_info WHERE xuid = ?",
+            (player_xuid,),
+        )
+        last_date = (row.get("last_checkin_date") if row else None) or ""
+        last_date = str(last_date).strip()
+        if last_date == today:
+            panel = ActionForm(
+                title=self.language_manager.GetText("CHECKIN_PANEL_TITLE"),
+                content=self.language_manager.GetText("CHECKIN_ALREADY_DONE"),
+                on_close=self.show_main_menu,
+            )
+            panel.add_button(self.language_manager.GetText("RETURN_BUTTON_TEXT"), on_click=self.show_main_menu)
+            player.send_form(panel)
+            return
+
+        cfg = self.get_checkin_config()
+        daily_money = cfg["daily_money"]
+        pick_count = cfg["pick_count"]
+        reward_list = cfg["reward_list"]
+        picked = self._weighted_sample_checkin_rewards(reward_list, pick_count)
+
+        if daily_money > 0:
+            self.increase_player_money(player, daily_money)
+
+        item_lines = []
+        for it in picked:
+            item_id = it["item_id"]
+            cnt = int(it["item_count"])
+            if cnt <= 0:
+                continue
+            try:
+                self.server.dispatch_command(
+                    self.server.command_sender, f"give {player.name} {item_id} {cnt}"
+                )
+            except Exception:
+                pass
+            item_lines.append(f"{item_id} x{cnt}")
+
+        ok = self.database_manager.update(
+            table="player_basic_info",
+            data={"last_checkin_date": today},
+            where="xuid = ?",
+            params=(player_xuid,),
+        )
+        if not ok:
+            player.send_message(self.language_manager.GetText("SYSTEM_ERROR"))
+
+        if daily_money > 0:
+            money_line = self.language_manager.GetText("CHECKIN_SUCCESS_MONEY_LINE").format(
+                self._format_money_display(daily_money)
+            )
+        else:
+            money_line = self.language_manager.GetText("CHECKIN_SUCCESS_NO_MONEY_LINE")
+        items_text = "、".join(item_lines) if item_lines else self.language_manager.GetText("CHECKIN_NO_ITEM_REWARD")
+        content = self.language_manager.GetText("CHECKIN_SUCCESS_CONTENT").format(money_line, items_text)
+
+        result_panel = ActionForm(
+            title=self.language_manager.GetText("CHECKIN_PANEL_TITLE"),
+            content=content,
+            on_close=self.show_main_menu,
+        )
+        result_panel.add_button(self.language_manager.GetText("RETURN_BUTTON_TEXT"), on_click=self.show_main_menu)
+        player.send_form(result_panel)
+
+    def show_checkin_config_panel(self, player: Player):
+        """OP：配置每日签到金钱、随机条数、奖励池 JSON。"""
+        cfg = self.get_checkin_config()
+        reward_list_json = json.dumps(
+            [
+                [e["item_id"], e["item_count"], e["weight"]]
+                for e in cfg["reward_list"]
+            ],
+            ensure_ascii=False,
+        )
+        money_input = TextInput(
+            label=self.language_manager.GetText("CHECKIN_CONFIG_MONEY_LABEL"),
+            placeholder="0",
+            default_value=str(cfg["daily_money"]),
+        )
+        pick_input = TextInput(
+            label=self.language_manager.GetText("CHECKIN_CONFIG_PICK_LABEL"),
+            placeholder="0",
+            default_value=str(cfg["pick_count"]),
+        )
+        list_input = TextInput(
+            label=self.language_manager.GetText("CHECKIN_CONFIG_LIST_LABEL"),
+            placeholder='[["minecraft:diamond",1,1],["minecraft:iron_ingot",3,5]]',
+            default_value=reward_list_json,
+        )
+
+        def try_save(p: Player, json_str: str):
+            try:
+                data = json.loads(json_str)
+            except Exception:
+                p.send_message(self.language_manager.GetText("CHECKIN_CONFIG_SAVE_FAIL"))
+                return self.show_op_main_panel(p)
+            if not data or len(data) < 3:
+                p.send_message(self.language_manager.GetText("CHECKIN_CONFIG_SAVE_FAIL"))
+                return self.show_op_main_panel(p)
+            try:
+                money_v = self._round_money(float(str(data[0]).strip()))
+            except (ValueError, TypeError):
+                money_v = 0.0
+            try:
+                pick_v = int(str(data[1]).strip())
+            except (ValueError, TypeError):
+                pick_v = 0
+            if pick_v < 0:
+                pick_v = 0
+            list_raw = str(data[2]).strip()
+            parsed = self._parse_checkin_reward_list_raw(list_raw)
+            if pick_v > 0 and not parsed:
+                p.send_message(self.language_manager.GetText("CHECKIN_CONFIG_LIST_INVALID"))
+                return self.show_op_main_panel(p)
+
+            self.setting_manager.SetSetting("CHECKIN_DAILY_MONEY", money_v)
+            self.setting_manager.SetSetting("CHECKIN_REWARD_PICK_COUNT", pick_v)
+            normalized_list = json.dumps(
+                [[e["item_id"], e["item_count"], e["weight"]] for e in parsed],
+                ensure_ascii=False,
+            )
+            self.setting_manager.SetSetting("CHECKIN_REWARD_LIST", normalized_list if parsed else "[]")
+
+            panel = ActionForm(
+                title=self.language_manager.GetText("CHECKIN_CONFIG_TITLE"),
+                content=self.language_manager.GetText("CHECKIN_CONFIG_SAVED"),
+                on_close=self.show_op_main_panel,
+            )
+            panel.add_button(self.language_manager.GetText("RETURN_BUTTON_TEXT"), on_click=self.show_op_main_panel)
+            p.send_form(panel)
+
+        form = ModalForm(
+            title=self.language_manager.GetText("CHECKIN_CONFIG_TITLE"),
+            controls=[money_input, pick_input, list_input],
+            on_close=self.show_op_main_panel,
+            on_submit=try_save,
+        )
+        player.send_form(form)
 
     def get_player_free_land_blocks(self, player: Player) -> int:
         """获取玩家剩余免费领地格子数"""
@@ -2421,9 +2852,6 @@ class ARCCorePlugin(Plugin):
             player_request_text = self.language_manager.GetText('TELEPORT_BUTTON_WITH_COST').format(player_request_text, self.teleport_system.teleport_cost_player)
         teleport_main_menu.add_button(player_request_text, on_click=self.show_player_teleport_request_menu)
         
-        if player.is_op:
-            teleport_main_menu.add_button(self.language_manager.GetText('TELEPORT_MAIN_MENU_OP_MANAGE_WARP_BUTTON'),
-                                          on_click=self.show_op_warp_manage_menu)
         # 返回
         teleport_main_menu.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
                                       on_click=self.show_main_menu)
@@ -3036,13 +3464,164 @@ class ARCCorePlugin(Plugin):
                 player.send_message(self.language_manager.GetText('TPHERE_REQUEST_DENIED_BY_YOU').format(sender.name))
         self.teleport_system.remove_request(player.name)
 
+    def show_op_teleport_manage_panel(self, player: Player):
+        """OP 传送管理：公共传送点与传送相关配置。"""
+        panel = ActionForm(
+            title=self.language_manager.GetText('OP_TELEPORT_MANAGE_TITLE'),
+            content=self.language_manager.GetText('OP_TELEPORT_MANAGE_CONTENT'),
+            on_close=self.show_op_main_panel,
+        )
+        panel.add_button(
+            self.language_manager.GetText('OP_TELEPORT_MANAGE_WARP_BUTTON'),
+            on_click=self.show_op_warp_manage_menu,
+        )
+        panel.add_button(
+            self.language_manager.GetText('OP_TELEPORT_MANAGE_SETTINGS_BUTTON'),
+            on_click=self.show_op_teleport_settings_panel,
+        )
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_main_panel)
+        player.send_form(panel)
+
+    def show_op_teleport_settings_panel(self, player: Player):
+        """OP 编辑 core_setting 中与传送相关的参数并立即重载 TeleportSystem。"""
+        ts = self.teleport_system
+
+        def _raw(key: str, fallback: str) -> str:
+            v = self.setting_manager.GetSetting(key)
+            if v is None or str(v).strip() == "":
+                return fallback
+            return str(v).strip()
+
+        in_max_home = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_MAX_HOME_LABEL'),
+            placeholder="5",
+            default_value=_raw("MAX_PLAYER_HOME_NUM", str(ts.max_player_home_num)),
+        )
+        in_enable_random = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_ENABLE_RANDOM_LABEL'),
+            placeholder="true / false",
+            default_value="true" if ts.enable_random_teleport else "false",
+        )
+        in_cx = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_CENTER_X_LABEL'),
+            placeholder="0",
+            default_value=_raw("RANDOM_TELEPORT_CENTER_X", str(ts.random_teleport_center_x)),
+        )
+        in_cz = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_CENTER_Z_LABEL'),
+            placeholder="0",
+            default_value=_raw("RANDOM_TELEPORT_CENTER_Z", str(ts.random_teleport_center_z)),
+        )
+        in_radius = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_RADIUS_LABEL'),
+            placeholder="4096",
+            default_value=_raw("RANDOM_TELEPORT_RADIUS", str(ts.random_teleport_radius)),
+        )
+        in_cost_warp = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_COST_PUBLIC_WARP_LABEL'),
+            placeholder="0",
+            default_value=_raw("TELEPORT_COST_PUBLIC_WARP", str(ts.teleport_cost_public_warp)),
+        )
+        in_cost_home = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_COST_HOME_LABEL'),
+            placeholder="0",
+            default_value=_raw("TELEPORT_COST_HOME", str(ts.teleport_cost_home)),
+        )
+        in_cost_land = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_COST_LAND_LABEL'),
+            placeholder="0",
+            default_value=_raw("TELEPORT_COST_LAND", str(ts.teleport_cost_land)),
+        )
+        in_cost_death = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_COST_DEATH_LABEL'),
+            placeholder="0",
+            default_value=_raw("TELEPORT_COST_DEATH_LOCATION", str(ts.teleport_cost_death_location)),
+        )
+        in_cost_random = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_COST_RANDOM_LABEL'),
+            placeholder="0",
+            default_value=_raw("TELEPORT_COST_RANDOM", str(ts.teleport_cost_random)),
+        )
+        in_cost_player = TextInput(
+            label=self.language_manager.GetText('OP_TELEPORT_SET_COST_PLAYER_LABEL'),
+            placeholder="0",
+            default_value=_raw("TELEPORT_COST_PLAYER", str(ts.teleport_cost_player)),
+        )
+
+        def try_save(p: Player, json_str: str):
+            try:
+                data = json.loads(json_str)
+            except Exception:
+                p.send_message(self.language_manager.GetText('OP_TELEPORT_SETTINGS_SAVE_FAIL'))
+                return self.show_op_teleport_manage_panel(p)
+            if not data or len(data) < 11:
+                p.send_message(self.language_manager.GetText('OP_TELEPORT_SETTINGS_SAVE_FAIL'))
+                return self.show_op_teleport_manage_panel(p)
+
+            def parse_int_safe(raw_value: str, default_value: int) -> int:
+                try:
+                    return int(str(raw_value).strip())
+                except (ValueError, TypeError):
+                    return default_value
+
+            max_home = parse_int_safe(data[0], ts.max_player_home_num)
+            enable_raw = str(data[1]).strip().lower()
+            enable_random = enable_raw in ("true", "1", "yes", "on")
+            cx = parse_int_safe(data[2], ts.random_teleport_center_x)
+            cz = parse_int_safe(data[3], ts.random_teleport_center_z)
+            radius = parse_int_safe(data[4], ts.random_teleport_radius)
+            if radius < 0:
+                radius = 0
+
+            self.setting_manager.SetSetting("MAX_PLAYER_HOME_NUM", max_home)
+            self.setting_manager.SetSetting("ENABLE_RANDOM_TELEPORT", "true" if enable_random else "false")
+            self.setting_manager.SetSetting("RANDOM_TELEPORT_CENTER_X", cx)
+            self.setting_manager.SetSetting("RANDOM_TELEPORT_CENTER_Z", cz)
+            self.setting_manager.SetSetting("RANDOM_TELEPORT_RADIUS", radius)
+            self.setting_manager.SetSetting("TELEPORT_COST_PUBLIC_WARP", parse_int_safe(data[5], ts.teleport_cost_public_warp))
+            self.setting_manager.SetSetting("TELEPORT_COST_HOME", parse_int_safe(data[6], ts.teleport_cost_home))
+            self.setting_manager.SetSetting("TELEPORT_COST_LAND", parse_int_safe(data[7], ts.teleport_cost_land))
+            self.setting_manager.SetSetting("TELEPORT_COST_DEATH_LOCATION", parse_int_safe(data[8], ts.teleport_cost_death_location))
+            self.setting_manager.SetSetting("TELEPORT_COST_RANDOM", parse_int_safe(data[9], ts.teleport_cost_random))
+            self.setting_manager.SetSetting("TELEPORT_COST_PLAYER", parse_int_safe(data[10], ts.teleport_cost_player))
+
+            self.teleport_system.reload_config()
+
+            result = ActionForm(
+                title=self.language_manager.GetText('OP_TELEPORT_SETTINGS_TITLE'),
+                content=self.language_manager.GetText('OP_TELEPORT_SETTINGS_SAVED'),
+                on_close=self.show_op_teleport_manage_panel,
+            )
+            result.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_teleport_manage_panel)
+            p.send_form(result)
+
+        form = ModalForm(
+            title=self.language_manager.GetText('OP_TELEPORT_SETTINGS_TITLE'),
+            controls=[
+                in_max_home,
+                in_enable_random,
+                in_cx,
+                in_cz,
+                in_radius,
+                in_cost_warp,
+                in_cost_home,
+                in_cost_land,
+                in_cost_death,
+                in_cost_random,
+                in_cost_player,
+            ],
+            on_close=self.show_op_teleport_manage_panel,
+            on_submit=try_save,
+        )
+        player.send_form(form)
+
     # OP Warp Management
     def show_op_warp_manage_menu(self, player: Player):
         """显示OP传送点管理菜单"""
         warp_manage_menu = ActionForm(
             title=self.language_manager.GetText('OP_WARP_MANAGE_MENU_TITLE'),
             content=self.language_manager.GetText('OP_WARP_MANAGE_MENU_CONTENT'),
-            on_close=self.show_teleport_menu
+            on_close=self.show_op_teleport_manage_panel
         )
         
         warp_manage_menu.add_button(
@@ -4565,40 +5144,306 @@ class ARCCorePlugin(Plugin):
     # ─── End Sub-land UI ─────────────────────────────────────────────────────────
 
     # OP Panel
+    def show_op_land_manage_panel(self, player: Player):
+        """OP 领地管理二级菜单。"""
+        panel = ActionForm(
+            title=self.language_manager.GetText('OP_LAND_MANAGE_TITLE'),
+            content=self.language_manager.GetText('OP_LAND_MANAGE_CONTENT'),
+            on_close=self.show_op_main_panel,
+        )
+        panel.add_button(
+            self.language_manager.GetText('OP_PANEL_MANAGE_ALL_LANDS'),
+            on_click=self.show_op_all_lands_panel,
+        )
+        panel.add_button(
+            self.language_manager.GetText('OP_PANEL_MANAGE_LAND_AT_POS'),
+            on_click=self.show_op_land_at_pos,
+        )
+        panel.add_button(
+            self.language_manager.GetText('OP_PANEL_REBUILD_CHUNK_MAPPING'),
+            on_click=self.show_op_rebuild_chunk_mapping_confirm,
+        )
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_main_panel)
+        player.send_form(panel)
+
+    def show_op_tools_panel(self, player: Player):
+        """OP 工具二级菜单。"""
+        panel = ActionForm(
+            title=self.language_manager.GetText('OP_TOOLS_TITLE'),
+            content=self.language_manager.GetText('OP_TOOLS_CONTENT'),
+            on_close=self.show_op_main_panel,
+        )
+        panel.add_button(
+            self.language_manager.GetText('OP_PANEL_SWITCH_GAME_MODE'),
+            on_click=self.switch_player_game_mode,
+        )
+        panel.add_button(self.language_manager.GetText('CLEAR_DROP_ITEM'), on_click=self.clear_drop_item)
+        panel.add_button(self.language_manager.GetText('RECORD_COOR_1'), on_click=self.record_coordinate_1)
+        panel.add_button(self.language_manager.GetText('RECORD_COOR_2'), on_click=self.record_coordinate_2)
+        debug_btn_text = (
+            self.language_manager.GetText('OP_DEBUG_MODE_BUTTON_ON')
+            if player.name in self.op_debug_mode
+            else self.language_manager.GetText('OP_DEBUG_MODE_BUTTON_OFF')
+        )
+        panel.add_button(debug_btn_text, on_click=self.toggle_op_debug_mode)
+        panel.add_button(self.language_manager.GetText('RUN_COMMAND'), on_click=self.run_command_as_self)
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_main_panel)
+        player.send_form(panel)
+
     def show_op_main_panel(self, player: Player):
         op_main_panel = ActionForm(
             title=self.language_manager.GetText('OP_PANEL_TITLE')
         )
-        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_SWITCH_GAME_MODE'),
-                                 on_click=self.switch_player_game_mode)
-        op_main_panel.add_button(self.language_manager.GetText('CLEAR_DROP_ITEM'),
-                                 on_click=self.clear_drop_item)
-        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_MONEY_MANAGE'),
-                                 on_click=self.show_money_manage_menu)
-        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_MANAGE_ALL_LANDS'),
-                                 on_click=self.show_op_all_lands_panel)
-        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_MANAGE_LAND_AT_POS'),
-                                 on_click=self.show_op_land_at_pos)
-        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_REBUILD_CHUNK_MAPPING'),
-                                 on_click=self.show_op_rebuild_chunk_mapping_confirm)
+        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_RELOAD_CONFIG_BUTTON'),
+                                 on_click=self.op_reload_config)
+        op_main_panel.add_button(self.language_manager.GetText('OP_TOOLS_ENTRY'),
+                                 on_click=self.show_op_tools_panel)
+        op_main_panel.add_button(self.language_manager.GetText('OP_ECONOMY_MANAGE_ENTRY'),
+                                 on_click=self.show_economy_manage_panel)
+        op_main_panel.add_button(self.language_manager.GetText('OP_LAND_MANAGE_ENTRY'),
+                                 on_click=self.show_op_land_manage_panel)
+        op_main_panel.add_button(self.language_manager.GetText('OP_TELEPORT_MANAGE_ENTRY'),
+                                 on_click=self.show_op_teleport_manage_panel)
+        op_main_panel.add_button(self.language_manager.GetText('OP_ACHIEVEMENT_MANAGE_BUTTON'),
+                                 on_click=self.show_op_achievement_manage_panel)
+        op_main_panel.add_button(self.language_manager.GetText('CHECKIN_CONFIG_OP_BUTTON'),
+                                 on_click=self.show_checkin_config_panel)
         op_main_panel.add_button(self.language_manager.GetText('INVITE_REWARD_CONFIG_BUTTON'),
                                  on_click=self.show_invite_reward_config_panel)
         op_main_panel.add_button(self.language_manager.GetText('OP_TITLE_MANAGE_BUTTON'),
                                  on_click=self.show_op_title_manage_panel)
-        op_main_panel.add_button(self.language_manager.GetText('OP_PANEL_RELOAD_CONFIG_BUTTON'),
-                                 on_click=self.op_reload_config)
-        op_main_panel.add_button(self.language_manager.GetText('RECORD_COOR_1'),
-                                 on_click=self.record_coordinate_1)
-        op_main_panel.add_button(self.language_manager.GetText('RECORD_COOR_2'),
-                                 on_click=self.record_coordinate_2)
-        debug_btn_text = self.language_manager.GetText('OP_DEBUG_MODE_BUTTON_ON') if player.name in self.op_debug_mode else self.language_manager.GetText('OP_DEBUG_MODE_BUTTON_OFF')
-        op_main_panel.add_button(debug_btn_text, on_click=self.toggle_op_debug_mode)
-        op_main_panel.add_button(self.language_manager.GetText('RUN_COMMAND'),
-                                 on_click=self.run_command_as_self)
         # 返回
         op_main_panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
                                   on_click=self.show_main_menu)
         player.send_form(op_main_panel)
+
+    def show_op_achievement_manage_panel(self, player: Player):
+        """OP 成就管理：列表 / 创建 / 返回。"""
+        panel = ActionForm(
+            title=self.language_manager.GetText("OP_ACHIEVEMENT_PANEL_TITLE"),
+            content=self.language_manager.GetText("OP_ACHIEVEMENT_PANEL_CONTENT"),
+            on_close=self.show_op_main_panel,
+        )
+        panel.add_button(self.language_manager.GetText("OP_ACHIEVEMENT_CREATE_BUTTON"),
+                         on_click=self.show_op_achievement_create_panel)
+        panel.add_button(self.language_manager.GetText("OP_ACHIEVEMENT_LIST_BUTTON"),
+                         on_click=self.show_op_achievement_list_panel)
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+                         on_click=self.show_op_main_panel)
+        player.send_form(panel)
+
+    def show_op_achievement_list_panel(self, player: Player):
+        defs = self.achievement_system.list_definitions()
+        if not defs:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_EMPTY_HINT"))
+            return self.show_op_achievement_manage_panel(player)
+
+        panel = ActionForm(
+            title=self.language_manager.GetText("OP_ACHIEVEMENT_LIST_TITLE"),
+            content=self.language_manager.GetText("OP_ACHIEVEMENT_LIST_CONTENT"),
+            on_close=self.show_op_achievement_manage_panel,
+        )
+        for d in defs:
+            achievement_id = d.get("id")
+            name = d.get("name") or ""
+            stat_key = d.get("stat_key") or ""
+            required_count = d.get("required_count") or 0
+            unlock_title = d.get("unlock_title") or ""
+            enabled = int(d.get("enabled") or 0) == 1
+            status = "§aON§r" if enabled else "§cOFF§r"
+            label = f"{status} #{achievement_id} {name}\n{stat_key} >= {required_count} -> {unlock_title}"
+            panel.add_button(label, on_click=lambda p, a_id=achievement_id: self.show_op_achievement_edit_panel(p, a_id))
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+                         on_click=self.show_op_achievement_manage_panel)
+        player.send_form(panel)
+
+    def show_op_achievement_create_panel(self, player: Player):
+        """创建成就：name / stat_key / required_count / unlock_title / enabled(0/1)。"""
+        name_input = TextInput(
+            label=self.language_manager.GetText("OP_ACHIEVEMENT_FIELD_NAME"),
+            placeholder="例如：屠夫成就",
+            default_value="",
+        )
+        stat_key_input = TextInput(
+            label=self.language_manager.GetText("OP_ACHIEVEMENT_FIELD_STAT_KEY"),
+            placeholder="kill_total | kill:minecraft:zombie | block_break_total | block_break:minecraft:stone",
+            default_value="kill_total",
+        )
+        required_input = TextInput(
+            label=self.language_manager.GetText("OP_ACHIEVEMENT_FIELD_REQUIRED"),
+            placeholder="例如：100",
+            default_value="100",
+        )
+        title_input = TextInput(
+            label=self.language_manager.GetText("OP_ACHIEVEMENT_FIELD_UNLOCK_TITLE"),
+            placeholder="例如：屠夫",
+            default_value="",
+        )
+        enabled_input = TextInput(
+            label=self.language_manager.GetText("OP_ACHIEVEMENT_FIELD_ENABLED"),
+            placeholder="1=启用 0=禁用",
+            default_value="1",
+        )
+
+        form = ModalForm(
+            title=self.language_manager.GetText("OP_ACHIEVEMENT_CREATE_TITLE"),
+            controls=[name_input, stat_key_input, required_input, title_input, enabled_input],
+            on_close=self.show_op_achievement_manage_panel,
+            on_submit=self._do_op_achievement_create,
+        )
+        player.send_form(form)
+
+    def _do_op_achievement_create(self, player: Player, json_str: str):
+        try:
+            data = json.loads(json_str)
+        except Exception:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_SAVE_FAIL"))
+            return self.show_op_achievement_manage_panel(player)
+
+        if not data or len(data) < 5:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_SAVE_FAIL"))
+            return self.show_op_achievement_manage_panel(player)
+
+        name = str(data[0] or "").strip()
+        stat_key = str(data[1] or "").strip()
+        required_count = data[2]
+        unlock_title = str(data[3] or "").strip()
+        enabled = str(data[4] or "1").strip() not in ["0", "false", "False", "off", "OFF"]
+
+        try:
+            required_count_int = int(required_count)
+        except Exception:
+            required_count_int = 0
+
+        ok = self.achievement_system.upsert_definition(
+            name=name,
+            stat_key=stat_key,
+            required_count=required_count_int,
+            unlock_title=unlock_title,
+            enabled=enabled,
+            achievement_id=None,
+        )
+        if ok:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_SAVE_SUCCESS"))
+        else:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_SAVE_FAIL"))
+        self.show_op_achievement_manage_panel(player)
+
+    def show_op_achievement_edit_panel(self, player: Player, achievement_id: int):
+        d = self.achievement_system.get_definition(achievement_id)
+        if not d:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_NOT_FOUND"))
+            return self.show_op_achievement_list_panel(player)
+
+        name = (d.get("name") or "").strip()
+        stat_key = (d.get("stat_key") or "").strip()
+        required_count = int(d.get("required_count") or 0)
+        unlock_title = (d.get("unlock_title") or "").strip()
+        enabled = int(d.get("enabled") or 0) == 1
+
+        panel = ActionForm(
+            title=self.language_manager.GetText("OP_ACHIEVEMENT_EDIT_TITLE").format(achievement_id),
+            content=f"{name}\n{stat_key} >= {required_count} -> {unlock_title}\n" + (self.language_manager.GetText("OP_ACHIEVEMENT_STATUS_ON") if enabled else self.language_manager.GetText("OP_ACHIEVEMENT_STATUS_OFF")),
+            on_close=self.show_op_achievement_list_panel,
+        )
+        panel.add_button(self.language_manager.GetText("OP_ACHIEVEMENT_EDIT_FIELDS_BUTTON"),
+                         on_click=lambda p, a_id=achievement_id: self._show_op_achievement_edit_modal(p, a_id))
+        toggle_text = self.language_manager.GetText("OP_ACHIEVEMENT_DISABLE_BUTTON") if enabled else self.language_manager.GetText("OP_ACHIEVEMENT_ENABLE_BUTTON")
+        panel.add_button(toggle_text, on_click=lambda p, a_id=achievement_id, en=enabled: self._do_op_achievement_toggle(p, a_id, not en))
+        panel.add_button(self.language_manager.GetText("OP_ACHIEVEMENT_DELETE_BUTTON"),
+                         on_click=lambda p, a_id=achievement_id: self._do_op_achievement_delete(p, a_id))
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
+                         on_click=self.show_op_achievement_list_panel)
+        player.send_form(panel)
+
+    def _show_op_achievement_edit_modal(self, player: Player, achievement_id: int):
+        d = self.achievement_system.get_definition(achievement_id)
+        if not d:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_NOT_FOUND"))
+            return self.show_op_achievement_list_panel(player)
+
+        name_input = TextInput(
+            label=self.language_manager.GetText("OP_ACHIEVEMENT_FIELD_NAME"),
+            placeholder="",
+            default_value=str(d.get("name") or ""),
+        )
+        stat_key_input = TextInput(
+            label=self.language_manager.GetText("OP_ACHIEVEMENT_FIELD_STAT_KEY"),
+            placeholder="kill_total | kill:minecraft:zombie | block_break_total | block_break:minecraft:stone",
+            default_value=str(d.get("stat_key") or ""),
+        )
+        required_input = TextInput(
+            label=self.language_manager.GetText("OP_ACHIEVEMENT_FIELD_REQUIRED"),
+            placeholder="",
+            default_value=str(int(d.get("required_count") or 0)),
+        )
+        title_input = TextInput(
+            label=self.language_manager.GetText("OP_ACHIEVEMENT_FIELD_UNLOCK_TITLE"),
+            placeholder="",
+            default_value=str(d.get("unlock_title") or ""),
+        )
+        enabled_input = TextInput(
+            label=self.language_manager.GetText("OP_ACHIEVEMENT_FIELD_ENABLED"),
+            placeholder="1=启用 0=禁用",
+            default_value="1" if int(d.get("enabled") or 0) == 1 else "0",
+        )
+        form = ModalForm(
+            title=self.language_manager.GetText("OP_ACHIEVEMENT_EDIT_MODAL_TITLE").format(achievement_id),
+            controls=[name_input, stat_key_input, required_input, title_input, enabled_input],
+            on_close=self.show_op_achievement_edit_panel,
+            on_submit=lambda p, json_str: self._do_op_achievement_save_edit(p, json_str, achievement_id),
+        )
+        player.send_form(form)
+
+    def _do_op_achievement_save_edit(self, player: Player, json_str: str, achievement_id: int):
+        try:
+            data = json.loads(json_str)
+        except Exception:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_SAVE_FAIL"))
+            return self.show_op_achievement_edit_panel(player, achievement_id)
+
+        if not data or len(data) < 5:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_SAVE_FAIL"))
+            return self.show_op_achievement_edit_panel(player, achievement_id)
+
+        name = str(data[0] or "").strip()
+        stat_key = str(data[1] or "").strip()
+        try:
+            required_count_int = int(data[2])
+        except Exception:
+            required_count_int = 0
+        unlock_title = str(data[3] or "").strip()
+        enabled = str(data[4] or "1").strip() not in ["0", "false", "False", "off", "OFF"]
+
+        ok = self.achievement_system.upsert_definition(
+            name=name,
+            stat_key=stat_key,
+            required_count=required_count_int,
+            unlock_title=unlock_title,
+            enabled=enabled,
+            achievement_id=int(achievement_id),
+        )
+        if ok:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_SAVE_SUCCESS"))
+        else:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_SAVE_FAIL"))
+        self.show_op_achievement_edit_panel(player, achievement_id)
+
+    def _do_op_achievement_toggle(self, player: Player, achievement_id: int, enabled: bool):
+        ok = self.achievement_system.set_enabled(int(achievement_id), bool(enabled))
+        if ok:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_SAVE_SUCCESS"))
+        else:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_SAVE_FAIL"))
+        self.show_op_achievement_edit_panel(player, achievement_id)
+
+    def _do_op_achievement_delete(self, player: Player, achievement_id: int):
+        ok = self.achievement_system.delete_definition(int(achievement_id))
+        if ok:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_DELETE_SUCCESS"))
+        else:
+            player.send_message(self.language_manager.GetText("OP_ACHIEVEMENT_DELETE_FAIL"))
+        self.show_op_achievement_list_panel(player)
 
     def show_op_title_manage_panel(self, player: Player):
         """OP 头衔管理子菜单：头衔属性管理、创建新头衔、给全体添加、给单独玩家添加。"""
@@ -4955,10 +5800,10 @@ class ARCCorePlugin(Plugin):
             result_panel = ActionForm(
                 title=self.language_manager.GetText('OP_LAND_AT_POS_TITLE'),
                 content=self.language_manager.GetText('OP_LAND_AT_POS_NOT_FOUND').format(x, y, z),
-                on_close=self.show_op_main_panel
+                on_close=self.show_op_land_manage_panel
             )
             result_panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'),
-                                    on_click=self.show_op_main_panel)
+                                    on_click=self.show_op_land_manage_panel)
             player.send_form(result_panel)
             return
 
@@ -4969,7 +5814,7 @@ class ARCCorePlugin(Plugin):
         confirm = ActionForm(
             title=self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_TITLE'),
             content=self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_CONFIRM_CONTENT'),
-            on_close=self.show_op_main_panel
+            on_close=self.show_op_land_manage_panel
         )
         confirm.add_button(
             self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_CONFIRM_BUTTON'),
@@ -4977,7 +5822,7 @@ class ARCCorePlugin(Plugin):
         )
         confirm.add_button(
             self.language_manager.GetText('RETURN_BUTTON_TEXT'),
-            on_click=self.show_op_main_panel
+            on_click=self.show_op_land_manage_panel
         )
         player.send_form(confirm)
 
@@ -4987,9 +5832,9 @@ class ARCCorePlugin(Plugin):
         result_panel = ActionForm(
             title=self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_TITLE'),
             content=message,
-            on_close=self.show_op_main_panel
+            on_close=self.show_op_land_manage_panel
         )
-        result_panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_main_panel)
+        result_panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_land_manage_panel)
         player.send_form(result_panel)
         if success:
             player.send_message(self.language_manager.GetText('OP_REBUILD_CHUNK_MAPPING_DONE'))
@@ -5064,6 +5909,8 @@ class ARCCorePlugin(Plugin):
             self._reapply_cached_settings()
             self._load_broadcast_messages()
             self.language_manager.ReloadCurrentLanguage()
+            self.entity_display_name_manager.reload()
+            self.kill_reward_config.reload()
             player.send_message(self.language_manager.GetText('OP_RELOAD_CONFIG_SUCCESS'))
             self.show_op_main_panel(player)
         except Exception as e:
@@ -5245,7 +6092,7 @@ class ARCCorePlugin(Plugin):
         else:
             self.op_debug_mode.add(player.name)
             player.send_message(self.language_manager.GetText('OP_DEBUG_MODE_TOGGLED_ON'))
-        self.show_op_main_panel(player)
+        self.show_op_tools_panel(player)
 
     def record_coordinate_1(self, player: Player):
         if not player.name in self.op_coordinate1_dict:
@@ -5256,7 +6103,7 @@ class ARCCorePlugin(Plugin):
         if not player.name in self.op_coordinate2_dict:
             self.op_coordinate2_dict[player.name] = None
         self.op_coordinate2_dict[player.name] = self.get_player_position_vector(player)
-        self.show_op_main_panel(player)
+        self.show_op_tools_panel(player)
 
     def get_op_record_coor1(self, player: Player):
         if not player.name in self.op_coordinate1_dict or self.op_coordinate1_dict[player.name] is None:
@@ -5295,18 +6142,133 @@ class ARCCorePlugin(Plugin):
         command_input_form = ModalForm(
             title=self.language_manager.GetText('RUN_COMMAND_PANEL_TITLE'),
             controls=[command_input],
-            on_close=self.show_op_main_panel,
+            on_close=self.show_op_tools_panel,
             on_submit=try_execute_command
         )
         player.send_form(command_input_form)
     
-    # Money Management UI
+    def show_economy_manage_panel(self, player: Player):
+        """OP 经济管理：在线玩家存款调整 + 经济相关配置。"""
+        panel = ActionForm(
+            title=self.language_manager.GetText('OP_ECONOMY_MANAGE_TITLE'),
+            content=self.language_manager.GetText('OP_ECONOMY_MANAGE_CONTENT'),
+            on_close=self.show_op_main_panel,
+        )
+        panel.add_button(
+            self.language_manager.GetText('OP_ECONOMY_ADJUST_MONEY_BUTTON'),
+            on_click=self.show_money_manage_menu,
+        )
+        panel.add_button(
+            self.language_manager.GetText('OP_ECONOMY_SETTINGS_BUTTON'),
+            on_click=self.show_economy_settings_panel,
+        )
+        panel.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_op_main_panel)
+        player.send_form(panel)
+
+    def show_economy_settings_panel(self, player: Player):
+        """OP 配置 PLAYER_INIT_MONEY_NUM、HIDE_OP_IN_MONEY_RANKING、RICHEST_TITLE_NAME。"""
+        def _raw(key: str, fallback: str) -> str:
+            v = self.setting_manager.GetSetting(key)
+            if v is None or str(v).strip() == "":
+                return fallback
+            return str(v).strip()
+
+        in_init_money = TextInput(
+            label=self.language_manager.GetText('OP_ECONOMY_SET_INIT_MONEY_LABEL'),
+            placeholder="2000",
+            default_value=_raw("PLAYER_INIT_MONEY_NUM", "0"),
+        )
+        in_hide_op_rank = TextInput(
+            label=self.language_manager.GetText('OP_ECONOMY_SET_HIDE_OP_RANK_LABEL'),
+            placeholder="true / false",
+            default_value="true" if self.hide_op_in_money_ranking else "false",
+        )
+        richest_default = self.setting_manager.GetSetting("RICHEST_TITLE_NAME")
+        if richest_default is None or not str(richest_default).strip():
+            richest_default = "首富"
+        else:
+            richest_default = str(richest_default).strip()
+        in_richest_title = TextInput(
+            label=self.language_manager.GetText('OP_ECONOMY_SET_RICHEST_TITLE_LABEL'),
+            placeholder="首富",
+            default_value=richest_default,
+        )
+
+        def try_save(p: Player, json_str: str):
+            try:
+                data = json.loads(json_str)
+            except Exception:
+                p.send_message(self.language_manager.GetText('OP_ECONOMY_SETTINGS_SAVE_FAIL'))
+                return self.show_economy_manage_panel(p)
+            if not data or len(data) < 3:
+                p.send_message(self.language_manager.GetText('OP_ECONOMY_SETTINGS_SAVE_FAIL'))
+                return self.show_economy_manage_panel(p)
+
+            try:
+                init_money = self._round_money(float(str(data[0]).strip()))
+            except (ValueError, TypeError):
+                p.send_message(self.language_manager.GetText('OP_ECONOMY_SETTINGS_SAVE_FAIL'))
+                return self.show_economy_manage_panel(p)
+            if init_money < 0:
+                init_money = 0.0
+
+            hide_raw = str(data[1]).strip().lower()
+            hide_op = hide_raw in ("true", "1", "yes", "on")
+
+            new_richest = str(data[2]).strip() if data[2] is not None else ""
+            if not new_richest:
+                new_richest = "首富"
+
+            raw_old_r = self.setting_manager.GetSetting("RICHEST_TITLE_NAME")
+            old_richest = (str(raw_old_r).strip() if raw_old_r else "") or "首富"
+
+            if old_richest != new_richest and self.current_richest_xuid:
+                try:
+                    self.title_system.revoke_title_by_xuid(self.current_richest_xuid, old_richest)
+                    old_name = self.get_player_name_by_xuid(self.current_richest_xuid)
+                    if old_name:
+                        pl = self.server.get_player(old_name)
+                        if pl is not None:
+                            self._update_player_name_tag(pl)
+                except Exception:
+                    pass
+
+            self.setting_manager.SetSetting("PLAYER_INIT_MONEY_NUM", init_money)
+            self.setting_manager.SetSetting(
+                "HIDE_OP_IN_MONEY_RANKING", "true" if hide_op else "false"
+            )
+            self.setting_manager.SetSetting("RICHEST_TITLE_NAME", new_richest)
+
+            self.hide_op_in_money_ranking = hide_op
+            self._ensure_richest_title_definition()
+            try:
+                self._update_richest_title_if_needed(force=True)
+            except Exception:
+                pass
+
+            result = ActionForm(
+                title=self.language_manager.GetText('OP_ECONOMY_SETTINGS_TITLE'),
+                content=self.language_manager.GetText('OP_ECONOMY_SETTINGS_SAVED'),
+                on_close=self.show_economy_manage_panel,
+            )
+            result.add_button(self.language_manager.GetText('RETURN_BUTTON_TEXT'), on_click=self.show_economy_manage_panel)
+            p.send_form(result)
+
+        form = ModalForm(
+            title=self.language_manager.GetText('OP_ECONOMY_SETTINGS_TITLE'),
+            controls=[in_init_money, in_hide_op_rank, in_richest_title],
+            on_close=self.show_economy_manage_panel,
+            on_submit=try_save,
+        )
+        player.send_form(form)
+
+    # Money Management UI（经济管理子菜单：调整在线玩家存款）
     def show_money_manage_menu(self, player: Player):
-        """显示金钱管理菜单"""
+        """选择增加或减少在线玩家存款"""
         money_menu = ActionForm(
             title=self.language_manager.GetText('MONEY_MANAGE_MENU_TITLE'),
             content=self.language_manager.GetText('MONEY_MANAGE_MENU_CONTENT'),
-            on_close=self.show_op_main_panel
+            on_close=self.show_economy_manage_panel
         )
         money_menu.add_button(
             self.language_manager.GetText('MONEY_MANAGE_ADD_BUTTON'),
@@ -5387,8 +6349,7 @@ class ARCCorePlugin(Plugin):
                 else:
                     player.send_message(self.language_manager.GetText('MONEY_SYSTEM_REMOVE_MONEY_FAILED'))
             
-            # 返回 OP 面板
-            self.show_op_main_panel(player)
+            self.show_economy_manage_panel(player)
         
         amount_input_form = ModalForm(
             title=self.language_manager.GetText('MONEY_MANAGE_INPUT_AMOUNT_TITLE'),
@@ -5408,7 +6369,7 @@ class ARCCorePlugin(Plugin):
             empty_panel = ActionForm(
                 title=self.language_manager.GetText('OP_ALL_LANDS_MENU_TITLE'),
                 content=self.language_manager.GetText('OP_ALL_LANDS_EMPTY'),
-                on_close=self.show_op_main_panel
+                on_close=self.show_op_land_manage_panel
             )
             player.send_form(empty_panel)
             return
@@ -5423,7 +6384,7 @@ class ARCCorePlugin(Plugin):
         menu = ActionForm(
             title=self.language_manager.GetText('OP_ALL_LANDS_MENU_TITLE'),
             content=self.language_manager.GetText('OP_ALL_LANDS_MENU_CONTENT').format(len(land_ids), page + 1),
-            on_close=self.show_op_main_panel
+            on_close=self.show_op_land_manage_panel
         )
         
         for land_id in page_land_ids:
@@ -5452,7 +6413,7 @@ class ARCCorePlugin(Plugin):
             )
         menu.add_button(
             self.language_manager.GetText('RETURN_BUTTON_TEXT'),
-            on_click=self.show_op_main_panel
+            on_click=self.show_op_land_manage_panel
         )
         player.send_form(menu)
     

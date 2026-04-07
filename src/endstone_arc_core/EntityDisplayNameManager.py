@@ -65,3 +65,28 @@ class EntityDisplayNameManager:
     def reload(self) -> None:
         """重新从文件加载。"""
         self._load()
+
+    def get_display_name_for_entity_type(self, entity_type_id: str) -> str:
+        """
+        根据类型 ID（如 minecraft:creeper）解析显示名。
+        优先查 entity.minecraft.creeper.name 与文件中其它键；无则返回简短 ID（如 creeper）。
+        """
+        if not entity_type_id:
+            return ""
+        et = str(entity_type_id).strip()
+        if ":" in et:
+            ns, short = et.split(":", 1)
+            key = f"entity.{ns}.{short}.name"
+        else:
+            short = et
+            key = f"entity.minecraft.{short}.name"
+        if key in self._cache and self._cache[key]:
+            return self._cache[key]
+        et_lower = et.lower()
+        if et_lower in self._cache and self._cache[et_lower]:
+            return self._cache[et_lower]
+        if et in self._cache and self._cache[et]:
+            return self._cache[et]
+        if ":" in et:
+            return et.split(":", 1)[1]
+        return et

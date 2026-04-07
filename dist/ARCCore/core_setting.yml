@@ -4,9 +4,10 @@ DATABASE_PATH=ARCCore.db
 # 强制登录（为 True 时，玩家进入游戏强制打开 /arc 菜单登录或注册；关闭登录/注册界面且未正确输入密码时会再次强制打开）
 FORCE_LOGIN=False
 
-# 玩家经济
+# 玩家经济（也可在 OP 面板 → 经济管理 → 经济参数配置 中修改）
 PLAYER_INIT_MONEY_NUM=2000
 HIDE_OP_IN_MONEY_RANKING=True
+RICHEST_TITLE_NAME=首富
 
 # 出生点保护
 IF_PROTECT_SPAWN=False
@@ -40,6 +41,13 @@ TELEPORT_COST_LAND=0
 TELEPORT_COST_DEATH_LOCATION=500
 TELEPORT_COST_RANDOM=1000
 TELEPORT_COST_PLAYER=100
+
+# 每日签到（主菜单按钮；last_checkin_date 与服务器本地日期 YYYY-MM-DD 不同则可签到）
+CHECKIN_DAILY_MONEY=100
+# 从奖励池中按权重不放回抽取的条目数（0 表示只发钱不发随机物）
+CHECKIN_REWARD_PICK_COUNT=2
+# JSON 数组：每项 [物品ID, 数量, 权重]，例如 [["minecraft:diamond",1,1],["minecraft:iron_ingot",3,5],["minecraft:oak_plank",64,10]]
+CHECKIN_REWARD_LIST=[["minecraft:diamond",1,1],["minecraft:iron_ingot",3,5],["minecraft:oak_plank",64,10]]
 
 # 邀请奖励
 INVITE_REWARD_ITEM_NAME=minecraft:diamond

@@ -287,6 +287,44 @@ class TitleSystem:
         except Exception:
             return False
 
+    def revoke_title_by_xuid(self, xuid: str, title: str) -> bool:
+        """按 xuid 撤销玩家头衔（从解锁记录移除；若正在佩戴则取消佩戴）。"""
+        try:
+            xuid = (xuid or "").strip()
+            title = (title or "").strip()
+            if not xuid or not title:
+                return False
+
+            # 若正在佩戴该头衔，先取消佩戴
+            row = self.database_manager.query_one(
+                "SELECT title FROM " + self._table_equipped + " WHERE xuid = ?",
+                (xuid,),
+            )
+            if row and row.get("title") == title:
+                self.database_manager.execute(
+                    "DELETE FROM " + self._table_equipped + " WHERE xuid = ?",
+                    (xuid,),
+                )
+
+            # 删除解锁记录（新表与兼容旧表都删）
+            self.database_manager.execute(
+                "DELETE FROM " + self._table_unlock_time + " WHERE xuid = ? AND title = ?",
+                (xuid, title),
+            )
+            self.database_manager.execute(
+                "DELETE FROM " + self._table_extra + " WHERE xuid = ? AND title = ?",
+                (xuid, title),
+            )
+            return True
+        except Exception:
+            return False
+
+    def revoke_title(self, player: Player, title: str) -> bool:
+        """撤销玩家头衔（在线玩家版）。"""
+        if not player:
+            return False
+        return self.revoke_title_by_xuid(str(player.xuid), title)
+
     def on_player_join(self, player: Player) -> None:
         """进服时：1) 确保默认头衔与 OP 头衔有解锁记录（无则插入，时间为当前）；2) 若非 OP 且佩戴 OP 头衔则解除佩戴。"""
         xuid = self._xuid(player)
