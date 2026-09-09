@@ -784,10 +784,7 @@ class ARCCorePlugin(Plugin):
             if not isinstance(sender, Player):
                 sender.send_message(f'[ARC Core]This command only works for players.')
                 return True
-            self.server.dispatch_command(
-                self.server.command_sender,
-                f'kill {format_mc_command_player_name(sender.name)}',
-            )
+            self._force_kill_player(sender)
             self.server.broadcast_message(self.language_manager.GetText('PLAYER_SUICIDE_MESSAGE').format(sender.name))
             return True
         if command.name == "spawn":
@@ -4683,6 +4680,11 @@ class ARCCorePlugin(Plugin):
                 self.language_manager.GetText('SHOOTER_GAME_MENU_NAME'),
                 on_click=self.show_arc_shooter_game_menu,
             )
+        if self.server.plugin_manager.get_plugin('dmz'):
+            arc_menu.add_button(
+                self.language_manager.GetText('DMZ_MENU_NAME'),
+                on_click=self.show_dmz_menu,
+            )
         if checkin_first:
             arc_menu.add_button(
                 self.language_manager.GetText('CHECKIN_MENU_BUTTON'),
@@ -4740,6 +4742,48 @@ class ARCCorePlugin(Plugin):
 
     def execute_suicide(self, player: Player):
         player.perform_command('suicide')
+
+    def _force_kill_player(self, player: Player) -> None:
+        """强制处死玩家。
+
+        Bedrock/Endstone 在 max_health>20（如 DMZ 血量加点）时，单次 /kill 或
+        health=0 往往只掉约 20 点；DMZ 局内致死伤还会被倒地系统改成倒地。
+        因此先标记放行倒地拦截，再多次抽干血量并补发 kill。
+        """
+        dmz = self.server.plugin_manager.get_plugin("dmz")
+        if dmz is not None:
+            try:
+                uid = str(player.unique_id)
+                downed = getattr(dmz, "_downed", None)
+                if isinstance(downed, dict) and uid in downed:
+                    downed[uid]["timeout_kill"] = True
+                    downed[uid]["finalized"] = True
+            except Exception:
+                pass
+
+        name = format_mc_command_player_name(player.name)
+        for _ in range(8):
+            try:
+                hp = float(getattr(player, "health", 0) or 0)
+            except Exception:
+                hp = 0.0
+            if hp <= 0:
+                break
+            try:
+                # 满血赋值 0 常只扣约 20，需多次才能抽干高血量
+                player.health = 0
+            except Exception:
+                pass
+            try:
+                self.server.dispatch_command(
+                    self.server.command_sender,
+                    f"kill {name}",
+                )
+            except Exception:
+                pass
+
+    def show_dmz_menu(self, player: Player):
+        player.perform_command("dmz")
 
     def show_newbie_welcome_panel(self, player: Player):
         """显示新手引导面板，内容来自内存中的 newbie_welcome.txt"""

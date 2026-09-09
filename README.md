@@ -3,7 +3,7 @@
 # EndStone ARC Core Plugin / EndStone弧光核心
 
 [![Codacy Grade](https://app.codacy.com/project/badge/Grade/2f830615baf347258558dcc2a5ab85a1)](https://app.codacy.com/gh/DEVILENMO/EndstoneMC-ARC-Core-Plugin/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
-[![Version](https://img.shields.io/badge/version-v0.9.42-blue)](https://github.com/ARC-Minecraft/EndstoneMC-ARC-Core-Plugin)
+[![Version](https://img.shields.io/badge/version-v0.9.46-blue)](https://github.com/ARC-Minecraft/EndstoneMC-ARC-Core-Plugin)
 [![Python](https://img.shields.io/badge/python-3.13+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![EndStone API](https://img.shields.io/badge/EndStone_API-0.7+-black)](https://github.com/EndstoneMC/endstone)
 [![License](https://img.shields.io/github/license/ARC-Minecraft/EndstoneMC-ARC-Core-Plugin)](LICENSE)
@@ -789,7 +789,12 @@ arc.api_sidebar_set_values(
 
 ## 📋 近期更新日志
 
-### v0.9.42（当前版本）
+### v0.9.46（当前版本）
+
+- ✅ **对接 DMZ**：主菜单在检测到 `dmz` 插件时显示「开放世界PVE搜打撤模式」，打开 `/dmz` 菜单
+- ✅ **修复自杀/重生**：高血量（>20，如 DMZ 加点）时单次 `/kill` 往往只掉约 20 点；改为多次抽干血量并处理 DMZ 倒地拦截
+
+### v0.9.42
 
 - ✅ **移除共享文件跨服同步**：删除 `*_DATABASE_PATH` 配置与 `legacy_recovery` 一次性导入；跨服仅支持 SyncServer + SyncClient 网络后端
 
