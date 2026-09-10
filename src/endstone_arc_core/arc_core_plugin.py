@@ -4987,7 +4987,7 @@ class ARCCorePlugin(Plugin):
             text=lambda _p: lm.GetText("LAND_MENU_NAME"),
             on_click=self.show_land_main_menu,
             priority=5,
-            visible=lambda _p: self._is_land_system_enabled() and self._is_land_claim_allowed(),
+            visible=lambda p: self._is_land_system_enabled() and (self._is_land_claim_allowed() or p.is_op),
         )
         self._put_main_menu_button(
             "arc_core:bank",
