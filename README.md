@@ -269,7 +269,8 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 - **本服本地表（不同步）**：**`player_local_info`** — 本服 `is_op`、剩余免费领地格、**签到**（每服独立）。始终写在本服 **`DATABASE_PATH`**；跨服排行 OP 排除读 **`player_basic_info.once_op`**（不再用本服 `is_op` 镜像）
 - **OP 面板**：点「跨服同步」即发起全面对账并显示运行状态；每次连上同步中心也会自动拉全量并上行本地已启用表
 - **QQ 群消息**：跨服 QQ 互通由 **AstrBot 弧光 EndStone 消息中枢** + **endstone-arc-qq-sync-astrbot** 负责；ARCCore **不再**经 SyncServer 做 QQ 事件中继。死亡播报调用本机 QQ Sync 的 `api_send_event("death", …)`；成就等可用 `custom`
-- **群聊死亡播报模式（v0.9.12）**：`QQ_DEATH_BROADCAST_MODE` = `off`（不播报）/ `pvp`（仅 PvP）/ `all`（全部，默认）；仅影响群聊，游戏内死亡播报仍始终发送
+- **群聊死亡播报模式（v0.9.12）**：`QQ_DEATH_BROADCAST_MODE` = `off`（不播报）/ `pvp`（仅 PvP）/ `all`（全部，默认）；仅影响群聊
+- **游戏内死亡播报开关（v0.9.48）**：`ENABLE_DEATH_BROADCAST`（默认 `True`）；设为 `False` 可关闭全服聊天栏死亡播报（枪战服建议关闭，改用模式内击杀提示）
 - **启动迁移**：签到迁入本服表；时长 / 进服次数保留在跨服 `player_basic_info`
 
 ### ⏱️ 游戏时长统计（跨服）
@@ -824,6 +825,7 @@ if arc and hasattr(arc, "api_register_chat_prefix"):
 ### v0.9.48
 
 - ✅ **主菜单按钮优先级与外部注册 API**：内置按钮硬编码优先级（签到 0/99，其余从 3 起）；同优先级按文本排序；新增 `api_register_main_menu_button` / `api_unregister_main_menu_button`；移除核心对股票/商店/枪战/DTWT/PvP KD/DMZ 等的硬编码入口，改由各插件自行注册
+- ✅ **游戏内死亡播报开关**：新增 `ENABLE_DEATH_BROADCAST`（默认 `True`），可在 OP 配置面板「通用」中关闭；与群聊 `QQ_DEATH_BROADCAST_MODE` 独立
 
 ### v0.9.47
 

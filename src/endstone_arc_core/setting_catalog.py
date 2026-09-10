@@ -65,6 +65,12 @@ SETTING_GROUPS: List[Dict[str, object]] = [
             _s("FORCE_LOGIN", "强制登录", "bool", choices=BOOL_CHOICES),
             _s("BROADCAST_INTERVAL", "广播间隔（秒）", "int", placeholder="120"),
             _s(
+                "ENABLE_DEATH_BROADCAST",
+                "游戏内死亡播报",
+                "bool",
+                choices=BOOL_CHOICES,
+            ),
+            _s(
                 "QQ_DEATH_BROADCAST_MODE",
                 "群聊死亡播报",
                 "choice",
