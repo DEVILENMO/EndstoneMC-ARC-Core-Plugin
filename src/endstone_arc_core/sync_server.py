@@ -6,13 +6,23 @@ import threading
 import time
 import uuid
 from contextlib import suppress
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 
 from endstone_arc_core.sync_config import (
     categories_from_tables,
     filter_incoming_settings,
     snapshot_shared_settings,
+)
+from endstone_arc_core.sync_plugin_api import (
+    build_create_table_sql,
+    is_plugin_logical_name,
+    normalize_fields,
+    normalize_primary_keys,
+    parse_logical_name,
+    physical_from_logical,
+    select_all_physical_rows,
+    query_physical_rows,
 )
 from endstone_arc_core.sync_protocol import (
     SyncMessageType,
@@ -47,8 +57,10 @@ class ConnectedClient:
     accepts_push: bool = False
     last_heartbeat: float = field(default_factory=time.time)
     sync_tables: Set[str] = field(default_factory=set)
+    # 第三方插件逻辑表名 plugin_id:table
+    plugin_tables: Set[str] = field(default_factory=set)
     protocol_version: int = 1
-    
+
     def is_alive(self) -> bool:
         """检查连接是否存活（心跳超时 60 秒）"""
         return time.time() - self.last_heartbeat < 60
@@ -98,11 +110,14 @@ class SyncServer:
         
         # 需要同步的表列表
         self._sync_tables = set(TABLE_TO_ENUM.keys())
-        
+        # 逻辑表名 -> {"fields", "primary_keys"}（来自客户端 auth 或本机插件注册）
+        self._plugin_schemas: Dict[str, Dict[str, Any]] = {}
+        self._plugin_schema_lock = threading.Lock()
+
         # 变更记录队列（用于异步推送给客户端）
         self._change_queue: List[Dict[str, Any]] = []
         self._change_queue_lock = threading.Lock()
-        
+
         # 全量同步锁（防止同步期间数据不一致）
         self._full_sync_lock = threading.Lock()
 
@@ -289,12 +304,12 @@ class SyncServer:
         server_id = data.get('server_id', '')
         server_name = data.get('server_name', '')
         auth_key = data.get('auth_key', '')
-        
+
         if self.auth_key and auth_key != self.auth_key:
             client.conn.sendall(build_auth_response(False, "Invalid auth key"))
             self._log("warning", f"Auth failed for {client.addr}: invalid key")
             return
-        
+
         client.server_id = server_id
         client.server_name = server_name
         client.authenticated = True
@@ -311,7 +326,9 @@ class SyncServer:
             }
         else:
             client.sync_tables = set(self._sync_tables)
-        
+
+        client.plugin_tables = self._absorb_plugin_tables(data.get('plugin_tables'))
+
         with self._clients_lock:
             self._clients.add(client)
 
@@ -325,6 +342,102 @@ class SyncServer:
             protocol_version=PROTOCOL_VERSION,
         ))
         self._log("info", f"Client authenticated: {server_name} ({server_id}) from {client.addr}")
+
+    def _absorb_plugin_tables(self, raw: Any) -> Set[str]:
+        """登记客户端声明的插件表并确保中心物理表存在（字段类型与主键均校验）。"""
+        allowed: Set[str] = set()
+        if not isinstance(raw, list):
+            return allowed
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('name') or '').strip()
+            parsed = parse_logical_name(name)
+            if not parsed:
+                continue
+            fields = item.get('fields')
+            pks = item.get('primary_keys')
+            if not isinstance(fields, dict) or not fields:
+                with self._plugin_schema_lock:
+                    if name not in self._plugin_schemas:
+                        continue
+            else:
+                try:
+                    self._ensure_plugin_table(name, fields, pks)
+                except Exception as e:
+                    self._log("warning", f"Ensure plugin table {name} failed: {e}")
+                    continue
+            allowed.add(name)
+        return allowed
+
+    def register_plugin_namespace(
+        self, logical_tables: Dict[str, Any]
+    ) -> None:
+        """本机插件注册：记录 schema 并建物理表（同步中心侧）。
+
+        logical_tables: {logical_name: {"fields": {...}, "primary_keys": [...]}}
+        或兼容旧调用 {logical_name: fields_dict}。
+        """
+        for name, meta in (logical_tables or {}).items():
+            try:
+                if isinstance(meta, dict) and "fields" in meta:
+                    self._ensure_plugin_table(
+                        name, meta.get("fields"), meta.get("primary_keys")
+                    )
+                else:
+                    self._ensure_plugin_table(name, meta, None)
+            except Exception as e:
+                self._log("error", f"Register plugin table {name} error: {e}")
+
+    def _ensure_plugin_table(
+        self, logical: str, fields: Any, primary_keys: Any = None
+    ) -> str:
+        phys = physical_from_logical(logical)
+        if not phys:
+            raise ValueError(f"invalid plugin table name: {logical!r}")
+        norm_fields = normalize_fields(fields)
+        # 已有 schema 且未给 PK 时沿用旧 PK，避免重复注册丢主键
+        with self._plugin_schema_lock:
+            prev = self._plugin_schemas.get(logical) or {}
+        if primary_keys is None and prev.get("primary_keys"):
+            pks = list(prev["primary_keys"])
+        else:
+            pks = normalize_primary_keys(primary_keys, norm_fields)
+        create_sql = build_create_table_sql(phys, norm_fields, pks)
+        with self._plugin_schema_lock:
+            self._plugin_schemas[logical] = {
+                "fields": dict(norm_fields),
+                "primary_keys": list(pks),
+            }
+        if not self.db.table_exists(phys):
+            # 不用 create_table：需要表级复合主键
+            if not self.db.execute(create_sql):
+                raise RuntimeError(f"create plugin table failed: {phys}")
+        return phys
+
+    def _resolve_request_tables(
+        self, client: ConnectedClient, data: Dict
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """返回 (core_table, plugin_logical, physical)；均未授权时 physical 为 None。"""
+        table_name = data.get('table_name')
+        if is_plugin_logical_name(table_name):
+            logical = str(table_name).strip()
+            if client is not None and logical not in client.plugin_tables:
+                return None, logical, None
+            phys = physical_from_logical(logical)
+            with self._plugin_schema_lock:
+                known = logical in self._plugin_schemas
+            if not phys or not known:
+                return None, logical, None
+            return None, logical, phys
+        try:
+            table_enum = SyncTable(data.get('table', 0))
+        except ValueError:
+            return None, None, None
+        core = ENUM_TO_TABLE.get(table_enum)
+        if core not in self._sync_tables:
+            return None, None, None
+        return core, None, core
 
     def _handle_heartbeat(self, client: ConnectedClient):
         """处理心跳包"""
@@ -340,16 +453,18 @@ class SyncServer:
     def _handle_query(self, client: ConnectedClient, data: Dict):
         """处理查询请求"""
         try:
-            table_enum = SyncTable(data.get('table', 0))
-            table_name = ENUM_TO_TABLE.get(table_enum)
+            core_table, plugin_logical, phys = self._resolve_request_tables(client, data)
             where = data.get('where', '1=1')
             params = data.get('params', [])
-            
-            if table_name not in self._sync_tables:
+
+            if not phys:
                 client.conn.sendall(build_query_response(False, [], "Table not allowed"))
                 return
-            
-            results = query_sync_table(self.db, table_name, where, tuple(params))
+
+            if plugin_logical:
+                results = query_physical_rows(self.db, phys, where, tuple(params))
+            else:
+                results = query_sync_table(self.db, core_table, where, tuple(params))
             client.conn.sendall(build_query_response(True, results))
         except Exception as e:
             client.conn.sendall(build_query_response(False, [], str(e)))
@@ -387,9 +502,8 @@ class SyncServer:
             request_type, SyncMessageType.INSERT_RESPONSE
         )
         try:
-            table_enum = SyncTable(data.get('table', 0))
-            table_name = ENUM_TO_TABLE.get(table_enum)
-            if table_name not in self._sync_tables:
+            core_table, plugin_logical, phys = self._resolve_request_tables(client, data)
+            if not phys:
                 client.conn.sendall(
                     build_data_response(
                         resp_type, False, 0, "Table not allowed", seq=seq
@@ -397,12 +511,12 @@ class SyncServer:
                 )
                 return
             with self.db.suppress_write_notify():
-                success = mutate(table_name)
+                success = mutate(phys)
             if success:
-                self._broadcast_push(
-                    SyncTable(table_enum), push_op, push_data, exclude=client
+                self._broadcast_push_resolved(
+                    core_table, plugin_logical, push_op, push_data, exclude=client
                 )
-                self._notify_economy_mutated(table_name)
+                self._notify_economy_mutated(core_table)
             client.conn.sendall(
                 build_data_response(
                     resp_type, success, 1 if success else 0, seq=seq
@@ -522,19 +636,22 @@ class SyncServer:
         只在读库时短暂加锁，发送响应不占锁，避免多从服互相堵到超时。
         """
         try:
-            table_enum = SyncTable(data.get('table', 0))
-            table_name = ENUM_TO_TABLE.get(table_enum)
+            core_table, plugin_logical, phys = self._resolve_request_tables(client, data)
 
-            if table_name not in self._sync_tables:
+            if not phys:
                 client.conn.sendall(build_full_sync_response(False, [], "Table not allowed"))
                 return
 
             with self._full_sync_lock:
-                rows = select_all_sync_table(self.db, table_name)
+                if plugin_logical:
+                    rows = select_all_physical_rows(self.db, phys)
+                else:
+                    rows = select_all_sync_table(self.db, core_table)
             client.conn.sendall(build_full_sync_response(True, rows))
+            label = plugin_logical or core_table
             self._log(
                 "info",
-                f"Full sync for {table_name}: {len(rows)} rows to {client.server_name}",
+                f"Full sync for {label}: {len(rows)} rows to {client.server_name}",
             )
         except Exception as e:
             try:
@@ -546,16 +663,18 @@ class SyncServer:
     def _handle_pull(self, client: ConnectedClient, data: Dict):
         """处理拉取请求"""
         try:
-            table_enum = SyncTable(data.get('table', 0))
+            core_table, plugin_logical, phys = self._resolve_request_tables(client, data)
             where = data.get('where', '1=1')
             params = data.get('params', [])
-            
-            table_name = ENUM_TO_TABLE.get(table_enum)
-            if table_name not in self._sync_tables:
+
+            if not phys:
                 client.conn.sendall(build_query_response(False, [], "Table not allowed"))
                 return
-            
-            results = query_sync_table(self.db, table_name, where, tuple(params))
+
+            if plugin_logical:
+                results = query_physical_rows(self.db, phys, where, tuple(params))
+            else:
+                results = query_sync_table(self.db, core_table, where, tuple(params))
             client.conn.sendall(build_query_response(True, results))
         except Exception as e:
             client.conn.sendall(build_query_response(False, [], str(e)))
@@ -595,18 +714,38 @@ class SyncServer:
                 self._clients.discard(client)
 
     def _broadcast_push(self, table: SyncTable, operation: str, data: Dict, exclude: Optional[ConnectedClient] = None):
-        """广播推送通知给所有已连接的客户端"""
+        """广播内置表推送通知给所有已连接的客户端"""
         table_name = ENUM_TO_TABLE.get(table)
-        msg = build_push_notify(table, operation, data)
+        self._broadcast_push_resolved(table_name, None, operation, data, exclude=exclude)
+
+    def _broadcast_push_resolved(
+        self,
+        core_table: Optional[str],
+        plugin_logical: Optional[str],
+        operation: str,
+        data: Dict,
+        exclude: Optional[ConnectedClient] = None,
+    ):
+        """按 core 表名或插件逻辑表名广播 PUSH。"""
+        table_enum = TABLE_TO_ENUM.get(core_table) if core_table else None
+        msg = build_push_notify(
+            table_enum if table_enum is not None else 0,
+            operation,
+            data,
+            table_name=plugin_logical,
+        )
         disconnected = []
-        
+
         with self._clients_lock:
             for client in self._clients:
                 if client is exclude:
                     continue
                 if not client.accepts_push:
                     continue
-                if table_name and client.sync_tables and table_name not in client.sync_tables:
+                if plugin_logical:
+                    if plugin_logical not in client.plugin_tables:
+                        continue
+                elif core_table and client.sync_tables and core_table not in client.sync_tables:
                     continue
                 if not client.is_alive():
                     disconnected.append(client)
@@ -615,10 +754,51 @@ class SyncServer:
                     client.conn.sendall(msg)
                 except Exception:
                     disconnected.append(client)
-            
-            # 移除断开的客户端
+
             for client in disconnected:
                 self._clients.discard(client)
+
+    def apply_plugin_upsert(self, logical: str, row: Dict[str, Any]) -> bool:
+        """同步中心本机插件写：落物理表并广播（不经 outbox）。"""
+        if not is_plugin_logical_name(logical) or not row:
+            return False
+        with self._plugin_schema_lock:
+            known = logical in self._plugin_schemas
+        if not known:
+            return False
+        phys = physical_from_logical(logical)
+        if not phys:
+            return False
+        with self.db.suppress_write_notify():
+            ok = self.db.upsert(phys, dict(row))
+        if ok:
+            self._broadcast_push_resolved(None, logical, "insert", dict(row))
+        return bool(ok)
+
+    def apply_plugin_delete(
+        self, logical: str, where: str, params: Optional[List[Any]] = None
+    ) -> bool:
+        """同步中心本机插件删：落物理表并广播。"""
+        if not is_plugin_logical_name(logical) or not where or ";" in str(where):
+            return False
+        with self._plugin_schema_lock:
+            known = logical in self._plugin_schemas
+        if not known:
+            return False
+        phys = physical_from_logical(logical)
+        if not phys:
+            return False
+        params_t = tuple(params or ())
+        with self.db.suppress_write_notify():
+            ok = self.db.delete(phys, str(where), params_t)
+        if ok:
+            self._broadcast_push_resolved(
+                None,
+                logical,
+                "delete",
+                {"_where": str(where), "_params": list(params_t)},
+            )
+        return bool(ok)
 
     def _cleanup_dead_clients(self):
         """清理已断开的客户端"""

@@ -3,7 +3,7 @@
 # EndStone ARC Core Plugin / EndStone弧光核心
 
 [![Codacy Grade](https://app.codacy.com/project/badge/Grade/2f830615baf347258558dcc2a5ab85a1)](https://app.codacy.com/gh/DEVILENMO/EndstoneMC-ARC-Core-Plugin/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
-[![Version](https://img.shields.io/badge/version-v0.9.49-blue)](https://github.com/ARC-Minecraft/EndstoneMC-ARC-Core-Plugin)
+[![Version](https://img.shields.io/badge/version-v0.9.50-blue)](https://github.com/ARC-Minecraft/EndstoneMC-ARC-Core-Plugin)
 [![Python](https://img.shields.io/badge/python-3.13+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![EndStone API](https://img.shields.io/badge/EndStone_API-0.7+-black)](https://github.com/EndstoneMC/endstone)
 [![License](https://img.shields.io/github/license/ARC-Minecraft/EndstoneMC-ARC-Core-Plugin)](LICENSE)
@@ -19,7 +19,7 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 
 - **作者**: DEVILENMO
 - **邮箱**: DEVILENMO@gmail.com
-- **版本**: 0.9.38
+- **版本**: 0.9.50
 - **API 版本**: 0.7+
 - **推荐 Python 版本**: 3.13
 
@@ -817,7 +817,14 @@ if arc and hasattr(arc, "api_register_chat_prefix"):
 
 ## 📋 近期更新日志
 
-### v0.9.49（当前版本）
+### v0.9.50（当前版本）
+
+- ✅ **插件化跨服同步 API（协议 v4）**：其它插件可 `api_sync_register_namespace` 注册自有表，业务数据仍存各自插件库；中心落 `psync_*` 物理表；从服经 `on_apply` 回写
+- ✅ **公会拆出至 `arc_guild`**：核心删除内置公会 UI/API/`GuildSystem`；领地公会判定、击杀/签到贡献、聊天前缀改为软依赖（查失败一律视为无公会、不放行）
+- ✅ **领地待购面板**：非 OP 不显示「创建公共领地」按钮也不提示；有 `arc_guild` 且为会长/管理者时才出现「创建公会领地」
+- ✅ **时长/次数仅主服统计**：从服不累加 `session_count`/`total_playtime`；本地无行时先向同步中心 PULL，避免把老玩家当新人并覆盖主服计数
+
+### v0.9.49
 
 - ✅ **聊天/展示名前缀注册制**：按 priority 升序拼接（越小越靠前，最低 0）；内置公会 `guild=2`、头衔 `title=3`；新增 `api_register_chat_prefix` / `api_set_player_chat_prefix` 供其它插件注册槽位并设置玩家前缀文本
 

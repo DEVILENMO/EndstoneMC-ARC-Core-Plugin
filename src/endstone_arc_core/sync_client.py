@@ -12,6 +12,10 @@ from endstone_arc_core.sync_config import (
     get_client_sync_categories,
     get_client_sync_tables,
 )
+from endstone_arc_core.sync_plugin_api import (
+    PluginSyncRegistry,
+    is_plugin_logical_name,
+)
 from endstone_arc_core.sync_protocol import (
     SyncMessageType,
     SyncTable,
@@ -22,6 +26,7 @@ from endstone_arc_core.sync_protocol import (
     build_data_request,
     build_full_sync_request,
     build_heartbeat,
+    build_query_request,
     build_settings_pull_request,
     decode_message,
 )
@@ -33,12 +38,20 @@ class SyncClient:
 
     断线或主机不可达时，按 SYNC_CLIENT_RECONNECT_INTERVAL 秒定时重连。
     本地写库先入 sync_outbox，重连后按序重放，收到 ack 才删除。
+    第三方插件表经 PluginSyncRegistry 注册，下行走 on_apply 回调。
     """
 
-    def __init__(self, database_manager, setting_manager, logger=None):
+    def __init__(
+        self,
+        database_manager,
+        setting_manager,
+        logger=None,
+        plugin_registry: Optional[PluginSyncRegistry] = None,
+    ):
         self.db = database_manager
         self.settings = setting_manager
         self.logger = logger
+        self.plugin_registry = plugin_registry or PluginSyncRegistry()
 
         self.server_ip = str(setting_manager.GetSetting("SYNC_SERVER_IP") or "127.0.0.1").strip()
         self.server_id = str(setting_manager.GetSetting("SYNC_CLIENT_SERVER_ID") or "server_001").strip()
@@ -95,11 +108,11 @@ class SyncClient:
         """启动客户端后台线程（断线后自动重连）。"""
         if self._active:
             return True
-        if not self.enabled_tables:
+        if not self.enabled_tables and not self.plugin_registry.logical_tables():
             self._log(
                 "warning",
-                "No sync categories enabled (SYNC_CLIENT_SYNC_* all False); "
-                "client not started",
+                "No sync categories enabled (SYNC_CLIENT_SYNC_* all False) "
+                "and no plugin tables registered; client not started",
             )
             return False
 
@@ -112,6 +125,40 @@ class SyncClient:
             f"(reconnect every {self.reconnect_interval}s)",
         )
         return True
+
+    def notify_registry_changed(self) -> None:
+        """插件表注册变更后触发重连，以便重新 auth + 全量。"""
+        if self.is_running():
+            self._close_socket()
+            self._outbox_wake.set()
+
+    def enqueue_plugin_upsert(self, logical: str, row: Dict[str, Any]) -> Optional[int]:
+        """插件本地写后整行 upsert 入 outbox。"""
+        if not is_plugin_logical_name(logical) or not row:
+            return None
+        if logical not in self.plugin_registry.logical_tables():
+            return None
+        seq = sync_outbox.enqueue(self.db, logical, "insert", {"row": dict(row)})
+        if seq is not None:
+            self._outbox_wake.set()
+        return seq
+
+    def enqueue_plugin_delete(
+        self, logical: str, where: str, params: Optional[list] = None
+    ) -> Optional[int]:
+        if not is_plugin_logical_name(logical) or not where:
+            return None
+        if logical not in self.plugin_registry.logical_tables():
+            return None
+        seq = sync_outbox.enqueue(
+            self.db,
+            logical,
+            "delete",
+            {"where": str(where), "params": list(params or [])},
+        )
+        if seq is not None:
+            self._outbox_wake.set()
+        return seq
 
     def set_settings_callback(self, callback: Optional[Callable[[Dict[str, str]], None]]) -> None:
         self._on_settings = callback
@@ -133,6 +180,52 @@ class SyncClient:
             self._send(build_settings_pull_request())
         except Exception as e:
             self._log("error", f"Request settings error: {e}")
+
+    def pull_rows(
+        self,
+        table: str,
+        where: str = "1=1",
+        params: Optional[list] = None,
+        timeout: Optional[float] = None,
+    ) -> Optional[list]:
+        """向同步中心查询行（不写本地库）。未连接返回 None。"""
+        if not self.is_running() or table not in self.enabled_tables:
+            return None
+        table_enum = TABLE_TO_ENUM.get(table)
+        if table_enum is None:
+            return None
+        try:
+            msg_type, data = self._request_response(
+                build_query_request(table_enum, where, list(params or [])),
+                expect_types={SyncMessageType.QUERY_RESPONSE},
+                timeout=timeout if timeout is not None else 8.0,
+            )
+            if msg_type != SyncMessageType.QUERY_RESPONSE:
+                return None
+            if not data.get("success"):
+                self._log(
+                    "warning",
+                    f"Pull {table} failed: {data.get('error', '')}",
+                )
+                return None
+            rows = data.get("results")
+            return list(rows) if isinstance(rows, list) else []
+        except Exception as e:
+            self._log("warning", f"Pull {table} error: {e}")
+            return None
+
+    def pull_one(
+        self,
+        table: str,
+        where: str,
+        params: Optional[list] = None,
+        timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        rows = self.pull_rows(table, where, params, timeout=timeout)
+        if not rows:
+            return None
+        row = rows[0]
+        return dict(row) if isinstance(row, dict) else None
 
     def stop(self) -> None:
         """停止客户端并取消重连。"""
@@ -169,6 +262,7 @@ class SyncClient:
             "outbox_pending": pending,
             "last_error": err,
             "enabled_tables": sorted(self.enabled_tables),
+            "plugin_tables": sorted(self.plugin_registry.logical_tables()),
         }
 
     def mirror_local_write(self, kind: str, table: str, **kwargs) -> None:
@@ -201,12 +295,25 @@ class SyncClient:
     def _send_outbox_item(
         self, seq: int, table: str, op: str, payload: Dict[str, Any]
     ) -> bool:
-        table_enum = TABLE_TO_ENUM.get(table)
-        if table_enum is None:
-            sync_outbox.delete_seq(self.db, seq)
-            return True
         use_ack = self._server_protocol_version >= 3
         try:
+            if is_plugin_logical_name(table):
+                if table not in self.plugin_registry.logical_tables():
+                    sync_outbox.delete_seq(self.db, seq)
+                    return True
+                if self._server_protocol_version < 4:
+                    # 不烧 attempts：中心升级到 v4 后可继续发送
+                    self._last_error = "hub protocol < 4; plugin table sync skipped"
+                    return True
+                table_enum = 0
+                table_name = table
+            else:
+                table_enum = TABLE_TO_ENUM.get(table)
+                if table_enum is None:
+                    sync_outbox.delete_seq(self.db, seq)
+                    return True
+                table_name = None
+
             if op == "delete":
                 msg = build_data_request(
                     SyncMessageType.DELETE_REQUEST,
@@ -215,6 +322,7 @@ class SyncClient:
                     where=str(payload.get("where") or ""),
                     params=list(payload.get("params") or []),
                     seq=seq if use_ack else None,
+                    table_name=table_name,
                 )
             else:
                 msg = build_data_request(
@@ -222,6 +330,7 @@ class SyncClient:
                     table_enum,
                     dict(payload.get("row") or {}),
                     seq=seq if use_ack else None,
+                    table_name=table_name,
                 )
             self._send(msg)
             if use_ack:
@@ -259,7 +368,11 @@ class SyncClient:
                 table = str(item.get("table_name") or "")
                 op = str(item.get("op") or "")
                 payload = item.get("payload") or {}
-                if table not in self.enabled_tables:
+                if is_plugin_logical_name(table):
+                    if table not in self.plugin_registry.logical_tables():
+                        sync_outbox.delete_seq(self.db, seq)
+                        continue
+                elif table not in self.enabled_tables:
                     sync_outbox.delete_seq(self.db, seq)
                     continue
                 if self._send_outbox_item(seq, table, op, payload):
@@ -449,10 +562,18 @@ class SyncClient:
         """连接阶段等待响应时穿插到的 PUSH/心跳等，就地消化，避免帧错位。"""
         if msg_type == SyncMessageType.PUSH_NOTIFY:
             try:
+                table_name = data.get("table_name")
+                table_enum = None
+                if not table_name:
+                    try:
+                        table_enum = SyncTable(data.get("table", 0))
+                    except ValueError:
+                        table_enum = None
                 self._apply_push(
-                    SyncTable(data.get("table", 0)),
+                    table_enum,
                     data.get("operation", ""),
                     data.get("data", {}),
+                    table_name=table_name,
                 )
             except Exception as e:
                 self._log("warning", f"Side PUSH during request ignored error: {e}")
@@ -514,6 +635,7 @@ class SyncClient:
             self.auth_key,
             sorted(self.enabled_tables),
             protocol_version=PROTOCOL_VERSION,
+            plugin_tables=self.plugin_registry.auth_plugin_tables_payload() or None,
         )
         msg_type, data = self._request_response(
             payload,
@@ -542,35 +664,65 @@ class SyncClient:
             table_enum = TABLE_TO_ENUM.get(table_name)
             if table_enum is None:
                 continue
-            try:
-                msg_type, data = self._request_response(
-                    build_full_sync_request(table_enum),
-                    expect_types={SyncMessageType.FULL_SYNC_RESPONSE},
-                    timeout=self._full_sync_timeout,
+            self._full_sync_one(table_name, table_enum, None)
+
+        plugin_tables = sorted(self.plugin_registry.logical_tables())
+        if plugin_tables and self._server_protocol_version < 4:
+            self._log(
+                "warning",
+                f"Hub protocol {self._server_protocol_version} < 4; "
+                f"skip full sync for {len(plugin_tables)} plugin table(s)",
+            )
+            return
+        for logical in plugin_tables:
+            self._full_sync_one(logical, 0, logical)
+
+    def _full_sync_one(
+        self, label: str, table_enum, table_name: Optional[str]
+    ) -> None:
+        try:
+            msg_type, data = self._request_response(
+                build_full_sync_request(table_enum, table_name=table_name),
+                expect_types={SyncMessageType.FULL_SYNC_RESPONSE},
+                timeout=self._full_sync_timeout,
+            )
+            if msg_type != SyncMessageType.FULL_SYNC_RESPONSE:
+                self._log(
+                    "warning",
+                    f"Full sync {label}: unexpected response {msg_type}",
                 )
-                if msg_type != SyncMessageType.FULL_SYNC_RESPONSE:
-                    self._log(
-                        "warning",
-                        f"Full sync {table_name}: unexpected response {msg_type}",
-                    )
-                    continue
-                if not data.get("success"):
-                    self._log(
-                        "warning",
-                        f"Full sync {table_name} failed: {data.get('error', '')}",
-                    )
-                    continue
-                rows = data.get("rows", [])
+                return
+            if not data.get("success"):
+                self._log(
+                    "warning",
+                    f"Full sync {label} failed: {data.get('error', '')}",
+                )
+                return
+            rows = data.get("rows", [])
+            if table_name:
+                applied = self._apply_plugin_rows_full(table_name, rows)
+            else:
                 applied = 0
                 for row in rows:
-                    if self._upsert_row(table_name, row):
+                    if self._upsert_row(label, row):
                         applied += 1
-                self._log(
-                    "info",
-                    f"Full sync {table_name}: {applied}/{len(rows)} rows applied",
-                )
-            except Exception as e:
-                self._log("error", f"Full sync {table_name} error: {e}")
+            self._log(
+                "info",
+                f"Full sync {label}: {applied}/{len(rows)} rows applied",
+            )
+        except Exception as e:
+            self._log("error", f"Full sync {label} error: {e}")
+
+    def _apply_plugin_rows_full(self, logical: str, rows: list) -> int:
+        payload_rows = [dict(r) for r in (rows or []) if isinstance(r, dict)]
+        try:
+            ok = self.plugin_registry.dispatch_apply(
+                logical, "full", {"rows": payload_rows}
+            )
+            return len(payload_rows) if ok else 0
+        except Exception as e:
+            self._log("error", f"Plugin full apply {logical} error: {e}")
+            return 0
 
     def reconcile_tables(self, tables: Optional[Set[str]] = None) -> Dict[str, int]:
         """手动触发全面对账：断线重连后自动「拉全量 + 本地全表上行」。
@@ -625,14 +777,43 @@ class SyncClient:
         if where:
             self.db.delete(table_name, where, tuple(data.get("_params", [])))
 
-    def _apply_push(self, table_enum: SyncTable, operation: str, data: Dict[str, Any]) -> None:
-        table_name = ENUM_TO_TABLE.get(table_enum)
-        if not table_name or table_name not in self.enabled_tables:
+    def _apply_push(
+        self,
+        table_enum,
+        operation: str,
+        data: Dict[str, Any],
+        table_name: Optional[str] = None,
+    ) -> None:
+        if table_name and is_plugin_logical_name(table_name):
+            if table_name not in self.plugin_registry.logical_tables():
+                return
+            apply_op = {"insert": "upsert", "update": "upsert", "delete": "delete"}.get(
+                operation
+            )
+            if not apply_op:
+                return
+            try:
+                self.plugin_registry.dispatch_apply(table_name, apply_op, dict(data or {}))
+            except Exception as e:
+                self._log(
+                    "error", f"Apply plugin push {table_name}/{operation} error: {e}"
+                )
+            return
+
+        table = None
+        if table_name and table_name in self.enabled_tables:
+            table = table_name
+        elif table_enum is not None:
+            try:
+                table = ENUM_TO_TABLE.get(table_enum)
+            except Exception:
+                table = None
+        if not table or table not in self.enabled_tables:
             return
         apply_fn = {
-            "insert": lambda: self._upsert_row(table_name, data),
-            "update": lambda: self._apply_push_update(table_name, data),
-            "delete": lambda: self._apply_push_delete(table_name, data),
+            "insert": lambda: self._upsert_row(table, data),
+            "update": lambda: self._apply_push_update(table, data),
+            "delete": lambda: self._apply_push_delete(table, data),
         }.get(operation)
         if not apply_fn:
             return
@@ -640,16 +821,27 @@ class SyncClient:
             with self.db.suppress_write_notify():
                 apply_fn()
         except Exception as e:
-            self._log("error", f"Apply push {table_name}/{operation} error: {e}")
+            self._log("error", f"Apply push {table}/{operation} error: {e}")
 
     def _dispatch_listen_message(self, msg_type, data: Dict[str, Any], heartbeat_ts: float) -> float:
         """处理监听循环中的单条消息，返回可能更新后的 heartbeat 时间戳。"""
         if msg_type == SyncMessageType.PUSH_NOTIFY:
-            self._apply_push(
-                SyncTable(data.get("table", 0)),
-                data.get("operation", ""),
-                data.get("data", {}),
-            )
+            try:
+                table_name = data.get("table_name")
+                table_enum = None
+                if not table_name:
+                    try:
+                        table_enum = SyncTable(data.get("table", 0))
+                    except ValueError:
+                        table_enum = None
+                self._apply_push(
+                    table_enum,
+                    data.get("operation", ""),
+                    data.get("data", {}),
+                    table_name=table_name,
+                )
+            except Exception as e:
+                self._log("error", f"Dispatch PUSH error: {e}")
         elif msg_type == SyncMessageType.SETTINGS_PUSH:
             self._apply_remote_settings(data.get("settings"))
         elif msg_type in (

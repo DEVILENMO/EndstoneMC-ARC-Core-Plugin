@@ -68,7 +68,8 @@ ENUM_TO_TABLE = {v: k for k, v in TABLE_TO_ENUM.items()}
 
 # 2+：认证响应可带 settings；可收 SETTINGS_PUSH。旧客户端不发此字段，视为 1。
 # 3+：数据操作请求/响应带 seq；响应使用真实的 INSERT/UPDATE/DELETE_RESPONSE。
-PROTOCOL_VERSION = 3
+# 4+：可选 table_name（plugin_id:table）与认证 plugin_tables；插件命名空间表同步。
+PROTOCOL_VERSION = 4
 
 # 请求类型 → 对应响应类型
 REQUEST_TO_RESPONSE = {
@@ -114,8 +115,9 @@ def build_auth_request(
     auth_key: str,
     sync_tables: Optional[List[str]] = None,
     protocol_version: int = PROTOCOL_VERSION,
+    plugin_tables: Optional[List[Dict]] = None,
 ) -> bytes:
-    """构建认证请求"""
+    """构建认证请求；plugin_tables 为 [{"name","fields",...}]，仅协议 4+。"""
     payload = {
         'server_id': server_id,
         'server_name': server_name,
@@ -124,6 +126,8 @@ def build_auth_request(
     }
     if sync_tables is not None:
         payload['sync_tables'] = sync_tables
+    if plugin_tables is not None:
+        payload['plugin_tables'] = plugin_tables
     return encode_message(SyncMessageType.AUTH_REQUEST, payload)
 
 
@@ -154,13 +158,21 @@ def build_settings_push(settings: Dict[str, str]) -> bytes:
     })
 
 
-def build_query_request(table: SyncTable, where: str, params: List) -> bytes:
-    """构建查询请求"""
-    return encode_message(SyncMessageType.QUERY_REQUEST, {
-        'table': int(table),
+def build_query_request(
+    table: SyncTable,
+    where: str,
+    params: List,
+    table_name: Optional[str] = None,
+) -> bytes:
+    """构建查询请求；插件表传 table_name 并将 table 置 0。"""
+    payload = {
+        'table': int(table) if table is not None else 0,
         'where': where,
         'params': params,
-    })
+    }
+    if table_name:
+        payload['table_name'] = table_name
+    return encode_message(SyncMessageType.QUERY_REQUEST, payload)
 
 
 def build_query_response(success: bool, results: List[Dict], error: str = "") -> bytes:
@@ -179,10 +191,14 @@ def build_data_request(
     where: str = "",
     params: List = None,
     seq: Optional[int] = None,
+    table_name: Optional[str] = None,
 ) -> bytes:
-    """构建数据操作请求（插入/更新/删除）；seq 用于 outbox ack 配对。"""
+    """构建数据操作请求（插入/更新/删除）；seq 用于 outbox ack 配对。
+
+    插件表传 table_name（plugin_id:table），table 可为 0。
+    """
     payload = {
-        'table': int(table),
+        'table': int(table) if table is not None else 0,
         'data': data,
     }
     if where:
@@ -191,6 +207,8 @@ def build_data_request(
         payload['params'] = params
     if seq is not None:
         payload['seq'] = int(seq)
+    if table_name:
+        payload['table_name'] = table_name
     return encode_message(msg_type, payload)
 
 
@@ -228,11 +246,14 @@ def build_batch_sync_response(success: bool, results: List[Dict], error: str = "
     })
 
 
-def build_full_sync_request(table: SyncTable) -> bytes:
-    """构建全量同步请求"""
-    return encode_message(SyncMessageType.FULL_SYNC_REQUEST, {
-        'table': int(table),
-    })
+def build_full_sync_request(
+    table: SyncTable, table_name: Optional[str] = None
+) -> bytes:
+    """构建全量同步请求；插件表传 table_name。"""
+    payload = {'table': int(table) if table is not None else 0}
+    if table_name:
+        payload['table_name'] = table_name
+    return encode_message(SyncMessageType.FULL_SYNC_REQUEST, payload)
 
 
 def build_full_sync_response(success: bool, rows: List[Dict], error: str = "") -> bytes:
@@ -257,12 +278,20 @@ def build_error_response(error_code: int, error_message: str) -> bytes:
     })
 
 
-def build_push_notify(table: SyncTable, operation: str, row_data: Dict) -> bytes:
-    """构建推送通知"""
-    return encode_message(SyncMessageType.PUSH_NOTIFY, {
-        'table': int(table),
-        'operation': operation,  # 'insert', 'update', 'delete'
+def build_push_notify(
+    table: SyncTable,
+    operation: str,
+    row_data: Dict,
+    table_name: Optional[str] = None,
+) -> bytes:
+    """构建推送通知；插件表可带 table_name。"""
+    payload = {
+        'table': int(table) if table is not None else 0,
+        'operation': operation,  # 'insert', 'update', 'delete', 'full' 不用
         'data': row_data,
-    })
+    }
+    if table_name:
+        payload['table_name'] = table_name
+    return encode_message(SyncMessageType.PUSH_NOTIFY, payload)
 
 
