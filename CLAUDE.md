@@ -102,6 +102,7 @@ Other EndStone plugins can call methods on the `ARCCorePlugin` instance via `ser
 - **Guilds**: `api_get_player_guild_info`、`api_get_player_guild_id`、`api_get_guild_info`、`api_get_guild_total_contribution`、`api_change_guild_total_contribution`、`api_get_member_guild_contribution`、`api_change_member_guild_contribution`、`api_list_guild_members`、`api_add_guild_contribution`、`api_get_player_guild_contribution`、`api_get_guild_total_contribution_by_player`、`api_set_guild_size_tier`
 - **Newbie**: `api_get_newbie_guide_text()`
 - **Main menu**: `api_register_main_menu_button(button_id, text, on_click, priority=6)`、`api_unregister_main_menu_button(button_id)` — 其它插件在 `on_enable` 注册主菜单入口；priority 越小越靠前（签到未签到=0、已签到=99；核心其它功能从 3 起）
+- **Chat prefixes**: `api_register_chat_prefix(prefix_name, priority=0)`、`api_set_player_chat_prefix(prefix_name, text, player_name="", xuid="")` — 聊天/头顶/`get_player_name_by_xuid(..., True)` 展示名前缀按 priority 升序拼接（越小越靠前，最低 0）；内置 `guild=2`、`title=3`；`text` 为空清除；不可设置内置 guild/title
 
 All API methods are thread-safe.
 

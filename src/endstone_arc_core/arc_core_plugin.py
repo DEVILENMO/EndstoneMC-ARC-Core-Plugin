@@ -59,6 +59,11 @@ SKY_EYE_LOG_DIR_NAME = 'sky_eye'
 SKY_EYE_DB_NAME = 'skyeye.db'
 # 公会浏览列表每页按钮数量（避免表单按钮过多）
 GUILD_BROWSE_PAGE_SIZE = 18
+# 聊天/展示名前缀：内置公会与头衔（priority 越小越靠前，最低 0）
+CHAT_PREFIX_GUILD = "guild"
+CHAT_PREFIX_TITLE = "title"
+CHAT_PREFIX_PRIORITY_GUILD = 2
+CHAT_PREFIX_PRIORITY_TITLE = 3
 
 
 class ARCCorePlugin(Plugin):
@@ -196,6 +201,11 @@ class ARCCorePlugin(Plugin):
         # 主菜单按钮注册表：button_id -> {text, on_click, priority, visible}
         self._main_menu_buttons: Dict[str, dict] = {}
         self._main_menu_buttons_lock = threading.Lock()
+        # 聊天/展示名前缀：prefix_name -> {priority}；玩家自定义文本 xuid -> {name -> text}
+        self._chat_prefixes: Dict[str, dict] = {}
+        self._chat_prefixes_lock = threading.Lock()
+        self._player_chat_prefixes: Dict[str, Dict[str, str]] = {}
+        self._player_chat_prefixes_lock = threading.Lock()
         try:
             self.economy.set_balance_changed_callback(
                 self._on_economy_balance_changed_for_sidebar
@@ -600,6 +610,12 @@ class ARCCorePlugin(Plugin):
             self._register_core_main_menu_buttons()
         except Exception as e:
             self.logger.error(f"[ARC Core]Register core main menu buttons error: {e}")
+
+        # 聊天/展示名前缀（公会 2、头衔 3；外部插件可再注册）
+        try:
+            self._register_core_chat_prefixes()
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Register core chat prefixes error: {e}")
 
     def _init_sync_service(self) -> None:
         """初始化跨服数据同步：同步中心（可选）与远程客户端（与文件路径互斥）。"""
@@ -4370,17 +4386,28 @@ class ARCCorePlugin(Plugin):
             self.logger.error(f"{ColorFormat.RED}[ARC Core]Get player name by XUID error: {str(e)}")
             return None
 
-    def format_player_display_label_with_guild(
-        self,
-        raw_player_name: str,
-        equipped_title: Optional[str],
-        xuid: str,
-    ) -> str:
-        """
-        展示用：§白[无公会]§r 或 §普通色[公会名]§r，再接 [头衔]§r，最后为游戏名。
-        与聊天、头顶 name_tag、死亡播报及 get_player_name_by_xuid(..., True) 保持一致。
-        """
-        name = (raw_player_name or "").strip() or "?"
+    def _put_chat_prefix(self, prefix_name: str, priority: int) -> bool:
+        """写入前缀注册表。priority 钳制到 >=0；同名覆盖。"""
+        name = str(prefix_name or "").strip()
+        if not name:
+            return False
+        try:
+            prio = int(priority)
+        except (TypeError, ValueError):
+            return False
+        if prio < 0:
+            prio = 0
+        with self._chat_prefixes_lock:
+            self._chat_prefixes[name] = {"priority": prio}
+        return True
+
+    def _register_core_chat_prefixes(self) -> None:
+        """内置聊天前缀：公会 priority=2，头衔 priority=3。"""
+        self._put_chat_prefix(CHAT_PREFIX_GUILD, CHAT_PREFIX_PRIORITY_GUILD)
+        self._put_chat_prefix(CHAT_PREFIX_TITLE, CHAT_PREFIX_PRIORITY_TITLE)
+
+    def _compute_guild_chat_prefix(self, xuid: str) -> str:
+        """公会前缀展示文本：有公会为带色 [公会名]，否则 §f[无公会]§r。"""
         xs = str(xuid or "").strip()
         no_guild_label = self.language_manager.GetText("GUILD_DISPLAY_NO_GUILD_SHORT")
         if no_guild_label is None or not str(no_guild_label).strip():
@@ -4407,21 +4434,63 @@ class ARCCorePlugin(Plugin):
             guild_prefix = ""
         if not guild_prefix:
             guild_prefix = f"§f{no_guild_label}§r"
+        return guild_prefix
+
+    def _compute_title_chat_prefix(
+        self, xuid: str, equipped_title: Optional[str]
+    ) -> str:
+        """头衔前缀展示文本；未佩戴则为空串。"""
+        xs = str(xuid or "").strip()
         et = (equipped_title or "").strip() if equipped_title else ""
-        if et:
+        if not et:
+            return ""
+        rarity = None
+        try:
+            if xs:
+                info = self.title_system.get_equipped_title_entry_by_xuid(xs)
+                if info and info.get("title") == et:
+                    rarity = info.get("rarity")
+        except Exception:
             rarity = None
+        tc = self.title_system.get_title_rarity_color(et, rarity)
+        return f"{tc}[{et}]§r"
+
+    def format_player_display_label_with_guild(
+        self,
+        raw_player_name: str,
+        equipped_title: Optional[str],
+        xuid: str,
+    ) -> str:
+        """
+        展示用：按已注册前缀 priority 升序拼接（越小越靠前），最后为游戏名。
+        内置 guild=2、title=3；其它插件注册的前缀取玩家已设置文本。
+        与聊天、头顶 name_tag、死亡播报及 get_player_name_by_xuid(..., True) 保持一致。
+        """
+        name = (raw_player_name or "").strip() or "?"
+        xs = str(xuid or "").strip()
+        with self._chat_prefixes_lock:
+            defs = [(n, dict(meta)) for n, meta in self._chat_prefixes.items()]
+        with self._player_chat_prefixes_lock:
+            player_map = dict(self._player_chat_prefixes.get(xs, {})) if xs else {}
+        parts = []
+        for pname, meta in defs:
+            if pname == CHAT_PREFIX_GUILD:
+                text = self._compute_guild_chat_prefix(xs)
+            elif pname == CHAT_PREFIX_TITLE:
+                text = self._compute_title_chat_prefix(xs, equipped_title)
+            else:
+                text = str(player_map.get(pname) or "")
+            if not text:
+                continue
             try:
-                if xs:
-                    info = self.title_system.get_equipped_title_entry_by_xuid(xs)
-                    if info and info.get("title") == et:
-                        rarity = info.get("rarity")
-            except Exception:
-                rarity = None
-            tc = self.title_system.get_title_rarity_color(et, rarity)
-            title_part = f"{tc}[{et}]§r"
-        else:
-            title_part = ""
-        return guild_prefix + title_part + name
+                prio = int(meta.get("priority", 0))
+            except (TypeError, ValueError):
+                prio = 0
+            if prio < 0:
+                prio = 0
+            parts.append((prio, pname, text))
+        parts.sort(key=lambda item: (item[0], item[1]))
+        return "".join(t[2] for t in parts) + name
 
     def _refresh_player_name_tag_by_xuid(self, xuid: Optional[str]) -> None:
         if not xuid:
@@ -4840,6 +4909,65 @@ class ARCCorePlugin(Plugin):
                 del self._main_menu_buttons[bid]
             return True
         except Exception:
+            return False
+
+    def api_register_chat_prefix(self, prefix_name: str, priority: int = 0) -> bool:
+        """
+        供其它插件注册聊天/展示名前缀槽位。
+        prefix_name：前缀名（如 \"vip\"）；priority 越小越靠前（最低 0）；同名覆盖。
+        内置：guild=2、title=3。注册后需再调 api_set_player_chat_prefix 写入玩家文本。
+        """
+        try:
+            return self._put_chat_prefix(prefix_name, priority)
+        except Exception as e:
+            try:
+                if self.logger:
+                    self.logger.error(f"[ARC Core]api_register_chat_prefix error: {e}")
+            except Exception:
+                pass
+            return False
+
+    def api_set_player_chat_prefix(
+        self,
+        prefix_name: str,
+        text: str,
+        player_name: str = "",
+        xuid: str = "",
+    ) -> bool:
+        """
+        设置玩家某已注册前缀的展示文本（含颜色码）。text 为空则清除。
+        player_name / xuid 填一个即可，xuid 优先。不可设置内置 guild / title（由核心实时计算）。
+        成功后若玩家在线则刷新 name_tag。
+        """
+        pname = str(prefix_name or "").strip()
+        if not pname:
+            return False
+        if pname in (CHAT_PREFIX_GUILD, CHAT_PREFIX_TITLE):
+            return False
+        with self._chat_prefixes_lock:
+            if pname not in self._chat_prefixes:
+                return False
+        resolved = self._api_resolve_player_xuid(player_name, xuid)
+        if not resolved:
+            return False
+        display = str(text or "")
+        try:
+            with self._player_chat_prefixes_lock:
+                slot = self._player_chat_prefixes.setdefault(resolved, {})
+                if not display:
+                    slot.pop(pname, None)
+                    if not slot:
+                        self._player_chat_prefixes.pop(resolved, None)
+                else:
+                    slot[pname] = display
+            self._refresh_player_name_tag_by_xuid(resolved)
+            return True
+        except Exception as e:
+            try:
+                if self.logger:
+                    self.logger.error(f"[ARC Core]api_set_player_chat_prefix error: {e}")
+            except Exception:
+                pass
             return False
 
     def show_arc_tools_menu(self, player: Player):

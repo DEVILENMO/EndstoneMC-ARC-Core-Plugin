@@ -3,7 +3,7 @@
 # EndStone ARC Core Plugin / EndStone弧光核心
 
 [![Codacy Grade](https://app.codacy.com/project/badge/Grade/2f830615baf347258558dcc2a5ab85a1)](https://app.codacy.com/gh/DEVILENMO/EndstoneMC-ARC-Core-Plugin/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
-[![Version](https://img.shields.io/badge/version-v0.9.47-blue)](https://github.com/ARC-Minecraft/EndstoneMC-ARC-Core-Plugin)
+[![Version](https://img.shields.io/badge/version-v0.9.49-blue)](https://github.com/ARC-Minecraft/EndstoneMC-ARC-Core-Plugin)
 [![Python](https://img.shields.io/badge/python-3.13+-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![EndStone API](https://img.shields.io/badge/EndStone_API-0.7+-black)](https://github.com/EndstoneMC/endstone)
 [![License](https://img.shields.io/github/license/ARC-Minecraft/EndstoneMC-ARC-Core-Plugin)](LICENSE)
@@ -225,7 +225,7 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 - **调试模式**（v0.3.0）：开启后，在方块破坏/放置、方块交互、生物攻击、生物交互时向该 OP 发送聊天调试消息（事件类型、目标、维度、位置）
 
 ### 🏷️ 头衔系统（v0.3.0，表结构 v0.7.1）
-- **聊天头衔展示** - 远古 QQ 风格：首行 `[头衔]玩家名(年.月.日-时:分)：`，下一行消息内容；`[头衔]玩家名` 加粗并按稀有度上色（MC 格式码 §l、§r、§f/§9/§d/§6/§c），「玩家」前缀可在语言文件中配置（如英文 `Player-`）
+- **聊天头衔展示** - 远古 QQ 风格：首行 `[前缀…]玩家名(年.月.日-时:分)：`，下一行消息内容；前缀按注册 priority 升序（默认公会 2 → 头衔 3），头衔段按稀有度上色（MC 格式码 §f/§9/§d/§6/§c）
 - **数据（v0.7.1 / v0.9.13）** - 玩家解锁时间仅存 **`player_title_unlock_time`**（`xuid`、`title`、`unlocked_at`）；废弃表 **`player_title_extra`** 在启动时自动 DROP
 - **头衔属性** - 每个头衔支持：**稀有度**（普通/稀有/史诗/传奇/神话，对应白/蓝/紫/橙/红）、**头衔介绍**、**解锁时间**（解锁时记录，默认头衔在首次进服或首次获得时记录；已进服但尚未有默认头衔的玩家在下一次进服时补发并记录时间）、**解锁奖励**（金钱 + 物品列表「物品ID 数量」）
 - **默认头衔** - 配置 `DEFAULT_TITLE`（逗号分隔），**进服时**为每位玩家写入解锁记录（与成就无关）；默认稀有度为普通，介绍与奖励为空，OP 可在头衔属性管理中修改。
@@ -253,7 +253,7 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
   - **底层消费接口**：`GuildSystem.consume_guild_contribution(guild_id, points)`（仅扣减公共值，不影响私人值），供领地等系统消耗公共贡献点
 - **全部公会浏览与入会（v0.7.3）**：主菜单 **公会 → 查看全部公会** — 列表按 **规模等级降序、同规模按公共贡献点降序**；支持 **按名称搜索**、分页；点选公会仅 **预览**（名称、简介、规模、人数/上限、公共贡献、入会说明）；**无公会** 玩家可 **申请加入 / 加入**（取决于 **入会审核**）；**已是本会成员** 仅提供 **我的公会** 跳转。会长 / 管理者在 **我的公会 → 入会审核设置** 中开关审核，在 **入会申请** 中处理待审。相关数据表：`guild_join_requests`、`guilds.join_requires_approval`
 - **跨服同步**：远程客户端模式下通过 **`SYNC_CLIENT_SYNC_GUILD`** 控制是否同步公会数据
-- **展示名统一**：聊天、玩家头顶 **`name_tag`**、`get_player_name_by_xuid(..., return_with_title=True)` 等为 **`[公会前缀][头衔]玩家名`**：有公会时前缀为带 MC 颜色码的 **`[公会名]`**（与「普通」稀有度头衔同色）；无公会时为 **`§f[无公会]§r`**（白色），再接头衔段与游戏名
+- **展示名统一（注册制前缀，v0.9.49）**：聊天、玩家头顶 **`name_tag`**、`get_player_name_by_xuid(..., return_with_title=True)` 等按已注册前缀的 **priority 升序**拼接（**越小越靠前，最低 0**），最后为游戏名。核心内置：**公会 `guild` priority=2**、**头衔 `title` priority=3**（默认仍为 `[公会][头衔]名字`）。有公会时为带规模色的 **`[公会名]`**；无公会时为 **`§f[无公会]§r`**；头衔段按稀有度上色。其它插件可通过 `api_register_chat_prefix` / `api_set_player_chat_prefix` 插入自定义前缀
 - **数据库平滑升级**：插件加载时若旧库 `guilds` / `guild_members` 缺少 `size_tier` / `total_contribution` / `contribution` 列，会自动 `ALTER TABLE` 补齐（默认值：`size_tier='small'`、其余为 `0`），无需手动迁移
 
 ### 🔄 跨服数据同步（v0.8 / v0.9.42）
@@ -731,6 +731,8 @@ arc.api_sidebar_set_values(
 | `api_get_newbie_guide_text` | 无 | `str`：`newbie_welcome.txt` 全文；失败为 `""` |
 | `api_register_main_menu_button` | `button_id`，`text`，`on_click`，`priority=6` | `bool`：向 `/arc` 主菜单注册按钮；`priority` 越小越靠前；同优先级按 `text` 排序；同 id 覆盖 |
 | `api_unregister_main_menu_button` | `button_id` | `bool`：注销已注册按钮 |
+| `api_register_chat_prefix` | `prefix_name`，`priority=0` | `bool`：注册聊天/展示名前缀槽位；`priority` 越小越靠前（最低 0）；同名覆盖。内置 `guild=2`、`title=3` |
+| `api_set_player_chat_prefix` | `prefix_name`，`text`，`player_name=""`，`xuid=""` | `bool`：设置玩家该前缀的展示文本（可含 § 颜色码）；`text` 为空则清除；须已注册；不可改内置 `guild`/`title`；在线则刷新 `name_tag` |
 
 示例（其它插件 `on_enable`）：
 
@@ -743,6 +745,16 @@ if arc and hasattr(arc, "api_register_main_menu_button"):
         on_click=self.show_my_panel,  # callable(player)
         priority=6,
     )
+```
+
+示例（聊天前缀，priority=1 会出现在公会/头衔之前）：
+
+```python
+arc = self.server.plugin_manager.get_plugin("arc_core")
+if arc and hasattr(arc, "api_register_chat_prefix"):
+    arc.api_register_chat_prefix("vip", priority=1)
+    # 之后按玩家设置展示文本：
+    # arc.api_set_player_chat_prefix("vip", "§6[VIP]§r", xuid=player.xuid)
 ```
 
 #### 领地
@@ -805,7 +817,11 @@ if arc and hasattr(arc, "api_register_main_menu_button"):
 
 ## 📋 近期更新日志
 
-### v0.9.48（当前版本）
+### v0.9.49（当前版本）
+
+- ✅ **聊天/展示名前缀注册制**：按 priority 升序拼接（越小越靠前，最低 0）；内置公会 `guild=2`、头衔 `title=3`；新增 `api_register_chat_prefix` / `api_set_player_chat_prefix` 供其它插件注册槽位并设置玩家前缀文本
+
+### v0.9.48
 
 - ✅ **主菜单按钮优先级与外部注册 API**：内置按钮硬编码优先级（签到 0/99，其余从 3 起）；同优先级按文本排序；新增 `api_register_main_menu_button` / `api_unregister_main_menu_button`；移除核心对股票/商店/枪战/DTWT/PvP KD/DMZ 等的硬编码入口，改由各插件自行注册
 
