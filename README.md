@@ -41,7 +41,8 @@ EndStone ARC Core 是一个功能完整的 EndStone (Minecraft 基岩版服务�
 
 ### 🧭 主菜单与子命令（`/arc`）
 - **进服自动弹出主菜单**：玩家加入服务器后约 **1 秒**（20 ticks）会 **自动弹出 ARC 主菜单一次**，**无需配置**；可直接 **关闭** 表单继续游玩，亦可随时再输入 **`/arc`** 打开。此项 **不是**「强制登录」——浏览菜单不设密码门槛；敏感操作仍见下文「敏感操作密码验证」。
-- 主菜单前几项顺序为：**新手引导 → 传送系统 → 领地系统 → 银行 → 公会 → 每日签到 → 我的信息 → 工具**（含小喇叭与重生）→ …；浏览与一般入口 **无需** 预先输入账户密码；涉及资金与领地等安全步骤见「玩家管理系统」中的 **敏感操作密码验证**。
+- **按钮优先级排序（v0.9.48）**：所有主菜单按钮带优先级，**数字越小越靠前（0 最高）**；同优先级按按钮文本排序。核心内置：每日签到未签到 **0**、已签到 **99**；新手引导 **3** → 传送 **4** → 领地 **5** → 银行 **6** → 公会 **7** → 工具 **8** → OP 面板 **50**。
+- **外部插件自注册**：股票 / 按钮商店 / 枪战 / 别踩白块 / PvP KD / UShop 等不再由核心硬编码检测，应在各自 `on_enable` 调用 `api_register_main_menu_button`（建议 priority≈6）；`on_disable` 时 `api_unregister_main_menu_button`。DMZ 等本仓库外插件同样需自行注册。
 - **`/arc land`**、**`/arc tp`**、**`/arc bank`**、**`/arc guild`** 分别直接打开 **领地菜单**、**传送菜单**、**银行菜单**、**公会菜单**（若从控制台/命令方块执行，会按 **命令发送者名称** 解析在线玩家，与 `/connecttoserver` 相同机制，便于命令方块代为弹出表单）。进入菜单后，**转账、创建/管理领地、公会创建等敏感操作**仍会按需弹出密码验证（未设密会先引导设密），详见「玩家管理系统」。
 
 ### 👤 玩家管理系统
@@ -728,6 +729,21 @@ arc.api_sidebar_set_values(
 | `api_get_player_name_by_xuid` | `xuid`，`with_title=False` | `str`：找不到为 `""`；`with_title=True` 时为公会/头衔展示名 |
 | `api_get_player_playtime` | `raw_player_name=""`，`xuid=""` | `dict`：`session_count`，`total_playtime`（秒，含当前会话），`is_online`，`last_join_time`，`last_quit_time`，`xuid`；找不到时时长为 0 |
 | `api_get_newbie_guide_text` | 无 | `str`：`newbie_welcome.txt` 全文；失败为 `""` |
+| `api_register_main_menu_button` | `button_id`，`text`，`on_click`，`priority=6` | `bool`：向 `/arc` 主菜单注册按钮；`priority` 越小越靠前；同优先级按 `text` 排序；同 id 覆盖 |
+| `api_unregister_main_menu_button` | `button_id` | `bool`：注销已注册按钮 |
+
+示例（其它插件 `on_enable`）：
+
+```python
+arc = self.server.plugin_manager.get_plugin("arc_core")
+if arc and hasattr(arc, "api_register_main_menu_button"):
+    arc.api_register_main_menu_button(
+        "my_plugin:main",
+        "我的功能",
+        on_click=self.show_my_panel,  # callable(player)
+        priority=6,
+    )
+```
 
 #### 领地
 
@@ -789,13 +805,17 @@ arc.api_sidebar_set_values(
 
 ## 📋 近期更新日志
 
-### v0.9.47（当前版本）
+### v0.9.48（当前版本）
+
+- ✅ **主菜单按钮优先级与外部注册 API**：内置按钮硬编码优先级（签到 0/99，其余从 3 起）；同优先级按文本排序；新增 `api_register_main_menu_button` / `api_unregister_main_menu_button`；移除核心对股票/商店/枪战/DTWT/PvP KD/DMZ 等的硬编码入口，改由各插件自行注册
+
+### v0.9.47
 
 - ✅ **自杀改回单次 `/kill`**：不再循环抽血；杀不死再另说
 
 ### v0.9.46
 
-- ✅ **对接 DMZ**：主菜单在检测到 `dmz` 插件时显示「开放世界PVE搜打撤模式」，打开 `/dmz` 菜单
+- ✅ **对接 DMZ**：主菜单在检测到 `dmz` 插件时显示「开放世界PVE搜打撤模式」，打开 `/dmz` 菜单（v0.9.48 起改为 DMZ 插件自行 `api_register_main_menu_button`）
 - ✅ **自杀曾改为多次抽血+kill**（v0.9.47 已改回单次 kill）
 
 ### v0.9.42

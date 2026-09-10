@@ -101,10 +101,11 @@ Other EndStone plugins can call methods on the `ARCCorePlugin` instance via `ser
 - **Teleport**: `api_teleport_player_to`、`api_list_player_homes`、`api_list_public_warps`、`api_teleport_player_to_home`、`api_teleport_player_to_warp`
 - **Guilds**: `api_get_player_guild_info`、`api_get_player_guild_id`、`api_get_guild_info`、`api_get_guild_total_contribution`、`api_change_guild_total_contribution`、`api_get_member_guild_contribution`、`api_change_member_guild_contribution`、`api_list_guild_members`、`api_add_guild_contribution`、`api_get_player_guild_contribution`、`api_get_guild_total_contribution_by_player`、`api_set_guild_size_tier`
 - **Newbie**: `api_get_newbie_guide_text()`
+- **Main menu**: `api_register_main_menu_button(button_id, text, on_click, priority=6)`、`api_unregister_main_menu_button(button_id)` — 其它插件在 `on_enable` 注册主菜单入口；priority 越小越靠前（签到未签到=0、已签到=99；核心其它功能从 3 起）
 
 All API methods are thread-safe.
 
-Achievement logic lives in sibling plugin `endstone_arc_achievement` (`arc_achievement`, data dir `plugins/ARCAchievement/`). Core only forwards menu buttons to `/ach` and `/achop` when that plugin is present. Stats tables remain on core's SQLite via shared `database_manager`.
+Achievement logic lives in sibling plugin `endstone_arc_achievement` (`arc_achievement`, data dir `plugins/ARCAchievement/`). Core only forwards「我的信息」内成就按钮到 `/ach`（及 OP 的 `/achop`）when that plugin is present. Stats tables remain on core's SQLite via shared `database_manager`.
 
 ## Language
 

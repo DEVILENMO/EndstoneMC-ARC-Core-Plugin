@@ -193,6 +193,9 @@ class ARCCorePlugin(Plugin):
             on_money_changed=self._update_richest_title_if_needed,
         )
         self.sidebar_system = SidebarSystem(self)
+        # 主菜单按钮注册表：button_id -> {text, on_click, priority, visible}
+        self._main_menu_buttons: Dict[str, dict] = {}
+        self._main_menu_buttons_lock = threading.Lock()
         try:
             self.economy.set_balance_changed_callback(
                 self._on_economy_balance_changed_for_sidebar
@@ -591,6 +594,12 @@ class ARCCorePlugin(Plugin):
                         pass
         except Exception as e:
             self.logger.error(f"[ARC Core]Sidebar system start error: {e}")
+
+        # 主菜单内置按钮（优先级从 3 起，签到为 0/99）
+        try:
+            self._register_core_main_menu_buttons()
+        except Exception as e:
+            self.logger.error(f"[ARC Core]Register core main menu buttons error: {e}")
 
     def _init_sync_service(self) -> None:
         """初始化跨服数据同步：同步中心（可选）与远程客户端（与文件路径互斥）。"""
@@ -4673,56 +4682,165 @@ class ARCCorePlugin(Plugin):
     # UI Main menu
     def show_main_menu(self, player: Player):
         self.update_player_name(player)
-        checkin_first = not self._player_has_checked_in_today(player)
         arc_menu = ActionForm(
             title=self.language_manager.GetText('MAIN_MENU_TITLE'),
         )
-        # 枪战插件存在时置顶「枪战游戏」入口
-        if self.server.plugin_manager.get_plugin('arc_shooter_game'):
-            arc_menu.add_button(
-                self.language_manager.GetText('SHOOTER_GAME_MENU_NAME'),
-                on_click=self.show_arc_shooter_game_menu,
-            )
-        if self.server.plugin_manager.get_plugin('dmz'):
-            arc_menu.add_button(
-                self.language_manager.GetText('DMZ_MENU_NAME'),
-                on_click=self.show_dmz_menu,
-            )
-        if checkin_first:
-            arc_menu.add_button(
-                self.language_manager.GetText('CHECKIN_MENU_BUTTON'),
-                on_click=self.show_daily_checkin_panel,
-            )
-        arc_menu.add_button(self.language_manager.GetText('NEWBIE_GUIDE_BUTTON'), on_click=self.show_newbie_welcome_panel)
-        if self._teleport_menu_has_any_feature():
-            arc_menu.add_button(self.language_manager.GetText('TELEPORT_MENU_NAME'), on_click=self.show_teleport_menu)
-        # 领地系统关闭或不允许圈地时，不显示领地面板入口
-        if self._is_land_system_enabled() and self._is_land_claim_allowed():
-            arc_menu.add_button(self.language_manager.GetText('LAND_MENU_NAME'), on_click=self.show_land_main_menu)
-        arc_menu.add_button(self.language_manager.GetText('BANK_MENU_NAME'), on_click=self.show_bank_main_menu)
-        arc_menu.add_button(self.language_manager.GetText('GUILD_MENU_NAME'), on_click=self.show_guild_main_menu)
-        if not checkin_first:
-            arc_menu.add_button(
-                self.language_manager.GetText('CHECKIN_MENU_BUTTON'),
-                on_click=self.show_daily_checkin_panel,
-            )
-        arc_menu.add_button(self.language_manager.GetText('MAIN_MENU_TOOLS_BUTTON'), on_click=self.show_arc_tools_menu)
-        if self.server.plugin_manager.get_plugin('ushop'):
-            arc_menu.add_button(self.language_manager.GetText('SHOP_MENU_NAME'), on_click=self.show_shop_menu)
-        if self.server.plugin_manager.get_plugin('arc_sign_shop'):
-            arc_menu.add_button(self.language_manager.GetText('BUTTON_SHOP_MENU_NAME'), on_click=self.show_button_shop_menu)
-        elif self.server.plugin_manager.get_plugin('arc_button_shop'):
-            arc_menu.add_button(self.language_manager.GetText('BUTTON_SHOP_MENU_NAME'), on_click=self.show_button_shop_menu)
-        if self.server.plugin_manager.get_plugin('arc_dtwt'):
-            arc_menu.add_button(self.language_manager.GetText('DTWT_MENU_NAME'), on_click=self.show_dtwt_panel)
-        if self.server.plugin_manager.get_plugin('arc_pvp_kd'):
-            arc_menu.add_button(self.language_manager.GetText('PVP_KD_MENU_NAME'), on_click=self.show_arc_pvp_kd_menu)
-        if self.server.plugin_manager.get_plugin('up_and_down'):
-            arc_menu.add_button(self.language_manager.GetText('STOCK_MARKET_NAME'), on_click=self.show_stock_ui)
-        if player.is_op:
-            arc_menu.add_button(self.language_manager.GetText('OP_PANEL_NAME'), on_click=self.show_op_main_panel)
+        for text, on_click in self._iter_main_menu_buttons_for_player(player):
+            arc_menu.add_button(text, on_click=on_click)
         arc_menu.on_close = None
         player.send_form(arc_menu)
+
+    def _put_main_menu_button(
+        self,
+        button_id: str,
+        text,
+        on_click,
+        priority=6,
+        visible=None,
+    ) -> bool:
+        """内部注册主菜单按钮。text/priority 可为常量或按玩家计算的 callable。"""
+        bid = str(button_id or "").strip()
+        if not bid or on_click is None or not callable(on_click):
+            return False
+        if text is None or (not callable(text) and not str(text)):
+            return False
+        entry = {
+            "button_id": bid,
+            "text": text,
+            "on_click": on_click,
+            "priority": priority,
+            "visible": visible,
+        }
+        with self._main_menu_buttons_lock:
+            self._main_menu_buttons[bid] = entry
+        return True
+
+    def _register_core_main_menu_buttons(self) -> None:
+        """注册弧光核心自带主菜单按钮；优先级从 3 起，保持原相对顺序。"""
+        lm = self.language_manager
+        self._put_main_menu_button(
+            "arc_core:checkin",
+            text=lambda _p: lm.GetText("CHECKIN_MENU_BUTTON"),
+            on_click=self.show_daily_checkin_panel,
+            priority=lambda p: 0 if not self._player_has_checked_in_today(p) else 99,
+        )
+        self._put_main_menu_button(
+            "arc_core:newbie",
+            text=lambda _p: lm.GetText("NEWBIE_GUIDE_BUTTON"),
+            on_click=self.show_newbie_welcome_panel,
+            priority=3,
+        )
+        self._put_main_menu_button(
+            "arc_core:teleport",
+            text=lambda _p: lm.GetText("TELEPORT_MENU_NAME"),
+            on_click=self.show_teleport_menu,
+            priority=4,
+            visible=lambda _p: self._teleport_menu_has_any_feature(),
+        )
+        self._put_main_menu_button(
+            "arc_core:land",
+            text=lambda _p: lm.GetText("LAND_MENU_NAME"),
+            on_click=self.show_land_main_menu,
+            priority=5,
+            visible=lambda _p: self._is_land_system_enabled() and self._is_land_claim_allowed(),
+        )
+        self._put_main_menu_button(
+            "arc_core:bank",
+            text=lambda _p: lm.GetText("BANK_MENU_NAME"),
+            on_click=self.show_bank_main_menu,
+            priority=6,
+        )
+        self._put_main_menu_button(
+            "arc_core:guild",
+            text=lambda _p: lm.GetText("GUILD_MENU_NAME"),
+            on_click=self.show_guild_main_menu,
+            priority=7,
+        )
+        self._put_main_menu_button(
+            "arc_core:tools",
+            text=lambda _p: lm.GetText("MAIN_MENU_TOOLS_BUTTON"),
+            on_click=self.show_arc_tools_menu,
+            priority=8,
+        )
+        self._put_main_menu_button(
+            "arc_core:op",
+            text=lambda _p: lm.GetText("OP_PANEL_NAME"),
+            on_click=self.show_op_main_panel,
+            priority=50,
+            visible=lambda p: bool(getattr(p, "is_op", False)),
+        )
+
+    def _iter_main_menu_buttons_for_player(self, player: Player):
+        """按优先级升序（同优先级按按钮文本）产出 (text, on_click)。"""
+        with self._main_menu_buttons_lock:
+            entries = list(self._main_menu_buttons.values())
+        resolved = []
+        for entry in entries:
+            visible = entry.get("visible")
+            try:
+                if visible is not None and not visible(player):
+                    continue
+            except Exception:
+                continue
+            text = entry.get("text")
+            try:
+                text = text(player) if callable(text) else text
+            except Exception:
+                continue
+            text = str(text) if text is not None else ""
+            if not text:
+                continue
+            priority = entry.get("priority", 6)
+            try:
+                priority = priority(player) if callable(priority) else priority
+                priority = int(priority)
+            except Exception:
+                priority = 6
+            on_click = entry.get("on_click")
+            if on_click is None or not callable(on_click):
+                continue
+            resolved.append((priority, text, entry.get("button_id", ""), on_click))
+        # 0 最高；同优先级按文本首字符（整串比较）再按 button_id 稳定排序
+        resolved.sort(key=lambda item: (item[0], item[1], item[2]))
+        for _priority, text, _bid, on_click in resolved:
+            yield text, on_click
+
+    def api_register_main_menu_button(
+        self,
+        button_id: str,
+        text: str,
+        on_click,
+        priority: int = 6,
+    ) -> bool:
+        """供其它插件注册 ARC 主菜单按钮。priority 越小越靠前（0 最高）；同优先级按文本排序。"""
+        try:
+            return self._put_main_menu_button(
+                button_id,
+                text=str(text),
+                on_click=on_click,
+                priority=int(priority),
+            )
+        except Exception as e:
+            try:
+                if self.logger:
+                    self.logger.error(f"[ARC Core]api_register_main_menu_button error: {e}")
+            except Exception:
+                pass
+            return False
+
+    def api_unregister_main_menu_button(self, button_id: str) -> bool:
+        """注销其它插件（或自身）注册的主菜单按钮。"""
+        bid = str(button_id or "").strip()
+        if not bid:
+            return False
+        try:
+            with self._main_menu_buttons_lock:
+                if bid not in self._main_menu_buttons:
+                    return False
+                del self._main_menu_buttons[bid]
+            return True
+        except Exception:
+            return False
 
     def show_arc_tools_menu(self, player: Player):
         """我的信息、小喇叭、重生等快捷功能入口。"""
@@ -4745,9 +4863,6 @@ class ARCCorePlugin(Plugin):
 
     def execute_suicide(self, player: Player):
         player.perform_command('suicide')
-
-    def show_dmz_menu(self, player: Player):
-        player.perform_command("dmz")
 
     def show_newbie_welcome_panel(self, player: Player):
         """显示新手引导面板，内容来自内存中的 newbie_welcome.txt"""
@@ -9259,27 +9374,9 @@ class ARCCorePlugin(Plugin):
         )
         player.send_form(rank_panel)
     
-    # Shop menu
-    def show_shop_menu(self, player: Player):
-        player.perform_command('us')
-
-    def show_button_shop_menu(self, player: Player):
-        if self.server.plugin_manager.get_plugin('arc_sign_shop'):
-            player.perform_command('ss')
-        else:
-            player.perform_command('bs')
-
     def show_arc_achievement_menu(self, player: Player):
         """委托弧光成就插件打开玩家成就菜单。"""
         player.perform_command('ach')
-
-    def show_arc_pvp_kd_menu(self, player: Player):
-        """委托弧光 PvP KD 排行榜插件打开 KD 榜单。"""
-        player.perform_command('kd')
-
-    def show_arc_shooter_game_menu(self, player: Player):
-        """委托枪战游戏插件打开 /gs 主面板。"""
-        player.perform_command('gs')
 
     def _teleport_menu_has_any_feature(self) -> bool:
         """主菜单是否显示传送入口：至少有一项传送子功能开启。"""
@@ -15998,14 +16095,6 @@ class ARCCorePlugin(Plugin):
             )
             self.show_op_public_land_settings_panel(player, land_id, from_page)
     
-    # DTWT Plugin related functions
-    def show_dtwt_panel(self, player: Player):
-        player.perform_command('dtwt')
-    
-    # Stock Market Plugin related functions
-    def show_stock_ui(self, player: Player):
-        player.perform_command('stock ui')
-
     # Tool
     @staticmethod
     def get_player_position_vector(player: Player):
